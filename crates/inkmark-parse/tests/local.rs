@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use inkmark_buffer::{Document, Edit, EditKind, Selection};
-use inkmark_parse::{MarkdownParser, ParseOutput, ParseState, PulldownParser, SpanKind};
+use inkmark_parse::{GfmParser, MarkdownParser, ParseOutput, ParseState, PulldownParser, SpanKind};
 use proptest::prelude::*;
 
 const SAMPLE: &str = "# Title *em*\n\nSome **bold** text with `code` and [a link](http://x \"t\").\nSecond line &amp; more.\n\n> quote line\n> - nested *item*\n\n- one\n- two\n\n  continued\n\n```rust\nfn main() {}\n```\n\n    indented code\n\n<div>\nhtml\n</div>\n\n[ref]: /url\n\n---\nLast para\n";
@@ -234,4 +234,36 @@ fn local_reparse_picks_up_new_syntax_immediately() {
         ]
     );
     assert_eq!(out, PulldownParser.parse(&whole(&doc)));
+}
+
+const GFM_SAMPLE: &str = "| Name | Done |\n|:-----|-----:|\n| one  | ~~no~~ |\n| two  | yes |\n\n- [ ] task www.example.com/a_b_c\n- [x] done, mail me@example.org\n\nPlain https://x.org/y_z and ~~struck~~ text.\n";
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    #[test]
+    fn gfm_edits_keep_the_parse_valid(
+        edits in prop::collection::vec((0.0..1.0f64, 0usize..4, prop::sample::select(&["a", "|", "~~", "[ ] ", "- ", "\n", "www.a.com ", "\\\\", "_"][..])), 1..25)
+    ) {
+        let mut doc = Document::from_text(GFM_SAMPLE);
+        let mut out = GfmParser.parse(GFM_SAMPLE);
+        for (at, del, insert) in edits {
+            let since = edit(&mut doc, at, del, insert);
+            prop_assert!(out.catch_up(&GfmParser, &doc, since));
+            assert_valid(&out, &doc);
+        }
+    }
+}
+
+#[test]
+fn autolinks_survive_underscore_splits() {
+    let src = "see www.example.com/a_b_c now\n";
+    let out = GfmParser.parse(src);
+    let link: String = out
+        .map
+        .iter()
+        .filter(|s| s.style.contains(inkmark_parse::Style::LINK))
+        .map(|s| src[s.range].to_owned())
+        .collect();
+    assert_eq!(link, "www.example.com/a_b_c");
 }

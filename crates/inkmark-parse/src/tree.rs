@@ -20,12 +20,26 @@ pub enum BlockKind {
     },
     HtmlBlock,
     ThematicBreak,
+    /// A GFM table. The live view lays it out as a whole; its rows and
+    /// cells are blocks inside it.
+    Table {
+        columns: u16,
+    },
+    TableHead,
+    TableRow,
+    TableCell,
 }
 
 impl BlockKind {
     /// Leaf blocks hold inline content (or none); the rest contain blocks.
+    /// A table counts as one leaf: its rows and cells are laid out with it.
     pub fn is_leaf(self) -> bool {
         !matches!(self, Self::BlockQuote | Self::List { .. } | Self::Item)
+    }
+
+    /// Rows and cells live inside a table leaf.
+    pub fn is_table_part(self) -> bool {
+        matches!(self, Self::TableHead | Self::TableRow | Self::TableCell)
     }
 }
 
@@ -153,7 +167,10 @@ impl BlockTree {
         self.blocks
             .iter_from(offset)
             .filter(move |b| {
-                if b.kind.is_leaf() {
+                if b.kind.is_table_part() {
+                    // Yielded with their table.
+                    false
+                } else if b.kind.is_leaf() {
                     b.range.end > offset
                 } else {
                     b.range.start > offset
@@ -173,6 +190,33 @@ impl BlockTree {
                     None
                 }
             })
+    }
+
+    /// The rows of `table` (header first), each with its cells, in order.
+    pub fn table_rows(&self, table: &Block) -> Vec<(Block, Vec<Block>)> {
+        let mut rows: Vec<(Block, Vec<Block>)> = Vec::new();
+        for b in self
+            .blocks
+            .iter_from(table.range.start)
+            .skip_while(|b| b.range.start < table.range.start)
+            .take_while(|b| b.range.start < table.range.end || b.range.is_empty())
+        {
+            if b.range.start > table.range.end {
+                break;
+            }
+            match b.kind {
+                BlockKind::TableHead | BlockKind::TableRow if b.depth == table.depth + 1 => {
+                    rows.push((b, Vec::new()))
+                }
+                BlockKind::TableCell if b.depth == table.depth + 2 => {
+                    if let Some((_, cells)) = rows.last_mut() {
+                        cells.push(b);
+                    }
+                }
+                _ => {}
+            }
+        }
+        rows
     }
 
     /// Zero-based position of the item starting at `item_start` among the

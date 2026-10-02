@@ -1,5 +1,6 @@
 //! `MarkdownParser` trait, pulldown-cmark impl, BlockTree, SourceMap, rebase.
 
+mod autolinks;
 mod chunked;
 mod images;
 mod map;
@@ -9,7 +10,7 @@ mod tree;
 
 pub use images::{InlineImage, inline_images};
 pub use map::{SourceMap, Span, SpanKind, Style, Syntax};
-pub use pulldown::PulldownParser;
+pub use pulldown::{GfmParser, PulldownParser};
 pub use state::{DEBOUNCE, ParseState};
 pub use tree::{Block, BlockKind, BlockTree, Leaf};
 

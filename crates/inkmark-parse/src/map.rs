@@ -19,6 +19,10 @@ impl Style {
     pub const HEADING: Self = Self(1 << 7);
     pub const QUOTE: Self = Self(1 << 8);
     pub const LIST: Self = Self(1 << 9);
+    /// GFM `~~strikethrough~~`.
+    pub const STRIKE: Self = Self(1 << 10);
+    /// Inside a GFM table's header row.
+    pub const TABLE_HEAD: Self = Self(1 << 11);
 
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -48,6 +52,10 @@ pub enum Syntax {
     /// Trailing spaces or backslash of a hard line break, with its newline.
     HardBreak,
     ThematicBreak,
+    /// GFM table pipes, the delimiter row (`|:--|--:|`) and cell padding.
+    TableMarkup,
+    /// A GFM task list marker, `[ ]` (false) or `[x]` (true).
+    TaskMarker(bool),
     /// Anything else the parser consumed without output, e.g. link reference
     /// definitions.
     Other,

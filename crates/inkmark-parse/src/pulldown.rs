@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::map::{SourceMap, Span, SpanKind, Style, Syntax};
 use crate::tree::{Block, BlockKind, BlockTree};
@@ -12,7 +12,22 @@ pub struct PulldownParser;
 
 impl MarkdownParser for PulldownParser {
     fn parse(&self, src: &str) -> ParseOutput {
-        Builder::new(src).run()
+        Builder::new(src, Options::empty()).run()
+    }
+}
+
+/// GitHub Flavored Markdown: CommonMark plus tables, strikethrough, task
+/// lists (pulldown-cmark's extensions) and autolink literals (ours).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GfmParser;
+
+impl MarkdownParser for GfmParser {
+    fn parse(&self, src: &str) -> ParseOutput {
+        let options =
+            Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+        let mut out = Builder::new(src, options).run();
+        crate::autolinks::mark(src, &mut out.map);
+        out
     }
 }
 
@@ -38,12 +53,18 @@ enum OpenTag {
     Link,
     Image,
     InlineHtml,
+    Strikethrough,
+    Table,
+    TableHead,
+    TableRow,
+    TableCell,
     /// Extension tags we don't enable; kept so the stack stays balanced.
     Other,
 }
 
 struct Builder<'a> {
     src: &'a str,
+    options: Options,
     spans: Vec<Span>,
     blocks: Vec<Block>,
     stack: Vec<Open>,
@@ -55,9 +76,10 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    fn new(src: &'a str) -> Self {
+    fn new(src: &'a str, options: Options) -> Self {
         Self {
             src,
+            options,
             spans: Vec::new(),
             blocks: Vec::new(),
             stack: Vec::new(),
@@ -67,7 +89,7 @@ impl<'a> Builder<'a> {
     }
 
     fn run(mut self) -> ParseOutput {
-        let mut events = Parser::new(self.src).into_offset_iter();
+        let mut events = Parser::new_ext(self.src, self.options).into_offset_iter();
         for (event, range) in events.by_ref() {
             self.track_tight_item(&event, &range);
             match event {
@@ -99,6 +121,10 @@ impl<'a> Builder<'a> {
                 Event::HardBreak => {
                     self.fill_to(range.start);
                     self.push(range, SpanKind::Syntax(Syntax::HardBreak));
+                }
+                Event::TaskListMarker(checked) => {
+                    self.fill_to(range.start);
+                    self.push(range, SpanKind::Syntax(Syntax::TaskMarker(checked)));
                 }
                 Event::Rule => {
                     self.fill_to(range.start);
@@ -198,6 +224,16 @@ impl<'a> Builder<'a> {
             Tag::Strong => (OpenTag::Strong, None),
             Tag::Link { .. } => (OpenTag::Link, None),
             Tag::Image { .. } => (OpenTag::Image, None),
+            Tag::Strikethrough => (OpenTag::Strikethrough, None),
+            Tag::Table(alignments) => (
+                OpenTag::Table,
+                Some(BlockKind::Table {
+                    columns: alignments.len() as u16,
+                }),
+            ),
+            Tag::TableHead => (OpenTag::TableHead, Some(BlockKind::TableHead)),
+            Tag::TableRow => (OpenTag::TableRow, Some(BlockKind::TableRow)),
+            Tag::TableCell => (OpenTag::TableCell, Some(BlockKind::TableCell)),
             _ => (OpenTag::Other, None),
         };
         let block = block.map(|kind| {
@@ -232,7 +268,13 @@ impl<'a> Builder<'a> {
                 OpenTag::Strong => style.insert(Style::STRONG),
                 OpenTag::Link => style.insert(Style::LINK),
                 OpenTag::Image => style.insert(Style::IMAGE),
-                OpenTag::Paragraph | OpenTag::Other => {}
+                OpenTag::Strikethrough => style.insert(Style::STRIKE),
+                OpenTag::TableHead => style.insert(Style::TABLE_HEAD),
+                OpenTag::Paragraph
+                | OpenTag::Other
+                | OpenTag::Table
+                | OpenTag::TableRow
+                | OpenTag::TableCell => {}
             }
         }
         (style, heading)
@@ -409,13 +451,18 @@ impl<'a> Builder<'a> {
                 return Syntax::HeadingMarker;
             }
             Some(OpenTag::FencedCode) => return Syntax::Fence,
+            Some(OpenTag::Table | OpenTag::TableHead | OpenTag::TableRow | OpenTag::TableCell)
+                if innermost_inline.is_none() =>
+            {
+                return Syntax::TableMarkup;
+            }
             _ => {}
         }
         if line_start && let Some(c) = container {
             return container_syntax(c, text);
         }
         match innermost_inline {
-            Some(OpenTag::Emphasis | OpenTag::Strong) => Syntax::Delimiter,
+            Some(OpenTag::Emphasis | OpenTag::Strong | OpenTag::Strikethrough) => Syntax::Delimiter,
             Some(OpenTag::Link | OpenTag::Image) => Syntax::LinkMarkup,
             _ => container.map_or(Syntax::Other, |c| container_syntax(c, text)),
         }
