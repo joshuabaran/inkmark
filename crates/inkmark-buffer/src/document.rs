@@ -95,7 +95,8 @@ impl Document {
         Ok(())
     }
 
-    /// Sets where the next `save` writes, for a file that doesn't exist yet.
+    /// Sets where the next `save` writes, for a file that doesn't exist yet
+    /// (if one appears there before the save, `disk_status` says so).
     pub fn set_path(&mut self, path: impl Into<PathBuf>) {
         self.path = Some(path.into());
         self.disk_stamp = None;
@@ -114,11 +115,18 @@ impl Document {
         Ok(())
     }
 
-    /// Whether the file changed on disk since we opened or saved it.
+    /// Whether the file changed on disk since we opened or saved it. With
+    /// no stamp (a new file, or one acknowledged as deleted) we expect
+    /// nothing at the path, so a file appearing there counts as `Modified`.
     pub fn disk_status(&self) -> io::Result<DiskStatus> {
         match (&self.path, self.disk_stamp) {
             (Some(path), Some(stamp)) => file::disk_status(path, stamp),
-            _ => Ok(DiskStatus::Unchanged),
+            (Some(path), None) => match std::fs::symlink_metadata(path) {
+                Ok(_) => Ok(DiskStatus::Modified),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(DiskStatus::Unchanged),
+                Err(e) => Err(e),
+            },
+            (None, _) => Ok(DiskStatus::Unchanged),
         }
     }
 
@@ -280,24 +288,37 @@ impl Document {
 
     /// Applies edits in order, rolling back on the first invalid one.
     /// Returns the inverse of each edit, in application order.
+    /// Applies `edits` in order, all or nothing: the text changes first, and
+    /// only once every edit has succeeded do the epoch and the edit log
+    /// move, so a rolled-back batch leaves no trace views could map through.
+    /// Returns the inverse of each edit, in application order.
     fn apply_all(&mut self, edits: &[Edit]) -> Result<Vec<Edit>, EditError> {
         let mut inverses = Vec::with_capacity(edits.len());
+        let mut changes = Vec::with_capacity(edits.len());
         for edit in edits {
-            match self.apply_one(edit) {
-                Ok(inverse) => inverses.push(inverse),
+            match self.apply_text(edit) {
+                Ok((inverse, change)) => {
+                    inverses.push(inverse);
+                    changes.push(change);
+                }
                 Err(e) => {
                     for inverse in inverses.iter().rev() {
-                        self.apply_one(inverse)
+                        self.apply_text(inverse)
                             .expect("rollback of a just-applied edit");
                     }
                     return Err(e);
                 }
             }
         }
+        for change in changes {
+            self.epoch += 1;
+            self.log.push(self.epoch, change);
+        }
         Ok(inverses)
     }
 
-    fn apply_one(&mut self, edit: &Edit) -> Result<Edit, EditError> {
+    /// Changes the text only; returns the inverse edit and the change shape.
+    fn apply_text(&mut self, edit: &Edit) -> Result<(Edit, Change), EditError> {
         let Range { start, end } = edit.range.clone();
         if start > end || end > self.len() {
             return Err(EditError::OutOfBounds {
@@ -324,17 +345,13 @@ impl Document {
             self.rope.insert(char_start, &edit.insert);
         }
         let new_end = start + edit.insert.len();
-        self.epoch += 1;
-        self.log.push(
-            self.epoch,
-            Change {
-                start,
-                old_end: end,
-                new_end,
-                lines,
-            },
-        );
-        Ok(Edit::replace(start..new_end, removed))
+        let change = Change {
+            start,
+            old_end: end,
+            new_end,
+            lines,
+        };
+        Ok((Edit::replace(start..new_end, removed), change))
     }
 }
 
@@ -476,6 +493,45 @@ mod tests {
         assert_eq!(doc.slice(0..doc.len()), "a **b**");
         doc.undo();
         assert_eq!(doc.slice(0..doc.len()), "a b");
+    }
+
+    #[test]
+    fn a_failed_batch_leaves_no_epoch_or_log_entries() {
+        // Regression for #17.
+        let mut doc = Document::from_text("abcd");
+        let err = doc.apply(
+            vec![Edit::replace(1..2, "XYZ"), Edit::delete(0..99)],
+            caret(2),
+            caret(2),
+            EditKind::Other,
+        );
+        assert!(matches!(err, Err(EditError::OutOfBounds { .. })));
+        assert_eq!(doc.slice(0..doc.len()), "abcd");
+        assert_eq!(doc.epoch(), 0);
+        assert!(doc.log().is_empty());
+        assert_eq!(doc.log().map_since(0, 2, crate::edit::Bias::Left), Some(2));
+    }
+
+    #[test]
+    fn a_file_appearing_where_none_was_expected_is_modified() {
+        // Regression for #9: a new path, and a deleted file that was dismissed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        let mut doc = Document::from_text("# mine\n");
+        doc.set_path(&path);
+        assert_eq!(doc.disk_status().unwrap(), DiskStatus::Unchanged);
+        std::fs::write(&path, "# theirs\n").unwrap();
+        assert_eq!(doc.disk_status().unwrap(), DiskStatus::Modified);
+
+        let path = dir.path().join("gone.md");
+        std::fs::write(&path, "# mine\n").unwrap();
+        let mut doc = Document::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(doc.disk_status().unwrap(), DiskStatus::Missing);
+        doc.acknowledge_disk_state().unwrap();
+        assert_eq!(doc.disk_status().unwrap(), DiskStatus::Unchanged);
+        std::fs::write(&path, "# theirs\n").unwrap();
+        assert_eq!(doc.disk_status().unwrap(), DiskStatus::Modified);
     }
 
     #[test]

@@ -151,6 +151,44 @@ pub fn disk_status(path: &Path, last_seen: DiskStamp) -> io::Result<DiskStatus> 
     }
 }
 
+/// The file a save to `path` should replace: `path` itself, or what its
+/// symlinks point to (followed even when the final target doesn't exist
+/// yet, so saving through a dangling link creates the target, not a file
+/// in place of the link).
+fn resolve_target(path: &Path) -> io::Result<PathBuf> {
+    let mut at = path.to_path_buf();
+    for _ in 0..40 {
+        match fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link = fs::read_link(&at)?;
+                at = match at.parent() {
+                    Some(parent) if link.is_relative() => parent.join(link),
+                    _ => link,
+                };
+            }
+            Ok(_) => return fs::canonicalize(&at),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(at),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::other("too many levels of symbolic links"))
+}
+
+/// `.{name}.inkmark-{pid}-{n}.tmp`, with `name` shortened so the whole
+/// stays within the 255-byte file name limit.
+fn temp_name(name: &std::ffi::OsStr, pid: u32, n: u64) -> std::ffi::OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    const NAME_MAX: usize = 255;
+    let suffix = format!(".inkmark-{pid}-{n}.tmp");
+    let room = NAME_MAX - 1 - suffix.len();
+    let name = name.as_bytes();
+    let mut bytes = Vec::with_capacity(NAME_MAX);
+    bytes.push(b'.');
+    bytes.extend_from_slice(&name[..name.len().min(room)]);
+    bytes.extend_from_slice(suffix.as_bytes());
+    std::ffi::OsString::from_vec(bytes)
+}
+
 /// Replaces `path` with whatever `write` produces, all or nothing.
 ///
 /// Writes a temp file in the same directory, fsyncs it, renames it over the
@@ -162,11 +200,7 @@ pub fn write_atomic(
 ) -> io::Result<DiskStamp> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    let target = match fs::canonicalize(path) {
-        Ok(real) => real,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
-        Err(e) => return Err(e),
-    };
+    let target = resolve_target(path)?;
     let dir = match target.parent() {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
         _ => PathBuf::from("."),
@@ -174,9 +208,8 @@ pub fn write_atomic(
     let name = target
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let tmp = dir.join(format!(
-        ".{}.inkmark-{}-{}.tmp",
-        name.to_string_lossy(),
+    let tmp = dir.join(temp_name(
+        name,
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed),
     ));
@@ -295,6 +328,46 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read_to_string(&real).unwrap(), "new");
+    }
+
+    #[test]
+    fn saving_through_a_dangling_symlink_keeps_the_link() {
+        // Regression for #19.
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link.md");
+        std::os::unix::fs::symlink("real.md", &link).unwrap();
+        write_atomic(&link, |w| w.write_all(b"new")).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("real.md")).unwrap(),
+            "new"
+        );
+        // A target in a missing folder fails and leaves the link alone.
+        let broken = dir.path().join("broken.md");
+        std::os::unix::fs::symlink("nowhere/real.md", &broken).unwrap();
+        assert!(write_atomic(&broken, |w| w.write_all(b"x")).is_err());
+        assert!(
+            fs::symlink_metadata(&broken)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn long_file_names_save() {
+        // Regression for #20: the temp name must fit NAME_MAX too.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{}.md", "n".repeat(252)));
+        assert_eq!(path.file_name().unwrap().len(), 255);
+        write_atomic(&path, |w| w.write_all(b"new")).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
