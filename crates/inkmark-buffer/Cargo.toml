@@ -7,3 +7,7 @@ publish.workspace = true
 
 [dependencies]
 ropey.workspace = true
+
+[dev-dependencies]
+proptest = "1.11.0"
+tempfile = "3.27.0"
