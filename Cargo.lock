@@ -1677,7 +1677,6 @@ name = "inkmark-minimap"
 version = "0.1.0"
 dependencies = [
  "egui",
- "inkmark-parse",
 ]
 
 [[package]]
@@ -1706,6 +1705,7 @@ dependencies = [
  "egui",
  "image",
  "inkmark-buffer",
+ "inkmark-minimap",
  "inkmark-parse",
  "inkmark-text",
  "tempfile",

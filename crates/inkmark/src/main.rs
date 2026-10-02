@@ -23,6 +23,7 @@ const SAVE_AS: KeyboardShortcut =
 const CYCLE_MODE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::E);
 const FOCUS_CODE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num1);
 const FOCUS_LIVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num2);
+const TOGGLE_MINIMAP: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::M);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -302,15 +303,23 @@ impl App {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (cycle, code, live) = ctx.input_mut(|i| {
+        let (cycle, code, live, minimap) = ctx.input_mut(|i| {
             // egui ignores extra Alt when matching; Ctrl+Alt+digit sets headings.
             let alt = i.modifiers.alt;
             (
                 i.consume_shortcut(&CYCLE_MODE),
                 !alt && i.consume_shortcut(&FOCUS_CODE),
                 !alt && i.consume_shortcut(&FOCUS_LIVE),
+                i.consume_shortcut(&TOGGLE_MINIMAP),
             )
         });
+        if minimap {
+            // Each pane keeps its own minimap setting.
+            match self.focus {
+                Pane::Code => self.code.show_minimap ^= true,
+                Pane::Live => self.live.show_minimap ^= true,
+            }
+        }
         if cycle {
             self.cycle_mode(ctx);
         } else if code {

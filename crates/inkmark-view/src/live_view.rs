@@ -21,7 +21,7 @@ use crate::lines::{LineIndex, SCROLLBAR_WIDTH, ScrollPos, Synced};
 use crate::live_layout::{self, LeafLayout, LeafStyle};
 use crate::motion;
 use crate::theme::{
-    BACKGROUND, CARET, CODE_BACKGROUND, LIST_MARKER, MARKUP, QUOTE_BAR, RULE, SELECTION, TEXT,
+    self, BACKGROUND, CARET, CODE_BACKGROUND, LIST_MARKER, MARKUP, QUOTE_BAR, RULE, SELECTION, TEXT,
 };
 
 const PADDING: f32 = 28.0;
@@ -87,6 +87,8 @@ pub struct LiveView {
     dragging: bool,
     /// IME composition shown at the caret until committed.
     preedit: String,
+    /// Per-pane minimap toggle; survives mode switches with the view.
+    pub show_minimap: bool,
     /// Created on the first frame, when an egui context is at hand.
     images: Option<ImageCache>,
     pub font_size: f32,
@@ -110,6 +112,7 @@ impl LiveView {
             focused: false,
             dragging: false,
             preedit: String::new(),
+            show_minimap: true,
             images: None,
             font_size: 16.0,
             line_height: 26.0,
@@ -205,12 +208,23 @@ impl LiveView {
         let rect = ui.available_rect_before_wrap();
         ui.advance_cursor_after_rect(rect);
         let bar = Rect::from_min_max(pos2(rect.right() - SCROLLBAR_WIDTH, rect.top()), rect.max);
+        let text_right = if self.show_minimap {
+            bar.left() - inkmark_minimap::WIDTH
+        } else {
+            bar.left()
+        };
+        let minimap = self.show_minimap.then(|| {
+            Rect::from_min_max(
+                pos2(text_right, rect.top()),
+                pos2(bar.left(), rect.bottom()),
+            )
+        });
         let frame = Frame {
             rect,
             left: rect.left() + PADDING,
-            width: (bar.left() - rect.left() - 2.0 * PADDING).max(80.0),
+            width: (text_right - rect.left() - 2.0 * PADDING).max(80.0),
         };
-        let text_rect = Rect::from_min_max(rect.min, pos2(bar.left(), rect.bottom()));
+        let text_rect = Rect::from_min_max(rect.min, pos2(text_right, rect.bottom()));
         let response = ui.interact(text_rect, self.id, Sense::click_and_drag());
         if response.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::Text);
@@ -263,9 +277,15 @@ impl LiveView {
         }
         let parse = state.output();
         self.handle_pointer(ui, &response, doc, parse, frame);
+        let mut minimap_hovered = false;
+        if let Some(r) = minimap {
+            let (scrolled, hovered) = self.lines.minimap_input(ui, self.id, r, rect.height());
+            self.scrolled |= scrolled;
+            minimap_hovered = hovered;
+        }
         if self
             .lines
-            .scroll_input(ui, self.id, response.hovered(), bar)
+            .scroll_input(ui, self.id, response.hovered() || minimap_hovered, bar)
         {
             self.scrolled = true;
         }
@@ -274,6 +294,9 @@ impl LiveView {
         }
         let caret = self.paint(&painter, doc, parse, frame);
         self.lines.paint_scrollbar(&painter, bar);
+        if let Some(r) = minimap {
+            self.paint_minimap(&painter, ui, doc, parse, r, rect.height());
+        }
         if self.focused {
             let to_global = ui
                 .ctx()
@@ -939,6 +962,92 @@ impl LiveView {
         caret.filter(|c| rect.intersects(*c))
     }
 
+    /// Block structure in the minimap's window: headings as thick bars,
+    /// paragraphs as rows of ink, code blocks as tinted boxes.
+    fn paint_minimap(
+        &self,
+        painter: &egui::Painter,
+        ui: &Ui,
+        doc: &Document,
+        parse: &ParseOutput,
+        rect: Rect,
+        viewport: f32,
+    ) {
+        let heights = &self.lines.heights;
+        if heights.is_empty() {
+            return;
+        }
+        let m = self.lines.minimap(rect, viewport);
+        m.paint_background(painter);
+        let (top, bottom) = m.window();
+        let row = f64::from(self.text.row_height());
+        let start = heights.line_at(top).line;
+        for leaf in parse.blocks.leaves_from(doc.line_to_byte(start)) {
+            let r = &leaf.block.range;
+            let first = doc.byte_to_line(r.start);
+            let last = doc.byte_to_line(r.end.saturating_sub(1).max(r.start));
+            let y = heights.offset_of(first);
+            if y > bottom {
+                break;
+            }
+            let h = heights.offset_of(last + 1) - y;
+            let indent = (leaf
+                .containers
+                .iter()
+                .filter(|c| !matches!(c.kind, BlockKind::List { .. }))
+                .count() as f32
+                * 0.07)
+                .min(0.5);
+            match leaf.block.kind {
+                BlockKind::Heading(level) => {
+                    let width = 1.0 - 0.12 * f32::from(level.saturating_sub(1));
+                    m.bar(
+                        painter,
+                        y + h * 0.35,
+                        h * 0.45,
+                        (indent, width.max(indent + 0.2)),
+                        theme::MINI_HEADING,
+                    );
+                }
+                BlockKind::CodeBlock { .. } | BlockKind::HtmlBlock => {
+                    m.bar(painter, y, h, (indent, 1.0), theme::MINI_CODE_BACKGROUND);
+                    let rows = (h / row).round().max(1.0) as usize;
+                    for i in 0..rows {
+                        let w = 0.35 + 0.4 * ink(first + i);
+                        m.bar(
+                            painter,
+                            y + (i as f64 + 0.3) * row,
+                            row * 0.4,
+                            (indent + 0.04, indent + w),
+                            theme::MINI_CODE,
+                        );
+                    }
+                }
+                BlockKind::ThematicBreak => {
+                    m.bar(painter, y + h / 2.0, 8.0, (indent, 1.0), theme::MINI_TEXT);
+                }
+                _ => {
+                    let rows = (h / row).round().max(1.0) as usize;
+                    for i in 0..rows {
+                        let w = if i + 1 == rows && rows > 1 {
+                            0.3 + 0.4 * ink(first + i)
+                        } else {
+                            0.85 + 0.15 * ink(first + i)
+                        };
+                        m.bar(
+                            painter,
+                            y + (i as f64 + 0.3) * row,
+                            row * 0.4,
+                            (indent, (indent + w).min(1.0)),
+                            theme::MINI_TEXT,
+                        );
+                    }
+                }
+            }
+        }
+        m.paint_viewport(painter, ui.rect_contains_pointer(rect));
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn draw_leaf(
         &mut self,
@@ -1037,6 +1146,16 @@ impl LiveView {
             self.text.draw_line(meshes, &label, label_pos, MARKUP);
         }
     }
+}
+
+/// A stable pseudo-random 0..1 per row, so paragraph ink looks ragged like
+/// text without changing from frame to frame.
+fn ink(seed: usize) -> f32 {
+    let mut x = seed as u64 ^ 0x9e37_79b9_7f4a_7c15;
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    (x % 1000) as f32 / 1000.0
 }
 
 fn container_indent(c: &inkmark_parse::Block) -> f32 {

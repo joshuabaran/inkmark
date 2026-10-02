@@ -4,6 +4,7 @@
 
 use egui::{Id, Painter, Rect, Sense, Ui, pos2, vec2};
 use inkmark_buffer::{Change, Document};
+use inkmark_minimap::Minimap;
 use inkmark_text::{HeightCache, ScrollAnchor};
 
 use crate::theme::{SCROLL_THUMB, SCROLL_TRACK};
@@ -107,6 +108,7 @@ impl LineIndex {
         let viewport = bar.height();
         let mut scrolled = false;
         let bar_response = ui.interact(bar, id.with("scrollbar"), Sense::click_and_drag());
+        keep_focus(ui, id, &bar_response);
         if (bar_response.dragged() || bar_response.clicked())
             && let Some(pos) = bar_response.interact_pointer_pos()
         {
@@ -122,6 +124,35 @@ impl LineIndex {
             scrolled = true;
         }
         scrolled
+    }
+
+    /// The minimap for this pane at `rect`, as of this frame's scroll position.
+    pub fn minimap(&self, rect: Rect, viewport: f32) -> Minimap {
+        Minimap::new(
+            rect,
+            self.heights.total(),
+            viewport,
+            self.heights.anchor_y(self.anchor),
+        )
+    }
+
+    /// Click (jump, centred) and drag (scrollbar-like) on a minimap at
+    /// `rect`. Returns (scrolled, hovered).
+    pub fn minimap_input(&mut self, ui: &Ui, id: Id, rect: Rect, viewport: f32) -> (bool, bool) {
+        let response = ui.interact(rect, id.with("minimap"), Sense::click_and_drag());
+        keep_focus(ui, id, &response);
+        let m = self.minimap(rect, viewport);
+        let pressed =
+            response.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed());
+        let target = match response.interact_pointer_pos() {
+            Some(p) if pressed => Some(m.jump_target(p.y)),
+            Some(p) if response.dragged() => Some(m.drag_target(p.y)),
+            _ => None,
+        };
+        if let Some(top) = target {
+            self.anchor = self.heights.line_at(top);
+        }
+        (target.is_some(), response.hovered())
     }
 
     pub fn paint_scrollbar(&self, painter: &Painter, bar: Rect) {
@@ -147,5 +178,15 @@ impl LineIndex {
         self.anchor.line = self.anchor.line.min(self.heights.len().saturating_sub(1));
         self.synced_epoch = Some(doc.epoch());
         Synced::Rebuilt
+    }
+}
+
+/// Clicking a pane's scrollbar or minimap keeps (or gives) keyboard focus to
+/// the pane's text, so typing carries on where the caret is.
+fn keep_focus(ui: &Ui, id: Id, response: &egui::Response) {
+    // egui drops focus on a click (the release) outside the focused widget,
+    // so reclaim it on press, click and drag end alike.
+    if response.is_pointer_button_down_on() || response.clicked() || response.drag_stopped() {
+        ui.memory_mut(|m| m.request_focus(id));
     }
 }

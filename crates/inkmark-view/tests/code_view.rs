@@ -355,3 +355,86 @@ fn bench_typing_mid_document_5mb() {
     );
     assert!(at(0.95) < 16.0);
 }
+
+/// The minimap sits just left of the 10 pt scrollbar on an 800 pt screen.
+const MINIMAP_X: f32 = 800.0 - 10.0 - inkmark_minimap::WIDTH / 2.0;
+
+#[test]
+fn minimap_click_jumps_and_drag_tracks() {
+    let text: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
+    let mut h = Harness::new(&text);
+    assert_eq!(h.view.scroll_pos().line, 0);
+    // A press near the bottom of the minimap jumps further down the document.
+    let press = |pressed| Event::PointerButton {
+        pos: pos2(MINIMAP_X, 590.0),
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    h.frame(vec![
+        Event::PointerMoved(pos2(MINIMAP_X, 590.0)),
+        press(true),
+    ]);
+    h.frame(vec![press(false)]);
+    let jumped = h.view.scroll_pos().line;
+    assert!(jumped > 100, "jumped to line {jumped}");
+    assert!(h.view.take_scrolled(), "minimap scrolling counts for sync");
+    // Dragging to the bottom edge scrolls to the end, like a scrollbar.
+    h.frame(vec![
+        Event::PointerMoved(pos2(MINIMAP_X, 300.0)),
+        Event::PointerButton {
+            pos: pos2(MINIMAP_X, 300.0),
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    for y in [350.0, 450.0, 600.0] {
+        h.frame(vec![Event::PointerMoved(pos2(MINIMAP_X, y))]);
+    }
+    assert!(
+        h.view.scroll_pos().line > 19_900,
+        "dragged to {}",
+        h.view.scroll_pos().line
+    );
+}
+
+#[test]
+fn hiding_the_minimap_widens_the_text() {
+    let long = "word ".repeat(40);
+    let mut h = Harness::new(&format!("{long}\n"));
+    h.press(Key::End);
+    let with_minimap = h.head();
+    h.view.show_minimap = false;
+    h.frame(vec![]);
+    h.key(Key::Home, Modifiers::COMMAND);
+    h.press(Key::End);
+    assert!(
+        h.head() > with_minimap,
+        "first row holds more text without the minimap"
+    );
+}
+
+#[test]
+fn clicking_minimap_or_scrollbar_keeps_typing_focus() {
+    let text: String = (0..2000).map(|i| format!("line {i}\n")).collect();
+    let mut h = Harness::new(&text);
+    for x in [MINIMAP_X, 795.0] {
+        let click = |pressed| Event::PointerButton {
+            pos: pos2(x, 300.0),
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        h.frame(vec![Event::PointerMoved(pos2(x, 300.0)), click(true)]);
+        h.frame(vec![click(false)]);
+        h.frame(vec![]);
+        let before = h.doc.len();
+        h.type_text("z");
+        assert_eq!(
+            h.doc.len(),
+            before + 1,
+            "typing after clicking at x={x} lands"
+        );
+    }
+}

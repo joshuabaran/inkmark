@@ -273,3 +273,21 @@ fn image_paragraphs_show_the_loaded_image() {
         "revealed source adds a row"
     );
 }
+
+#[test]
+fn live_minimap_click_jumps() {
+    let para = "A paragraph of prose that wraps over a couple of rows in the live view.\n\n";
+    let mut h = Harness::new(&format!("# Start\n\n{}", para.repeat(3000)));
+    let x = 800.0 - 10.0 - inkmark_minimap::WIDTH / 2.0;
+    let press = |pressed| Event::PointerButton {
+        pos: pos2(x, 590.0),
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    h.frame(vec![Event::PointerMoved(pos2(x, 590.0)), press(true)]);
+    h.frame(vec![press(false)]);
+    let parse = h.parse.output().clone();
+    let line = h.view.scroll_pos(&h.doc, &parse).line;
+    assert!(line > 100, "jumped to line {line}");
+}

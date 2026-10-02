@@ -67,3 +67,9 @@ pub const CODE_BACKGROUND: Color32 = Color32::from_rgb(30, 31, 38);
 pub const QUOTE_BAR: Color32 = Color32::from_gray(70);
 pub const RULE: Color32 = Color32::from_gray(70);
 pub const LIST_MARKER: Color32 = Color32::from_gray(140);
+
+// Minimap ink: dimmer versions of the text colors.
+pub const MINI_TEXT: Color32 = Color32::from_gray(95);
+pub const MINI_HEADING: Color32 = Color32::from_rgb(90, 130, 190);
+pub const MINI_CODE: Color32 = Color32::from_rgb(95, 135, 90);
+pub const MINI_CODE_BACKGROUND: Color32 = Color32::from_rgb(34, 36, 46);

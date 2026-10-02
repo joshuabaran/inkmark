@@ -56,6 +56,10 @@ pub struct CodeView {
     reveal_caret: u8,
     /// Set when the user scrolls (wheel, scrollbar, caret moves), for sync.
     scrolled: bool,
+    /// Height of the visible area last frame, for the minimap.
+    viewport: f32,
+    /// Per-pane minimap toggle; survives mode switches with the view.
+    pub show_minimap: bool,
     pub font_size: f32,
     pub line_height: f32,
 }
@@ -65,7 +69,10 @@ pub struct CodeView {
 struct Frame {
     rect: Rect,
     text_left: f32,
+    /// Where text stops: the minimap's left edge, or the scrollbar's.
+    text_right: f32,
     bar_left: f32,
+    minimap: Option<Rect>,
 }
 
 impl CodeView {
@@ -86,6 +93,8 @@ impl CodeView {
             last_press: None,
             reveal_caret: 0,
             scrolled: false,
+            viewport: 0.0,
+            show_minimap: true,
             font_size: 14.0,
             line_height: 21.0,
         }
@@ -168,12 +177,22 @@ impl CodeView {
     ) -> Response {
         let rect = ui.available_rect_before_wrap();
         ui.advance_cursor_after_rect(rect);
+        let bar_left = rect.right() - SCROLLBAR_WIDTH;
+        let text_right = if self.show_minimap {
+            bar_left - inkmark_minimap::WIDTH
+        } else {
+            bar_left
+        };
         let frame = Frame {
             rect,
             text_left: rect.left() + PADDING,
-            bar_left: rect.right() - SCROLLBAR_WIDTH,
+            text_right,
+            bar_left,
+            minimap: self.show_minimap.then(|| {
+                Rect::from_min_max(pos2(text_right, rect.top()), pos2(bar_left, rect.bottom()))
+            }),
         };
-        let text_rect = Rect::from_min_max(rect.min, pos2(frame.bar_left, rect.bottom()));
+        let text_rect = Rect::from_min_max(rect.min, pos2(frame.text_right, rect.bottom()));
         let response = ui.interact(text_rect, self.id, Sense::click_and_drag());
         if response.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::Text);
@@ -194,12 +213,13 @@ impl CodeView {
         });
         let focused = response.has_focus();
         let viewport = rect.height();
+        self.viewport = viewport;
 
         let config = TextConfig {
             monospace: true,
             font_size: self.font_size,
             line_height: self.line_height,
-            wrap_width: Some((frame.bar_left - frame.text_left - PADDING).max(40.0)),
+            wrap_width: Some((frame.text_right - frame.text_left - PADDING).max(40.0)),
         };
         if self.text.begin_frame(config, ui.ctx().pixels_per_point()) {
             self.lines.invalidate();
@@ -213,9 +233,15 @@ impl CodeView {
         }
         self.handle_pointer(ui, &response, doc, frame);
         let bar = Rect::from_min_max(pos2(frame.bar_left, rect.top()), rect.max);
+        let mut minimap_hovered = false;
+        if let Some(r) = frame.minimap {
+            let (scrolled, hovered) = self.lines.minimap_input(ui, self.id, r, viewport);
+            self.scrolled |= scrolled;
+            minimap_hovered = hovered;
+        }
         if self
             .lines
-            .scroll_input(ui, self.id, response.hovered(), bar)
+            .scroll_input(ui, self.id, response.hovered() || minimap_hovered, bar)
         {
             self.scrolled = true;
         }
@@ -862,6 +888,68 @@ impl CodeView {
             &painter,
             Rect::from_min_max(pos2(frame.bar_left, rect.top()), rect.max),
         );
+        if let Some(r) = frame.minimap {
+            self.paint_minimap(&painter, ui, doc, parse, r);
+        }
         caret.filter(|c| rect.intersects(*c))
+    }
+
+    /// One bar per source line in the minimap's window: indent to length,
+    /// colored by the syntax the line starts with.
+    fn paint_minimap(
+        &self,
+        painter: &egui::Painter,
+        ui: &Ui,
+        doc: &Document,
+        parse: Option<&ParseOutput>,
+        rect: Rect,
+    ) {
+        /// Characters across the minimap's full width.
+        const COLUMNS: f32 = 100.0;
+        let heights = &self.lines.heights;
+        if heights.is_empty() {
+            return;
+        }
+        let m = self.lines.minimap(rect, self.viewport);
+        m.paint_background(painter);
+        let parse = parse.filter(|p| p.map.len() == doc.len());
+        let (top, bottom) = m.window();
+        let mut line = heights.line_at(top).line;
+        let mut y = heights.offset_of(line);
+        while y < bottom && line < doc.line_count().min(heights.len()) {
+            let h = f64::from(heights.height(line));
+            let (mut indent, mut indent_bytes, mut len) = (0.0f32, 0, 0.0f32);
+            let mut in_indent = true;
+            for c in doc.rope().line(line).chars().take(COLUMNS as usize) {
+                if c == '\n' {
+                    break;
+                }
+                let w = if c == '\t' { 4.0 } else { 1.0 };
+                if in_indent && c.is_whitespace() {
+                    indent += w;
+                    indent_bytes += c.len_utf8();
+                } else {
+                    in_indent = false;
+                }
+                len += w;
+            }
+            if len > indent {
+                let start = doc.line_to_byte(line) + indent_bytes;
+                let color = parse
+                    .and_then(|p| p.map.spans_in(start..start + 1).into_iter().next())
+                    .and_then(|s| theme::code_color(&s))
+                    .map_or(theme::MINI_TEXT, |c| c.gamma_multiply(0.55));
+                m.bar(
+                    painter,
+                    y + h * 0.2,
+                    h * 0.6,
+                    (indent / COLUMNS, len.min(COLUMNS) / COLUMNS),
+                    color,
+                );
+            }
+            y += h;
+            line += 1;
+        }
+        m.paint_viewport(painter, ui.rect_contains_pointer(rect));
     }
 }

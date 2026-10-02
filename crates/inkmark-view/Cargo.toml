@@ -9,6 +9,7 @@ publish.workspace = true
 egui.workspace = true
 image.workspace = true
 inkmark-buffer.workspace = true
+inkmark-minimap.workspace = true
 inkmark-parse.workspace = true
 inkmark-text.workspace = true
 unicode-segmentation.workspace = true
