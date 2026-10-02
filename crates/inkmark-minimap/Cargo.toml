@@ -1,0 +1,10 @@
+[package]
+name = "inkmark-minimap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+egui.workspace = true
+inkmark-parse.workspace = true

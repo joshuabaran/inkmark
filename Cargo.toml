@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+inkmark-buffer = { path = "crates/inkmark-buffer" }
+inkmark-parse = { path = "crates/inkmark-parse" }
+inkmark-text = { path = "crates/inkmark-text" }
+inkmark-view = { path = "crates/inkmark-view" }
+inkmark-minimap = { path = "crates/inkmark-minimap" }
+
+cosmic-text = "0.19.0"
+eframe = "0.36.2"
+egui = "0.36.2"
+pulldown-cmark = "0.13.4"
+rfd = "0.17.2"
+ropey = "1.6.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
