@@ -265,7 +265,10 @@ pub(crate) fn build(
                 if raw
                     && !matches!(
                         k,
-                        Syntax::QuotePrefix | Syntax::ListMarker | Syntax::TableMarkup
+                        Syntax::QuotePrefix
+                            | Syntax::ListMarker
+                            | Syntax::TableMarkup
+                            | Syntax::FootnoteLabel
                     ) =>
             {
                 let font = FontStyle {

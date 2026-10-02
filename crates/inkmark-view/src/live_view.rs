@@ -1750,7 +1750,7 @@ impl LiveView {
                     }
                 }
                 BlockKind::FootnoteDefinition => {
-                    if let Some(label) = footnote_label(doc, c, &p.leaf.block) {
+                    if let Some(label) = footnote_label(doc, parse, c, &p.leaf.block) {
                         let y = top + p.body.seg_tops.first().copied().unwrap_or(0.0);
                         let marker = self.fit_marker(&label, FOOTNOTE_INDENT - 6.0);
                         self.text
@@ -1931,21 +1931,43 @@ fn leaf_lines(doc: &Document, parse: &ParseOutput, line: usize) -> Option<(usize
     ))
 }
 
-/// "•" (by nesting depth) for bullet items. Ordered items count up from
-/// the list's start number, as CommonMark renders them ("1. 1. 1." shows
-/// 1, 2, 3), keeping the source's "." or ")".
-/// A footnote definition's label, when `leaf` is its first block (the
-/// margin marker goes beside that one only).
+/// A footnote definition's label, as written, when `leaf` is its first leaf
+/// (the margin marker goes beside that one only). Read from the `[^label]:`
+/// that opens the definition; the first block may itself be a list or a
+/// quote, and a label may contain escaped brackets (`[^a\]b]`).
 fn footnote_label(
     doc: &Document,
+    parse: &ParseOutput,
     def: &inkmark_parse::Block,
     leaf: &inkmark_parse::Block,
 ) -> Option<String> {
-    let before = doc.slice(def.range.start..leaf.range.start.max(def.range.start));
-    let label = before.trim_end().strip_prefix("[^")?.strip_suffix("]:")?;
-    (!label.contains(['[', ']'])).then(|| label.to_owned())
+    let first = parse.blocks.leaves_from(def.range.start).next()?;
+    if first.block.range.start != leaf.range.start {
+        return None;
+    }
+    let line_end = doc
+        .line_range(doc.byte_to_line(def.range.start))
+        .end
+        .min(def.range.end);
+    let head = doc.slice(def.range.start..line_end);
+    let rest = head.strip_prefix("[^")?;
+    let mut escaped = false;
+    for (i, c) in rest.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            ']' => return rest[i + 1..].starts_with(':').then(|| rest[..i].to_owned()),
+            // An unescaped `[` can't be in a label: not a definition marker.
+            '[' => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
+/// "•" (by nesting depth) for bullet items. Ordered items count up from
+/// the list's start number, as CommonMark renders them ("1. 1. 1." shows
+/// 1, 2, 3), keeping the source's "." or ")".
 fn list_marker(
     doc: &Document,
     parse: &ParseOutput,
@@ -2002,6 +2024,46 @@ mod tests {
                 list_marker(&doc, &parse, &item, &leaf.containers)
             })
             .collect()
+    }
+
+    /// The margin label drawn beside each leaf of `src`, if any.
+    fn footnote_labels(src: &str) -> Vec<Option<String>> {
+        use inkmark_parse::GfmParser;
+
+        let doc = Document::from_text(src);
+        let parse = GfmParser.parse(src);
+        parse
+            .blocks
+            .leaves_from(0)
+            .map(|leaf| {
+                let def = leaf
+                    .containers
+                    .iter()
+                    .find(|c| c.kind == BlockKind::FootnoteDefinition)?;
+                footnote_label(&doc, &parse, def, &leaf.block)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_footnote_label_is_read_from_the_definitions_start() {
+        // Review of #23: a first block that is a list or quote, or a label
+        // with an escaped bracket, used to lose its margin label.
+        let one = || Some("1".to_owned());
+        assert_eq!(footnote_labels("[^1]: Note\n"), vec![one()]);
+        assert_eq!(footnote_labels("[^1]: - item\n"), vec![one()]);
+        assert_eq!(footnote_labels("[^1]: 1. item\n"), vec![one()]);
+        assert_eq!(footnote_labels("[^1]: > quote\n"), vec![one()]);
+        assert_eq!(
+            footnote_labels("[^foo\\]bar]: note\n"),
+            vec![Some("foo\\]bar".to_owned())]
+        );
+        // Beside the first leaf only.
+        assert_eq!(
+            footnote_labels("[^1]: First\n\n    Second\n"),
+            vec![one(), None]
+        );
+        assert_eq!(footnote_labels("[^1]: - a\n    - b\n"), vec![one(), None]);
     }
 
     #[test]

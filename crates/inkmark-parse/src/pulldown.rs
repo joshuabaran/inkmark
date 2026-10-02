@@ -482,12 +482,12 @@ impl<'a> Builder<'a> {
             .take_while(|o| o.block.is_none())
             .map(|o| o.tag)
             .find(|t| *t != OpenTag::Other);
-        let container = self.stack.iter().rev().map(|o| o.tag).find(|t| {
-            matches!(
-                t,
-                OpenTag::BlockQuote | OpenTag::Item | OpenTag::FootnoteDefinition
-            )
-        });
+        let container = self
+            .stack
+            .iter()
+            .rev()
+            .map(|o| o.tag)
+            .find(|t| matches!(t, OpenTag::BlockQuote | OpenTag::Item));
         let line_start = at == 0 || self.src.as_bytes()[at - 1] == b'\n';
 
         if text == "\\" {
@@ -505,6 +505,21 @@ impl<'a> Builder<'a> {
             }
             _ => {}
         }
+        // A footnote definition's own `[^label]: ` (the gap holding its
+        // first byte). Later gaps in the note, like the `[` of a link that
+        // starts a lazy continuation line, are classified as usual.
+        if let Some(def) = self
+            .stack
+            .iter()
+            .rev()
+            .find(|o| o.tag == OpenTag::FootnoteDefinition)
+            .and_then(|o| o.block)
+        {
+            let start = self.blocks[def].range.start;
+            if at <= start && start < at + text.len() {
+                return Syntax::FootnoteLabel;
+            }
+        }
         if line_start && let Some(c) = container {
             return container_syntax(c, text);
         }
@@ -517,9 +532,7 @@ impl<'a> Builder<'a> {
 }
 
 fn container_syntax(container: OpenTag, text: &str) -> Syntax {
-    if container == OpenTag::FootnoteDefinition {
-        Syntax::FootnoteLabel
-    } else if container == OpenTag::BlockQuote || text.trim_start().starts_with('>') {
+    if container == OpenTag::BlockQuote || text.trim_start().starts_with('>') {
         Syntax::QuotePrefix
     } else {
         Syntax::ListMarker
@@ -783,5 +796,56 @@ mod tests {
         let out = PulldownParser.parse(src);
         assert!(out.map.iter().all(|s| !s.style.contains(Style::FOOTNOTE)));
         assert!(out.footnotes.is_empty());
+    }
+
+    #[test]
+    fn markup_starting_a_line_in_a_footnote_keeps_its_kind() {
+        // Review of #23: only the definition's own `[^label]: ` is a label.
+        let syntax = |src: &str| -> Vec<(String, Syntax)> {
+            GfmParser
+                .parse(src)
+                .map
+                .iter()
+                .filter_map(|s| match s.kind {
+                    SpanKind::Syntax(k) => Some((src[s.range].to_owned(), k)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let label = ("[^1]: ".to_owned(), Syntax::FootnoteLabel);
+        assert_eq!(
+            syntax("[^1]: see\n[a link](http://x.com) here\n"),
+            vec![
+                label.clone(),
+                ("[".into(), Syntax::LinkMarkup),
+                ("](http://x.com)".into(), Syntax::LinkMarkup),
+            ]
+        );
+        assert_eq!(
+            syntax("[^1]: see\n*world* next\n"),
+            vec![
+                label.clone(),
+                ("*".into(), Syntax::Delimiter),
+                ("*".into(), Syntax::Delimiter),
+            ]
+        );
+        assert_eq!(
+            syntax("[^1]: see\n![alt](img.png)\n"),
+            vec![
+                label.clone(),
+                ("![".into(), Syntax::LinkMarkup),
+                ("](img.png)".into(), Syntax::LinkMarkup),
+            ]
+        );
+        assert_eq!(
+            syntax("> [^1]: q\n"),
+            vec![("> ".into(), Syntax::QuotePrefix), label.clone()]
+        );
+        // A first block that is a list or quote: the label still ends at
+        // the space, and the block's own marker keeps its kind.
+        assert_eq!(
+            syntax("[^1]: - item\n"),
+            vec![label.clone(), ("- ".into(), Syntax::ListMarker)]
+        );
     }
 }
