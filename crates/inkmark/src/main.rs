@@ -13,6 +13,9 @@ use inkmark_parse::{GfmParser, ParseState};
 use inkmark_text::Fonts;
 use inkmark_view::{BrowserOutput, CodeView, FileBrowser, LiveView};
 
+/// How long a key hint stays in the status bar.
+const HINT_TIME: Duration = Duration::from_secs(4);
+
 /// How often we look for changes made to the file by other programs.
 const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd", "txt"];
@@ -130,6 +133,8 @@ struct App {
     banner: Option<Banner>,
     /// The last thing that failed (open, save, a dialog), until dismissed.
     error: Option<String>,
+    /// A pane's explanation for a key that did nothing, shown for a moment.
+    hint: Option<(&'static str, Instant)>,
     dialog: Option<Receiver<DialogResult>>,
     confirm: Option<Confirm>,
     close_after_save: bool,
@@ -182,6 +187,7 @@ impl App {
             },
             banner: None,
             error: None,
+            hint: None,
             dialog: None,
             confirm: None,
             close_after_save: false,
@@ -617,6 +623,9 @@ impl App {
             if self.doc.is_dirty() {
                 ui.label("●");
             }
+            if let Some((hint, _)) = self.hint {
+                ui.label(RichText::new(hint).color(Color32::from_rgb(230, 200, 120)));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(if encoding.bom { "UTF-8 BOM" } else { "UTF-8" });
                 ui.label(match encoding.line_ending {
@@ -903,6 +912,16 @@ impl App {
 
     fn panes(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if let Some(hint) = self.live.take_hint() {
+            self.hint = Some((hint, Instant::now()));
+        }
+        if let Some((_, shown)) = self.hint {
+            if shown.elapsed() >= HINT_TIME {
+                self.hint = None;
+            } else {
+                ctx.request_repaint_after(HINT_TIME - shown.elapsed());
+            }
+        }
         match self.mode {
             Mode::Code => {
                 self.code.show(ui, &mut self.doc, Some(&mut self.parse));

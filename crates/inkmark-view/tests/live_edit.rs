@@ -623,3 +623,16 @@ fn a_hidden_pane_takes_the_scroll_position_as_it_is() {
     let parse = s.parse.output().clone();
     assert_eq!(s.live.scroll_pos(&s.doc, &parse).line, pos.line);
 }
+
+#[test]
+fn shift_enter_in_a_table_explains_why_it_does_nothing() {
+    // From the first review's suggestions: ignoring it is safe, but silent.
+    let src = "| a | b |\n|---|---|\n| c | d |\n";
+    let mut s = Split::new(src);
+    s.caret(src.find('c').unwrap());
+    assert_eq!(s.live.take_hint(), None);
+    s.key(Key::Enter, Modifiers::SHIFT);
+    assert_eq!(s.text(), src);
+    assert!(s.live.take_hint().is_some());
+    assert_eq!(s.live.take_hint(), None, "shown once");
+}

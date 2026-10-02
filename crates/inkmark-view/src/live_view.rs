@@ -243,6 +243,8 @@ pub struct LiveView {
     pub show_minimap: bool,
     /// The caret moved since the last edit: start a new undo step.
     seal_undo: bool,
+    /// A short explanation for a key that did nothing, for the status bar.
+    hint: Option<&'static str>,
     /// The selection was set from outside in current offsets: don't map it
     /// through edits on the next sync.
     selection_current: bool,
@@ -276,6 +278,7 @@ impl LiveView {
             preedit: String::new(),
             show_minimap: true,
             seal_undo: false,
+            hint: None,
             selection_current: false,
             pending_scroll: None,
             checkboxes: Vec::new(),
@@ -283,6 +286,11 @@ impl LiveView {
             font_size: 16.0,
             line_height: 26.0,
         }
+    }
+
+    /// Why the last key did nothing, if it's not obvious. Taken once.
+    pub fn take_hint(&mut self) -> Option<&'static str> {
+        self.hint.take()
     }
 
     pub fn selection(&self) -> Selection {
@@ -1188,7 +1196,10 @@ impl LiveView {
             Key::Tab if here + 1 < cells.len() => goto(self, cells[here + 1]),
             Key::Tab => self.add_table_row(doc, &t),
             // A line break would end the row; Shift+Enter does nothing here.
-            Key::Enter if shift => false,
+            Key::Enter if shift => {
+                self.hint = Some("A line break would end the table row");
+                false
+            }
             Key::Enter if t.row + 1 < t.rows.len() => {
                 let below = &t.rows[t.row + 1].1;
                 if below.is_empty() {
