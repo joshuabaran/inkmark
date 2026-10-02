@@ -1,8 +1,12 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
+use std::rc::Rc;
 
 use cosmic_text::{
-    Attrs, AttrsList, BufferLine, Ellipsize, Family, FontSystem, Hinting, LineEnding, Shaping, Wrap,
+    Attrs, AttrsList, BufferLine, Ellipsize, Family, FontSystem, Hinting, LineEnding, Metrics,
+    Shaping, Style, Weight, Wrap,
 };
 use egui::{Color32, Mesh, Painter, Pos2, Rect, Shape, pos2, vec2};
 
@@ -24,27 +28,118 @@ pub struct TextConfig {
     pub wrap_width: Option<f32>,
 }
 
+/// Font choices that change layout (colors don't; they apply at paint time).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FontStyle {
+    pub mono: bool,
+    pub bold: bool,
+    pub italic: bool,
+    /// Size relative to the pane's font size, in percent.
+    pub scale: u16,
+}
+
+impl Default for FontStyle {
+    fn default() -> Self {
+        Self {
+            mono: false,
+            bold: false,
+            italic: false,
+            scale: 100,
+        }
+    }
+}
+
+/// A line with styled runs. Bytes outside `runs` use the pane's default font.
+#[derive(Clone, Copy, Debug)]
+pub struct RichLine<'a> {
+    pub text: &'a str,
+    pub runs: &'a [(Range<usize>, FontStyle)],
+    /// Wrap width in points; `None` uses the pane's.
+    pub wrap_width: Option<f32>,
+}
+
+impl<'a> RichLine<'a> {
+    pub fn plain(text: &'a str) -> Self {
+        Self {
+            text,
+            runs: &[],
+            wrap_width: None,
+        }
+    }
+
+    fn key_hash(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        self.text.hash(&mut h);
+        self.runs.hash(&mut h);
+        self.wrap_width.map(f32::to_bits).hash(&mut h);
+        h.finish()
+    }
+
+    fn matches(&self, key: &LineKey) -> bool {
+        key.text == self.text
+            && key.runs == self.runs
+            && key.wrap_width == self.wrap_width.map(f32::to_bits)
+    }
+}
+
+struct LineKey {
+    text: String,
+    runs: Vec<(Range<usize>, FontStyle)>,
+    wrap_width: Option<u32>,
+}
+
 struct CachedLine {
+    key: LineKey,
     line: BufferLine,
     last_used: u64,
+}
+
+/// The font database and glyph atlas, shared by every pane's renderer.
+pub struct Fonts {
+    ctx: egui::Context,
+    font_system: FontSystem,
+    atlas: GlyphAtlas,
+    /// egui pass the atlas was last prepared for.
+    pass: Option<u64>,
+}
+
+pub type SharedFonts = Rc<RefCell<Fonts>>;
+
+impl Fonts {
+    pub fn shared(ctx: &egui::Context) -> SharedFonts {
+        Rc::new(RefCell::new(Self {
+            ctx: ctx.clone(),
+            font_system: FontSystem::new(),
+            atlas: GlyphAtlas::new(ctx),
+            pass: None,
+        }))
+    }
+
+    /// Prepares the atlas once per egui pass, however many panes draw.
+    fn begin_pass(&mut self) {
+        let pass = self.ctx.cumulative_pass_nr();
+        if self.pass != Some(pass) {
+            self.pass = Some(pass);
+            self.atlas.begin_frame();
+        }
+    }
 }
 
 /// Lays out lines with cosmic-text and paints them through the glyph atlas.
 ///
 /// Everything is laid out in physical pixels with metrics hinting, then
 /// converted to points at paint time, so glyphs land on the pixel grid at any
-/// scale factor. Layouts are cached by line text, so inserting or deleting
-/// lines doesn't invalidate the lines around them.
+/// scale factor. Layouts are cached by content (text, runs, wrap width), so
+/// inserting or deleting lines doesn't invalidate the lines around them.
 pub struct TextRenderer {
-    font_system: FontSystem,
-    atlas: GlyphAtlas,
+    fonts: SharedFonts,
     config: Option<TextConfig>,
     pixels_per_point: f32,
     /// Line height rounded to whole physical pixels.
     line_height_px: f32,
     /// Average advance of typical text, for height estimates.
     avg_advance_px: f32,
-    lines: HashMap<String, CachedLine>,
+    lines: HashMap<u64, CachedLine>,
     frame: u64,
 }
 
@@ -69,10 +164,15 @@ impl GlyphMeshes {
 }
 
 impl TextRenderer {
+    /// A renderer with its own fonts; prefer [`with_fonts`](Self::with_fonts)
+    /// when several panes are on screen.
     pub fn new(ctx: &egui::Context) -> Self {
+        Self::with_fonts(Fonts::shared(ctx))
+    }
+
+    pub fn with_fonts(fonts: SharedFonts) -> Self {
         Self {
-            font_system: FontSystem::new(),
-            atlas: GlyphAtlas::new(ctx),
+            fonts,
             config: None,
             pixels_per_point: 1.0,
             line_height_px: 0.0,
@@ -86,7 +186,7 @@ impl TextRenderer {
     /// callers must re-estimate their line heights.
     pub fn begin_frame(&mut self, config: TextConfig, pixels_per_point: f32) -> bool {
         self.frame += 1;
-        self.atlas.begin_frame();
+        self.fonts.borrow_mut().begin_pass();
         if self.config == Some(config) && self.pixels_per_point == pixels_per_point {
             return false;
         }
@@ -102,32 +202,57 @@ impl TextRenderer {
         self.config.expect("begin_frame not called")
     }
 
-    fn attrs(&self) -> Attrs<'static> {
-        let family = if self.config().monospace {
+    fn attrs(&self, style: FontStyle) -> Attrs<'static> {
+        let config = self.config();
+        let family = if style.mono || (config.monospace && style == FontStyle::default()) {
             Family::Monospace
         } else {
             Family::SansSerif
         };
-        Attrs::new().family(family)
+        let scale = f32::from(style.scale) / 100.0;
+        let ppp = self.pixels_per_point;
+        Attrs::new()
+            .family(family)
+            .weight(if style.bold {
+                Weight::BOLD
+            } else {
+                Weight::NORMAL
+            })
+            .style(if style.italic {
+                Style::Italic
+            } else {
+                Style::Normal
+            })
+            .metrics(Metrics::new(
+                config.font_size * scale * ppp,
+                (config.line_height * scale * ppp).round(),
+            ))
     }
 
-    fn new_line(&self, text: &str) -> BufferLine {
-        BufferLine::new(
-            text,
-            LineEnding::None,
-            AttrsList::new(&self.attrs()),
-            Shaping::Advanced,
-        )
+    fn new_line(&self, line: RichLine) -> BufferLine {
+        let mut attrs = AttrsList::new(&self.attrs(FontStyle::default()));
+        for (range, style) in line.runs {
+            attrs.add_span(range.clone(), &self.attrs(*style));
+        }
+        BufferLine::new(line.text, LineEnding::None, attrs, Shaping::Advanced)
     }
 
     fn measure_avg_advance(&mut self) -> f32 {
         const SAMPLE: &str = "The quick brown fox jumps over the lazy dog, then naps; 0123456789.";
         let (config, ppp) = (self.config(), self.pixels_per_point);
-        let mut line = self.new_line(SAMPLE);
-        let width = layout(&mut line, &mut self.font_system, config, ppp, false, None)
-            .iter()
-            .map(|l| l.w)
-            .sum::<f32>();
+        let mut line = self.new_line(RichLine::plain(SAMPLE));
+        let width = layout(
+            &mut line,
+            &mut self.fonts.borrow_mut().font_system,
+            config,
+            None,
+            ppp,
+            false,
+            None,
+        )
+        .iter()
+        .map(|l| l.w)
+        .sum::<f32>();
         width / SAMPLE.chars().count() as f32
     }
 
@@ -152,20 +277,26 @@ impl TextRenderer {
 
     /// Lays out `text` (cached) and returns its height in points.
     pub fn line_height(&mut self, text: &str) -> f32 {
-        let rows = self
-            .cached_line(text)
-            .layout_opt()
-            .map_or(1, |l| l.len().max(1));
-        rows as f32 * self.row_height()
+        self.rich_height(RichLine::plain(text))
+    }
+
+    pub fn rich_height(&mut self, line: RichLine) -> f32 {
+        self.rich_geometry(line).height()
     }
 
     /// Caret and hit-test geometry of `text`, in points from its top-left.
     pub fn geometry(&mut self, text: &str) -> LineGeometry {
+        self.rich_geometry(RichLine::plain(text))
+    }
+
+    pub fn rich_geometry(&mut self, line: RichLine) -> LineGeometry {
         let ppp = self.pixels_per_point;
         let line_height_px = self.line_height_px;
-        let line = self.cached_line(text);
+        let row_height = self.row_height();
+        let text_len = line.text.len();
+        let buffer_line = self.cached_line(line);
         let mut rows: Vec<Row> = Vec::new();
-        for run in line.layout_runs(None, line_height_px) {
+        for run in buffer_line.layout_runs(None, line_height_px) {
             let clusters: Vec<ClusterSpan> = run
                 .glyphs
                 .iter()
@@ -189,52 +320,59 @@ impl TextRenderer {
         }
         if rows.is_empty() {
             rows.push(Row {
-                height: self.row_height(),
+                height: row_height,
                 ..Row::default()
             });
         }
         // The last row owns everything to the end of the line.
         if let Some(last) = rows.last_mut() {
-            last.end = last.end.max(text.len());
+            last.end = last.end.max(text_len);
         }
         LineGeometry { rows }
     }
 
-    fn cached_line(&mut self, text: &str) -> &mut BufferLine {
+    fn cached_line(&mut self, line: RichLine) -> &mut BufferLine {
         let (frame, config, ppp) = (self.frame, self.config(), self.pixels_per_point);
         // Snap glyphs from monospace fallback fonts (e.g. CJK) to whole cells.
         let mono_width = config.monospace.then_some(self.avg_advance_px);
-        if !self.lines.contains_key(text) {
-            let mut line = self.new_line(text);
+        let hash = line.key_hash();
+        let hit = self.lines.get(&hash).is_some_and(|c| line.matches(&c.key));
+        if !hit {
+            let mut buffer_line = self.new_line(line);
             layout(
-                &mut line,
-                &mut self.font_system,
+                &mut buffer_line,
+                &mut self.fonts.borrow_mut().font_system,
                 config,
+                line.wrap_width,
                 ppp,
                 true,
                 mono_width,
             );
             self.lines.insert(
-                text.to_owned(),
+                hash,
                 CachedLine {
-                    line,
+                    key: LineKey {
+                        text: line.text.to_owned(),
+                        runs: line.runs.to_vec(),
+                        wrap_width: line.wrap_width.map(f32::to_bits),
+                    },
+                    line: buffer_line,
                     last_used: frame,
                 },
             );
         }
-        let cached = self.lines.get_mut(text).expect("inserted above");
+        let cached = self.lines.get_mut(&hash).expect("inserted above");
         cached.last_used = frame;
         &mut cached.line
     }
 
     /// Paints `text` with its top-left corner at `top_left` (points).
     pub fn draw_line(&mut self, out: &mut GlyphMeshes, text: &str, top_left: Pos2, color: Color32) {
-        self.draw_line_colored(out, text, top_left, color, &[]);
+        self.draw_rich(out, RichLine::plain(text), top_left, color, &[]);
     }
 
     /// Like [`draw_line`](Self::draw_line), with byte ranges of `text` drawn
-    /// in other colors. `colors` must be sorted and non-overlapping. Colors
-    /// apply at paint time, so recoloring never re-shapes.
+    /// in other colors.
     pub fn draw_line_colored(
         &mut self,
         out: &mut GlyphMeshes,
@@ -243,18 +381,31 @@ impl TextRenderer {
         color: Color32,
         colors: &[(Range<usize>, Color32)],
     ) {
+        self.draw_rich(out, RichLine::plain(text), top_left, color, colors);
+    }
+
+    /// Paints a rich line. `colors` must be sorted and non-overlapping; colors
+    /// apply at paint time, so recoloring never re-shapes.
+    pub fn draw_rich(
+        &mut self,
+        out: &mut GlyphMeshes,
+        line: RichLine,
+        top_left: Pos2,
+        color: Color32,
+        colors: &[(Range<usize>, Color32)],
+    ) {
         let ppp = self.pixels_per_point;
         let line_height_px = self.line_height_px;
         let origin = ((top_left.x * ppp).round(), (top_left.y * ppp).round());
-        self.cached_line(text);
-        let Self {
-            font_system,
-            atlas,
-            lines,
-            ..
-        } = self;
-        let line = &lines[text].line;
-        for run in line.layout_runs(None, line_height_px) {
+        // Lay out first: that may borrow the fonts itself.
+        let hash = line.key_hash();
+        self.cached_line(line);
+        let mut fonts = self.fonts.borrow_mut();
+        let Fonts {
+            font_system, atlas, ..
+        } = &mut *fonts;
+        let buffer_line = &self.lines[&hash].line;
+        for run in buffer_line.layout_runs(None, line_height_px) {
             for glyph in run.glyphs {
                 let physical = glyph.physical((origin.0, origin.1 + run.line_y), 1.0);
                 let Some(g) = atlas.get(font_system, physical.cache_key) else {
@@ -282,7 +433,7 @@ impl TextRenderer {
 
     /// Uploads new glyphs, paints the meshes and trims the line cache.
     pub fn end_frame(&mut self, out: GlyphMeshes, painter: &Painter) {
-        self.atlas.upload();
+        self.fonts.borrow_mut().atlas.upload();
         painter.extend(
             out.meshes
                 .into_iter()
@@ -296,7 +447,7 @@ impl TextRenderer {
     }
 
     pub fn atlas_stats(&self) -> AtlasStats {
-        self.atlas.stats()
+        self.fonts.borrow().atlas.stats()
     }
 
     pub fn cached_lines(&self) -> usize {
@@ -308,12 +459,13 @@ fn layout<'a>(
     line: &'a mut BufferLine,
     font_system: &mut FontSystem,
     config: TextConfig,
+    wrap_width: Option<f32>,
     pixels_per_point: f32,
     wrap: bool,
     match_mono_width: Option<f32>,
 ) -> &'a [cosmic_text::LayoutLine] {
-    let width = config
-        .wrap_width
+    let width = wrap_width
+        .or(config.wrap_width)
         .filter(|_| wrap)
         .map(|w| w * pixels_per_point);
     line.layout(

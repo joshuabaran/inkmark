@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use inkmark_parse::{MarkdownParser, PulldownParser, SpanKind, Syntax};
+use inkmark_parse::{BlockKind, MarkdownParser, PulldownParser, SpanKind, Syntax};
 use pulldown_cmark::{Event, Parser};
 
 fn examples() -> Vec<(u64, String)> {
@@ -87,6 +87,34 @@ fn spec_examples_map_every_byte() {
                 b.range.end <= src.len(),
                 "example {n}: block {b:?} past end"
             );
+        }
+        // The live view renders leaf blocks, so all visible text must be in one.
+        let leaves: Vec<_> = out
+            .blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b.kind,
+                    BlockKind::Paragraph
+                        | BlockKind::Heading(_)
+                        | BlockKind::CodeBlock { .. }
+                        | BlockKind::HtmlBlock
+                )
+            })
+            .map(|b| b.range)
+            .collect();
+        for s in out.map.iter() {
+            if matches!(s.kind, SpanKind::Text | SpanKind::Replaced(_))
+                && !leaves
+                    .iter()
+                    .any(|l| l.start <= s.range.start && s.range.end <= l.end)
+            {
+                failures.push(format!(
+                    "example {n}: visible span {:?} {:?} outside any leaf block",
+                    s.range,
+                    &src[s.range.clone()]
+                ));
+            }
         }
     }
     other.dedup();

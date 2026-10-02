@@ -12,13 +12,14 @@ use egui::{
 };
 use inkmark_buffer::{Bias, Change, Document, Edit, EditKind, Selection};
 use inkmark_parse::{ParseOutput, ParseState};
-use inkmark_text::{GlyphMeshes, HeightCache, ScrollAnchor, TextConfig, TextRenderer};
+use inkmark_text::{GlyphMeshes, ScrollAnchor, SharedFonts, TextConfig, TextRenderer};
 
+use crate::lines::SCROLLBAR_WIDTH;
+use crate::lines::{LineIndex, ScrollPos, Synced};
 use crate::motion;
-use crate::theme::{self, BACKGROUND, CARET, SCROLL_THUMB, SCROLL_TRACK, SELECTION, TEXT};
+use crate::theme::{self, BACKGROUND, CARET, SELECTION, TEXT};
 
 const PADDING: f32 = 12.0;
-const SCROLLBAR_WIDTH: f32 = 10.0;
 const CARET_WIDTH: f32 = 2.0;
 /// Width of the highlight drawn for a selected newline.
 const NEWLINE_WIDTH: f32 = 6.0;
@@ -44,17 +45,16 @@ struct Drag {
 pub struct CodeView {
     id: Id,
     text: TextRenderer,
-    heights: HeightCache,
-    anchor: ScrollAnchor,
+    lines: LineIndex,
     selection: Selection,
     /// Remembered x for repeated up/down so the caret keeps its column.
     preferred_x: Option<f32>,
-    /// Epoch the heights and selection are in sync with; `None` → rebuild.
-    synced_epoch: Option<u64>,
     preedit: String,
     drag: Option<Drag>,
     last_press: Option<(Instant, Pos2, u8)>,
     reveal_caret: u8,
+    /// Set when the user scrolls (wheel, scrollbar, caret moves), for sync.
+    scrolled: bool,
     pub font_size: f32,
     pub line_height: f32,
 }
@@ -69,18 +69,22 @@ struct Frame {
 
 impl CodeView {
     pub fn new(ctx: &egui::Context, id: Id) -> Self {
+        Self::with_fonts(inkmark_text::Fonts::shared(ctx), id)
+    }
+
+    /// A view drawing with fonts shared with other panes.
+    pub fn with_fonts(fonts: SharedFonts, id: Id) -> Self {
         Self {
             id,
-            text: TextRenderer::new(ctx),
-            heights: HeightCache::new([]),
-            anchor: ScrollAnchor::default(),
+            text: TextRenderer::with_fonts(fonts),
+            lines: LineIndex::new(),
             selection: Selection::default(),
             preferred_x: None,
-            synced_epoch: None,
             preedit: String::new(),
             drag: None,
             last_press: None,
             reveal_caret: 0,
+            scrolled: false,
             font_size: 14.0,
             line_height: 21.0,
         }
@@ -97,10 +101,52 @@ impl CodeView {
         self.reveal_caret = REVEAL_FRAMES;
     }
 
+    /// Shows `selection` without scrolling to it (mirroring the other pane).
+    pub fn mirror_selection(&mut self, selection: Selection) {
+        self.selection = selection;
+    }
+
+    pub fn has_focus(&self, ctx: &egui::Context) -> bool {
+        ctx.memory(|m| m.has_focus(self.id))
+    }
+
+    /// Where the view is scrolled to, as a source line and fraction.
+    pub fn scroll_pos(&self) -> ScrollPos {
+        let anchor = self.lines.anchor;
+        let height = if anchor.line < self.lines.heights.len() {
+            self.lines.heights.height(anchor.line)
+        } else {
+            0.0
+        };
+        ScrollPos {
+            line: anchor.line,
+            frac: if height > 0.0 {
+                anchor.offset / height
+            } else {
+                0.0
+            },
+        }
+    }
+
+    /// Scrolls to `pos` (e.g. to follow the other pane).
+    pub fn set_scroll_pos(&mut self, pos: ScrollPos) {
+        let heights = &self.lines.heights;
+        if pos.line < heights.len() {
+            self.lines.anchor = ScrollAnchor {
+                line: pos.line,
+                offset: pos.frac * heights.height(pos.line),
+            };
+        }
+    }
+
+    /// Whether the user scrolled this view since the last call.
+    pub fn take_scrolled(&mut self) -> bool {
+        std::mem::take(&mut self.scrolled)
+    }
+
     /// Forgets all per-document state, for after a new document is loaded.
     pub fn reset(&mut self) {
-        self.synced_epoch = None;
-        self.anchor = ScrollAnchor::default();
+        self.lines.reset();
         self.selection = Selection::default();
         self.preferred_x = None;
         self.preedit.clear();
@@ -155,7 +201,7 @@ impl CodeView {
             wrap_width: Some((frame.bar_left - frame.text_left - PADDING).max(40.0)),
         };
         if self.text.begin_frame(config, ui.ctx().pixels_per_point()) {
-            self.synced_epoch = None;
+            self.lines.invalidate();
         }
         self.sync(doc, true);
 
@@ -165,7 +211,13 @@ impl CodeView {
             self.preedit.clear();
         }
         self.handle_pointer(ui, &response, doc, frame);
-        self.handle_scroll(ui, &response, frame);
+        let bar = Rect::from_min_max(pos2(frame.bar_left, rect.top()), rect.max);
+        if self
+            .lines
+            .scroll_input(ui, self.id, response.hovered(), bar)
+        {
+            self.scrolled = true;
+        }
         if self.reveal_caret > 0 {
             self.scroll_caret_into_view(ui, doc, viewport);
         }
@@ -197,68 +249,19 @@ impl CodeView {
 
     // ---- document sync ----------------------------------------------------
 
-    fn rebuild_heights(&mut self, doc: &Document) {
-        let text = &self.text;
-        self.heights.reset_estimates(
-            doc.rope()
-                .lines()
-                .map(|l| text.estimate_height(l.len_chars())),
-        );
-        self.anchor.line = self.anchor.line.min(self.heights.len().saturating_sub(1));
-        self.clamp_selection(doc);
-        self.synced_epoch = Some(doc.epoch());
-    }
-
     /// Brings heights (and, for edits made elsewhere, the selection) up to
     /// date with `doc`.
     fn sync(&mut self, doc: &Document, map_selection: bool) {
-        let Some(since) = self.synced_epoch else {
-            return self.rebuild_heights(doc);
-        };
-        if since == doc.epoch() {
-            return;
-        }
-        let Some(changes) = doc.log().changes_since(since) else {
-            return self.rebuild_heights(doc);
-        };
-        let changes: Vec<Change> = changes.copied().collect();
-        for c in &changes {
-            let lines = c.lines;
-            let old = lines.start..lines.start + lines.removed + 1;
-            if old.end > self.heights.len() {
-                return self.rebuild_heights(doc);
-            }
-            // Estimates only; real heights arrive when the lines are drawn.
-            let estimates: Vec<f32> = (lines.start..lines.start + lines.inserted + 1)
-                .map(|l| {
-                    if l < doc.line_count() {
-                        self.text.estimate_height(doc.rope().line(l).len_chars())
-                    } else {
-                        self.text.row_height()
-                    }
-                })
-                .collect();
-            self.heights.splice(old, estimates.into_iter());
-            if self.anchor.line > lines.start {
-                if self.anchor.line <= lines.start + lines.removed {
-                    self.anchor = ScrollAnchor {
-                        line: lines.start,
-                        offset: 0.0,
-                    };
-                } else {
-                    self.anchor.line = self.anchor.line - lines.removed + lines.inserted;
-                }
-            }
-            if map_selection {
+        let text = &self.text;
+        if let Synced::Changed(changes) = self.lines.sync(doc, |chars| text.estimate_height(chars))
+            && map_selection
+        {
+            for c in &changes {
                 self.selection.anchor = c.map(self.selection.anchor, Bias::Left);
                 self.selection.head = c.map(self.selection.head, Bias::Left);
             }
         }
-        if self.heights.len() != doc.line_count() {
-            return self.rebuild_heights(doc);
-        }
         self.clamp_selection(doc);
-        self.synced_epoch = Some(doc.epoch());
     }
 
     fn clamp_selection(&mut self, doc: &Document) {
@@ -602,11 +605,12 @@ impl CodeView {
 
     /// Document offset under a screen position.
     fn offset_at(&mut self, doc: &Document, frame: Frame, pos: Pos2) -> usize {
-        let y = self.heights.anchor_y(self.anchor) + f64::from(pos.y - frame.rect.top());
-        let at = self.heights.line_at(y);
+        let y =
+            self.lines.heights.anchor_y(self.lines.anchor) + f64::from(pos.y - frame.rect.top());
+        let at = self.lines.heights.line_at(y);
         let text = Self::line_text(doc, at.line);
         let height = self.text.line_height(&text);
-        self.heights.set_measured(at.line, height);
+        self.lines.heights.set_measured(at.line, height);
         let geometry = self.text.geometry(&text);
         doc.line_to_byte(at.line) + geometry.hit(vec2(pos.x - frame.text_left, at.offset))
     }
@@ -667,10 +671,13 @@ impl CodeView {
                 0.0
             };
             if overshoot != 0.0 {
-                self.anchor =
-                    self.heights
-                        .scroll_by(self.anchor, overshoot * 0.5, frame.rect.height());
+                self.lines.anchor = self.lines.heights.scroll_by(
+                    self.lines.anchor,
+                    overshoot * 0.5,
+                    frame.rect.height(),
+                );
                 ui.ctx().request_repaint();
+                self.scrolled = true;
             }
             let at = self.offset_at(doc, frame, pos);
             // Word and line drags grow by whole units and keep the first one selected.
@@ -703,47 +710,29 @@ impl CodeView {
         }
     }
 
-    fn handle_scroll(&mut self, ui: &Ui, response: &Response, frame: Frame) {
-        let viewport = frame.rect.height();
-        let bar = Rect::from_min_max(pos2(frame.bar_left, frame.rect.top()), frame.rect.max);
-        let bar_response = ui.interact(bar, self.id.with("scrollbar"), Sense::click_and_drag());
-        if (bar_response.dragged() || bar_response.clicked())
-            && let Some(pos) = bar_response.interact_pointer_pos()
-        {
-            let frac = ((pos.y - bar.top()) / bar.height()).clamp(0.0, 1.0);
-            let target = f64::from(frac) * self.heights.total() - f64::from(viewport) / 2.0;
-            self.anchor = self.heights.line_at(target.max(0.0));
-            self.anchor = self.heights.scroll_by(self.anchor, 0.0, viewport);
-        }
-        let hovered = response.hovered() || bar_response.hovered();
-        let wheel = ui.input(|i| i.smooth_scroll_delta.y);
-        if hovered && wheel != 0.0 {
-            self.anchor = self.heights.scroll_by(self.anchor, -wheel, viewport);
-        }
-    }
-
     fn scroll_caret_into_view(&mut self, ui: &Ui, doc: &Document, viewport: f32) {
         self.reveal_caret -= 1;
         let head = self.selection.head;
         let line = doc.byte_to_line(head);
         let text = Self::line_text(doc, line);
         let height = self.text.line_height(&text);
-        self.heights.set_measured(line, height);
+        self.lines.heights.set_measured(line, height);
         let caret = self
             .text
             .geometry(&text)
             .caret_rect(head - doc.line_to_byte(line), CARET_WIDTH);
-        let top = self.heights.offset_of(line) + f64::from(caret.top());
+        let top = self.lines.heights.offset_of(line) + f64::from(caret.top());
         let bottom = top + f64::from(caret.height());
-        let view_top = self.heights.anchor_y(self.anchor);
+        let view_top = self.lines.heights.anchor_y(self.lines.anchor);
         if top < view_top {
-            self.anchor = self.heights.line_at(top);
+            self.lines.anchor = self.lines.heights.line_at(top);
         } else if bottom > view_top + f64::from(viewport) {
-            self.anchor = self.heights.line_at(bottom - f64::from(viewport));
+            self.lines.anchor = self.lines.heights.line_at(bottom - f64::from(viewport));
         } else {
             self.reveal_caret = 0;
             return;
         }
+        self.scrolled = true;
         if self.reveal_caret > 0 {
             ui.ctx().request_repaint();
         }
@@ -770,15 +759,15 @@ impl CodeView {
         let mut highlights = Vec::new();
         let mut colors = Vec::new();
         let mut caret = None;
-        let mut y = rect.top() - self.anchor.offset;
-        let mut line = self.anchor.line;
+        let mut y = rect.top() - self.lines.anchor.offset;
+        let mut line = self.lines.anchor.line;
         while y < rect.bottom() && line < doc.line_count() {
             let range = doc.line_range(line);
             let text = doc.slice(range.clone());
             let height = self.text.line_height(&text);
-            self.heights.set_measured(line, height);
-            if line == self.anchor.line && self.anchor.offset > height {
-                self.anchor.offset = height;
+            self.lines.heights.set_measured(line, height);
+            if line == self.lines.anchor.line && self.lines.anchor.offset > height {
+                self.lines.anchor.offset = height;
             }
             let origin = pos2(frame.text_left, y);
 
@@ -842,25 +831,10 @@ impl CodeView {
         if focused && let Some(c) = caret {
             painter.rect_filled(c, 0.0, CARET);
         }
-        self.paint_scrollbar(&painter, frame);
-        caret.filter(|c| rect.intersects(*c))
-    }
-
-    fn paint_scrollbar(&self, painter: &egui::Painter, frame: Frame) {
-        let bar = Rect::from_min_max(pos2(frame.bar_left, frame.rect.top()), frame.rect.max);
-        painter.rect_filled(bar, 0.0, SCROLL_TRACK);
-        let total = self.heights.total().max(1.0) as f32;
-        let viewport = frame.rect.height();
-        if total <= viewport {
-            return;
-        }
-        let height = (viewport / total * bar.height()).max(24.0);
-        let top = self.heights.anchor_y(self.anchor) as f32 / (total - viewport)
-            * (bar.height() - height);
-        let thumb = Rect::from_min_size(
-            pos2(bar.left() + 2.0, bar.top() + top),
-            vec2(SCROLLBAR_WIDTH - 4.0, height),
+        self.lines.paint_scrollbar(
+            &painter,
+            Rect::from_min_max(pos2(frame.bar_left, rect.top()), rect.max),
         );
-        painter.rect_filled(thumb, 3.0, SCROLL_THUMB);
+        caret.filter(|c| rect.intersects(*c))
     }
 }

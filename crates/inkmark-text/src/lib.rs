@@ -9,4 +9,6 @@ mod renderer;
 pub use atlas::{AtlasGlyph, AtlasStats, GlyphAtlas};
 pub use geometry::{ClusterSpan, LineGeometry, Row};
 pub use heights::{HeightCache, ScrollAnchor};
-pub use renderer::{GlyphMeshes, TextConfig, TextRenderer};
+pub use renderer::{
+    FontStyle, Fonts, GlyphMeshes, RichLine, SharedFonts, TextConfig, TextRenderer,
+};

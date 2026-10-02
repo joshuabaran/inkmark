@@ -3,10 +3,14 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText, ViewportCommand};
+use eframe::egui::{
+    self, Color32, Key, KeyboardShortcut, Modifiers, Rect, RichText, Stroke, UiBuilder,
+    ViewportCommand, pos2,
+};
 use inkmark_buffer::{DiskStatus, Document, LineEnding, OpenError};
 use inkmark_parse::{ParseState, PulldownParser};
-use inkmark_view::CodeView;
+use inkmark_text::Fonts;
+use inkmark_view::{CodeView, LiveView};
 
 /// How often we look for changes made to the file by other programs.
 const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -16,6 +20,22 @@ const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O)
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 const SAVE_AS: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S);
+const CYCLE_MODE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::E);
+const FOCUS_CODE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num1);
+const FOCUS_LIVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num2);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Split,
+    Code,
+    Live,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    Code,
+    Live,
+}
 
 fn main() -> eframe::Result {
     let path = std::env::args_os().nth(1).map(PathBuf::from);
@@ -57,8 +77,12 @@ enum DialogResult {
 
 struct App {
     doc: Document,
-    view: CodeView,
+    code: CodeView,
+    live: LiveView,
     parse: ParseState,
+    mode: Mode,
+    /// The pane with keyboard focus (or that last had it).
+    focus: Pane,
     banner: Option<Banner>,
     dialog: Option<Receiver<DialogResult>>,
     confirm: Option<Confirm>,
@@ -70,9 +94,14 @@ struct App {
 
 impl App {
     fn new(ctx: &egui::Context, path: Option<PathBuf>) -> Self {
+        // One font database and glyph atlas for both panes.
+        let fonts = Fonts::shared(ctx);
         let mut app = Self {
             doc: Document::default(),
-            view: CodeView::new(ctx, egui::Id::new("code_view")),
+            code: CodeView::with_fonts(fonts.clone(), egui::Id::new("code_view")),
+            live: LiveView::with_fonts(fonts, egui::Id::new("live_view")),
+            mode: Mode::Split,
+            focus: Pane::Code,
             parse: {
                 let ctx = ctx.clone();
                 // The swap point for a GFM parser later.
@@ -91,7 +120,7 @@ impl App {
         if let Some(path) = path {
             app.open(path);
         }
-        app.view.request_focus(ctx);
+        app.code.request_focus(ctx);
         app
     }
 
@@ -111,7 +140,8 @@ impl App {
                 return;
             }
         }
-        self.view.reset();
+        self.code.reset();
+        self.live.reset();
         self.parse.reset(&self.doc);
         self.banner = None;
     }
@@ -220,7 +250,72 @@ impl App {
         ctx.request_repaint_after(DISK_CHECK_INTERVAL);
     }
 
+    fn selection(&self) -> inkmark_buffer::Selection {
+        match self.focus {
+            Pane::Code => self.code.selection(),
+            Pane::Live => self.live.selection(),
+        }
+    }
+
+    /// Moves keyboard focus (with the caret and scroll position) to `pane`,
+    /// switching away from a single-pane mode that hides it.
+    fn focus_pane(&mut self, ctx: &egui::Context, pane: Pane) {
+        let selection = self.selection();
+        let parse = self.parse.output();
+        match pane {
+            Pane::Code => {
+                if self.mode == Mode::Live {
+                    self.code
+                        .set_scroll_pos(self.live.scroll_pos(&self.doc, parse));
+                    self.mode = Mode::Code;
+                }
+                self.code.set_selection(selection);
+                self.code.request_focus(ctx);
+            }
+            Pane::Live => {
+                if self.mode == Mode::Code {
+                    self.live
+                        .set_scroll_pos(&self.doc, parse, self.code.scroll_pos());
+                    self.mode = Mode::Live;
+                }
+                self.live.set_selection(selection);
+                self.live.request_focus(ctx);
+            }
+        }
+        self.focus = pane;
+    }
+
+    /// Split → code → live → split.
+    fn cycle_mode(&mut self, ctx: &egui::Context) {
+        match self.mode {
+            Mode::Split => {
+                // Pretend live was showing so focus_pane carries its position.
+                self.mode = Mode::Live;
+                self.focus_pane(ctx, Pane::Code);
+            }
+            Mode::Code => self.focus_pane(ctx, Pane::Live),
+            Mode::Live => {
+                self.mode = Mode::Split;
+                self.focus_pane(ctx, Pane::Live);
+            }
+        }
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let (cycle, code, live) = ctx.input_mut(|i| {
+            (
+                i.consume_shortcut(&CYCLE_MODE),
+                i.consume_shortcut(&FOCUS_CODE),
+                i.consume_shortcut(&FOCUS_LIVE),
+            )
+        });
+        if cycle {
+            self.cycle_mode(ctx);
+        } else if code {
+            self.focus_pane(ctx, Pane::Code);
+        } else if live {
+            self.focus_pane(ctx, Pane::Live);
+        }
         let (save_as, save, open) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&SAVE_AS),
@@ -311,7 +406,7 @@ impl App {
     }
 
     fn status_ui(&self, ui: &mut egui::Ui) {
-        let head = self.view.selection().head;
+        let head = self.selection().head;
         let line = self.doc.byte_to_line(head);
         let column = self
             .doc
@@ -377,6 +472,62 @@ impl App {
     }
 }
 
+impl App {
+    fn panes(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        match self.mode {
+            Mode::Code => {
+                self.code.show(ui, &mut self.doc, Some(&mut self.parse));
+            }
+            Mode::Live => {
+                self.live.show(ui, &mut self.doc, Some(&mut self.parse));
+            }
+            Mode::Split => {
+                let rect = ui.available_rect_before_wrap();
+                let mid = rect.center().x.round();
+                let left = Rect::from_min_max(rect.min, pos2(mid - 1.0, rect.bottom()));
+                let right = Rect::from_min_max(pos2(mid + 1.0, rect.top()), rect.max);
+                ui.scope_builder(UiBuilder::new().max_rect(left), |ui| {
+                    self.code.show(ui, &mut self.doc, Some(&mut self.parse));
+                });
+                ui.scope_builder(UiBuilder::new().max_rect(right), |ui| {
+                    self.live.show(ui, &mut self.doc, Some(&mut self.parse));
+                });
+                ui.painter().vline(
+                    mid,
+                    rect.y_range(),
+                    Stroke::new(2.0, Color32::from_gray(40)),
+                );
+            }
+        }
+
+        // Clicking into a pane moves focus there too.
+        if self.code.has_focus(&ctx) {
+            self.focus = Pane::Code;
+        } else if self.live.has_focus(&ctx) {
+            self.focus = Pane::Live;
+        }
+        // The other pane mirrors the caret and follows the scroll position.
+        let (code_scrolled, live_scrolled) = (self.code.take_scrolled(), self.live.take_scrolled());
+        let parse = self.parse.output();
+        match self.focus {
+            Pane::Code => self.live.mirror_selection(self.code.selection()),
+            Pane::Live => self.code.mirror_selection(self.live.selection()),
+        }
+        if self.mode == Mode::Split && parse.map.len() == self.doc.len() {
+            if code_scrolled {
+                self.live
+                    .set_scroll_pos(&self.doc, parse, self.code.scroll_pos());
+                ctx.request_repaint();
+            } else if live_scrolled {
+                self.code
+                    .set_scroll_pos(self.live.scroll_pos(&self.doc, parse));
+                ctx.request_repaint();
+            }
+        }
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -391,9 +542,7 @@ impl eframe::App for App {
         egui::Panel::bottom("status").show(ui, |ui| self.status_ui(ui));
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show(ui, |ui| {
-                self.view.show(ui, &mut self.doc, Some(&mut self.parse))
-            });
+            .show(ui, |ui| self.panes(ui));
         self.confirm_ui(&ctx);
         self.update_title(&ctx);
     }

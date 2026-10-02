@@ -10,7 +10,7 @@ pub const CARET: Color32 = Color32::from_rgb(120, 170, 255);
 pub const SCROLL_TRACK: Color32 = Color32::from_gray(28);
 pub const SCROLL_THUMB: Color32 = Color32::from_gray(80);
 
-const MARKUP: Color32 = Color32::from_rgb(105, 115, 135);
+pub const MARKUP: Color32 = Color32::from_rgb(105, 115, 135);
 const LINK_MARKUP: Color32 = Color32::from_rgb(85, 135, 145);
 const HEADING: Color32 = Color32::from_rgb(130, 180, 255);
 const CODE: Color32 = Color32::from_rgb(150, 200, 140);
@@ -49,3 +49,21 @@ fn text_color(style: Style) -> Option<Color32> {
     .find(|(s, _)| style.contains(*s))
     .map(|(_, c)| c)
 }
+
+/// Color of revealed syntax in the live view.
+pub fn syntax_color(span: &Span) -> Color32 {
+    match span.kind {
+        SpanKind::Syntax(Syntax::LinkMarkup) => LINK_MARKUP,
+        _ => MARKUP,
+    }
+}
+
+/// Live-view color for rendered text, or `None` for the default.
+pub fn live_color(span: &Span) -> Option<Color32> {
+    text_color(span.style)
+}
+
+pub const CODE_BACKGROUND: Color32 = Color32::from_rgb(30, 31, 38);
+pub const QUOTE_BAR: Color32 = Color32::from_gray(70);
+pub const RULE: Color32 = Color32::from_gray(70);
+pub const LIST_MARKER: Color32 = Color32::from_gray(140);

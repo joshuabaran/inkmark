@@ -37,6 +37,7 @@ enum OpenTag {
     Strong,
     Link,
     Image,
+    InlineHtml,
     /// Extension tags we don't enable; kept so the stack stays balanced.
     Other,
 }
@@ -48,6 +49,9 @@ struct Builder<'a> {
     stack: Vec<Open>,
     /// End of the last emitted span.
     cursor: usize,
+    /// Implicit paragraph for the text of a tight list item (pulldown-cmark
+    /// emits none), so every piece of inline content has a leaf block.
+    tight: Option<usize>,
 }
 
 impl<'a> Builder<'a> {
@@ -58,11 +62,13 @@ impl<'a> Builder<'a> {
             blocks: Vec::new(),
             stack: Vec::new(),
             cursor: 0,
+            tight: None,
         }
     }
 
     fn run(mut self) -> ParseOutput {
         for (event, range) in Parser::new(self.src).into_offset_iter() {
+            self.track_tight_item(&event, &range);
             match event {
                 Event::Start(tag) => {
                     self.fill_to(range.start);
@@ -75,7 +81,16 @@ impl<'a> Builder<'a> {
                 }
                 Event::Text(text) => self.text(range, &text),
                 Event::Code(text) => self.code_span(range, &text),
-                Event::Html(text) | Event::InlineHtml(text) => self.text(range, &text),
+                Event::Html(text) => self.text(range, &text),
+                Event::InlineHtml(text) => {
+                    // Shown as raw source, styled like code.
+                    self.stack.push(Open {
+                        tag: OpenTag::InlineHtml,
+                        block: None,
+                    });
+                    self.text(range, &text);
+                    self.stack.pop();
+                }
                 Event::SoftBreak => {
                     self.fill_to(range.start);
                     self.push(range, SpanKind::SoftBreak);
@@ -101,6 +116,45 @@ impl<'a> Builder<'a> {
         ParseOutput {
             blocks: BlockTree::from_blocks(self.blocks),
             map: SourceMap::from_spans(self.spans),
+        }
+    }
+
+    fn track_tight_item(&mut self, event: &Event, range: &Range<usize>) {
+        let inline = match event {
+            Event::Text(_)
+            | Event::Code(_)
+            | Event::InlineHtml(_)
+            | Event::SoftBreak
+            | Event::HardBreak => true,
+            Event::Start(tag) => !is_block(tag),
+            Event::End(end) => !is_block_end(*end),
+            _ => false,
+        };
+        if !inline {
+            self.tight = None;
+            return;
+        }
+        if self.tight.is_none() {
+            let in_item = self
+                .stack
+                .iter()
+                .rev()
+                .find(|o| o.block.is_some())
+                .map(|o| o.tag)
+                == Some(OpenTag::Item);
+            if !in_item || range.is_empty() {
+                return;
+            }
+            self.blocks.push(Block {
+                kind: BlockKind::Paragraph,
+                range: range.start..range.start,
+                depth: self.depth(),
+            });
+            self.tight = Some(self.blocks.len() - 1);
+        }
+        if let Some(i) = self.tight {
+            let block = &mut self.blocks[i].range;
+            block.end = block.end.max(range.end);
         }
     }
 
@@ -165,7 +219,7 @@ impl<'a> Builder<'a> {
                 }
                 OpenTag::BlockQuote => style.insert(Style::QUOTE),
                 OpenTag::FencedCode | OpenTag::IndentedCode => style.insert(Style::CODE_BLOCK),
-                OpenTag::HtmlBlock => style.insert(Style::HTML),
+                OpenTag::HtmlBlock | OpenTag::InlineHtml => style.insert(Style::HTML),
                 OpenTag::List | OpenTag::Item => style.insert(Style::LIST),
                 OpenTag::Emphasis => style.insert(Style::EMPHASIS),
                 OpenTag::Strong => style.insert(Style::STRONG),
@@ -251,6 +305,11 @@ impl<'a> Builder<'a> {
             style,
             heading,
         });
+        // The leaf block starts after this indentation; it now renders it.
+        if let Some(i) = self.stack.iter().rev().find_map(|o| o.block) {
+            let block = &mut self.blocks[i].range;
+            block.start = block.start.min(start);
+        }
     }
 
     /// `` `code` ``: backtick runs (and the single padding space CommonMark
@@ -364,6 +423,32 @@ fn container_syntax(container: OpenTag, text: &str) -> Syntax {
     }
 }
 
+fn is_block(tag: &Tag) -> bool {
+    !matches!(
+        tag,
+        Tag::Emphasis
+            | Tag::Strong
+            | Tag::Strikethrough
+            | Tag::Superscript
+            | Tag::Subscript
+            | Tag::Link { .. }
+            | Tag::Image { .. }
+    )
+}
+
+fn is_block_end(end: TagEnd) -> bool {
+    !matches!(
+        end,
+        TagEnd::Emphasis
+            | TagEnd::Strong
+            | TagEnd::Strikethrough
+            | TagEnd::Superscript
+            | TagEnd::Subscript
+            | TagEnd::Link
+            | TagEnd::Image
+    )
+}
+
 fn heading_level(level: HeadingLevel) -> u8 {
     match level {
         HeadingLevel::H1 => 1,
@@ -372,5 +457,107 @@ fn heading_level(level: HeadingLevel) -> u8 {
         HeadingLevel::H4 => 4,
         HeadingLevel::H5 => 5,
         HeadingLevel::H6 => 6,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blocks(src: &str) -> Vec<(BlockKind, &str, u16)> {
+        PulldownParser
+            .parse(src)
+            .blocks
+            .iter()
+            .map(|b| (b.kind, &src[b.range], b.depth))
+            .collect()
+    }
+
+    #[test]
+    fn tight_list_items_get_implicit_paragraphs() {
+        let src = "- one *em*\n  more\n- two\n  - nested\n";
+        assert_eq!(
+            blocks(src),
+            vec![
+                (
+                    BlockKind::List {
+                        ordered: false,
+                        start: 1
+                    },
+                    src,
+                    0
+                ),
+                (BlockKind::Item, "- one *em*\n  more\n", 1),
+                (BlockKind::Paragraph, "one *em*\n  more", 2),
+                (BlockKind::Item, "- two\n  - nested\n", 1),
+                (BlockKind::Paragraph, "two", 2),
+                (
+                    BlockKind::List {
+                        ordered: false,
+                        start: 1
+                    },
+                    "- nested\n",
+                    2
+                ),
+                (BlockKind::Item, "- nested\n", 3),
+                (BlockKind::Paragraph, "nested", 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn leaves_carry_their_containers() {
+        let src = "intro\n\n> - one\n>   two\n> - three\n\nend\n";
+        let tree = PulldownParser.parse(src).blocks;
+        let walk = |from: usize| -> Vec<(String, Vec<BlockKind>)> {
+            tree.leaves_from(from)
+                .map(|l| {
+                    (
+                        src[l.block.range].trim().to_owned(),
+                        l.containers.iter().map(|c| c.kind).collect(),
+                    )
+                })
+                .collect()
+        };
+        let quote_item = vec![
+            BlockKind::BlockQuote,
+            BlockKind::List {
+                ordered: false,
+                start: 1,
+            },
+            BlockKind::Item,
+        ];
+        let all = walk(0);
+        assert_eq!(all[0], ("intro".into(), vec![]));
+        assert_eq!(all[1], ("one\n>   two".into(), quote_item.clone()));
+        assert_eq!(all[2], ("three".into(), quote_item.clone()));
+        assert_eq!(all[3], ("end".into(), vec![]));
+        // Starting mid-way still knows the containers.
+        let mid = src.find("two").unwrap();
+        assert_eq!(walk(mid)[0], ("one\n>   two".into(), quote_item));
+        // Starting in a gap gives the next leaf.
+        assert_eq!(walk(src.find("\n\nend").unwrap() + 1)[0].0, "end");
+    }
+
+    #[test]
+    fn loose_lists_keep_their_own_paragraphs() {
+        let src = "- one\n\n- two\n";
+        let kinds: Vec<_> = blocks(src).into_iter().map(|(k, _, d)| (k, d)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (
+                    BlockKind::List {
+                        ordered: false,
+                        start: 1
+                    },
+                    0
+                ),
+                (BlockKind::Item, 1),
+                (BlockKind::Paragraph, 2),
+                (BlockKind::Item, 1),
+                (BlockKind::Paragraph, 2),
+            ]
+        );
     }
 }
