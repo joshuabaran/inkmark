@@ -20,7 +20,7 @@ impl Recent {
         Self::from_store(state.map(|s| s.join("inkmark/recent")))
     }
 
-    fn from_store(store: Option<PathBuf>) -> Self {
+    pub(crate) fn from_store(store: Option<PathBuf>) -> Self {
         let entries = store
             .as_deref()
             .and_then(|p| std::fs::read_to_string(p).ok())

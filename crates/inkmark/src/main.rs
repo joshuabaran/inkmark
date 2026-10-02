@@ -82,7 +82,7 @@ enum Banner {
 }
 
 /// An action waiting on "discard unsaved changes?".
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Confirm {
     /// Ctrl+O: show the open dialog.
     Open,
@@ -121,6 +121,10 @@ struct App {
 
 impl App {
     fn new(ctx: &egui::Context, path: Option<PathBuf>) -> Self {
+        Self::with_recent(ctx, path, recent::Recent::load())
+    }
+
+    fn with_recent(ctx: &egui::Context, path: Option<PathBuf>, recent: recent::Recent) -> Self {
         // One font database and glyph atlas for both panes.
         let fonts = Fonts::shared(ctx);
         let mut app = Self {
@@ -144,7 +148,7 @@ impl App {
             next_disk_check: Instant::now() + DISK_CHECK_INTERVAL,
             title: String::new(),
             measure: None,
-            recent: recent::Recent::load(),
+            recent,
             recent_list: None,
             modal_was_open: false,
         };
@@ -168,13 +172,13 @@ impl App {
     }
 
     fn open(&mut self, path: PathBuf) {
-        self.recent.add(&path);
-        match Document::open(&path) {
-            Ok(doc) => self.doc = doc,
+        let doc = match Document::open(&path) {
+            Ok(doc) => doc,
             // A path that doesn't exist yet becomes a new file there.
             Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.doc = Document::default();
-                self.doc.set_path(path);
+                let mut doc = Document::default();
+                doc.set_path(&path);
+                doc
             }
             Err(e) => {
                 self.banner = Some(Banner::Error(format!(
@@ -183,16 +187,37 @@ impl App {
                 )));
                 return;
             }
-        }
+        };
+        // Only files that opened (or are deliberately new) are remembered.
+        self.recent.add(&path);
+        self.replace_document(doc);
+    }
+
+    fn replace_document(&mut self, doc: Document) {
+        self.doc = doc;
         self.code.reset();
         self.live.reset();
         self.parse.reset(&self.doc);
         self.banner = None;
     }
 
+    /// Re-reads the open file. If it's gone, the buffer is kept (it may be
+    /// the only copy left) and the missing-file banner says so.
     fn reload(&mut self) {
-        if let Some(path) = self.doc.path().map(|p| p.to_path_buf()) {
-            self.open(path);
+        let Some(path) = self.doc.path().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        match Document::open(&path) {
+            Ok(doc) => self.replace_document(doc),
+            Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.banner = Some(Banner::DiskMissing);
+            }
+            Err(e) => {
+                self.banner = Some(Banner::Error(format!(
+                    "Couldn't reload {}: {e}",
+                    path.display()
+                )));
+            }
         }
     }
 
@@ -212,6 +237,16 @@ impl App {
     }
 
     fn save_as(&mut self, path: PathBuf) {
+        // Saving as the open file is a save: don't overwrite changes made
+        // by another program without asking.
+        let canonical = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+        let same_file = self.doc.path().is_some_and(|open| {
+            open == path || canonical(open).is_some_and(|c| Some(c) == canonical(&path))
+        });
+        if same_file && matches!(self.doc.disk_status(), Ok(DiskStatus::Modified)) {
+            self.banner = Some(Banner::DiskChanged);
+            return;
+        }
         match self.doc.save_as(&path) {
             Ok(()) => {
                 self.recent.add(&path);
@@ -268,7 +303,8 @@ impl App {
                 ctx.request_repaint_after(Duration::from_millis(100));
                 return;
             }
-            Ok(DialogResult::Open(Some(path))) => self.open(path),
+            // Edits may have been made while the dialog was up.
+            Ok(DialogResult::Open(Some(path))) => self.request_open(path),
             Ok(DialogResult::SaveAs(Some(path))) => self.save_as(path),
             Ok(DialogResult::Open(None) | DialogResult::SaveAs(None)) => {
                 self.close_after_save = false;
@@ -342,6 +378,9 @@ impl App {
             }
             Mode::Code => self.focus_pane(ctx, Pane::Live),
             Mode::Live => {
+                // The code pane was hidden: bring it to where live is.
+                let pos = self.live.scroll_pos(&self.doc, self.parse.output());
+                self.code.set_scroll_pos(pos);
                 self.mode = Mode::Split;
                 self.focus_pane(ctx, Pane::Live);
             }
@@ -717,5 +756,127 @@ impl App {
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    /// An app with its recent-files list kept in `dir`, never the real one.
+    fn app(dir: &std::path::Path, path: Option<PathBuf>) -> App {
+        let ctx = egui::Context::default();
+        let recent = recent::Recent::from_store(Some(dir.join("recent")));
+        App::with_recent(&ctx, path, recent)
+    }
+
+    fn text(app: &App) -> String {
+        app.doc.slice(0..app.doc.len()).into_owned()
+    }
+
+    fn type_into(app: &mut App, s: &str) {
+        let end = app.doc.len();
+        app.doc
+            .apply(
+                vec![inkmark_buffer::Edit::insert(end, s)],
+                inkmark_buffer::Selection::caret(end),
+                inkmark_buffer::Selection::caret(end + s.len()),
+                inkmark_buffer::EditKind::Other,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_failed_open_is_not_remembered() {
+        // Regression for #3.
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.md");
+        fs::write(&bad, b"\xff\xfe not utf-8").unwrap();
+        let mut app = app(dir.path(), None);
+        app.open(bad.clone());
+        assert!(matches!(app.banner, Some(Banner::Error(_))));
+        assert!(app.recent.entries().is_empty());
+        // A new file at a missing path is deliberate, so it is remembered.
+        app.open(dir.path().join("new.md"));
+        assert_eq!(app.recent.entries().len(), 1);
+    }
+
+    #[test]
+    fn reloading_a_deleted_file_keeps_the_buffer() {
+        // Regression for #5.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "# notes\n").unwrap();
+        let mut app = app(dir.path(), Some(path.clone()));
+        type_into(&mut app, "unsaved\n");
+        fs::remove_file(&path).unwrap();
+        app.reload();
+        assert_eq!(text(&app), "# notes\nunsaved\n");
+        assert!(app.doc.is_dirty());
+        assert!(matches!(app.banner, Some(Banner::DiskMissing)));
+    }
+
+    #[test]
+    fn save_as_the_open_file_respects_changes_on_disk() {
+        // Regression for #6.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "one\n").unwrap();
+        let mut app = app(dir.path(), Some(path.clone()));
+        type_into(&mut app, "mine\n");
+        fs::write(&path, "someone else's longer text\n").unwrap();
+        app.save_as(path.clone());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "someone else's longer text\n"
+        );
+        assert!(matches!(app.banner, Some(Banner::DiskChanged)));
+        // Saving somewhere else is fine.
+        app.save_as(dir.path().join("copy.md"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("copy.md")).unwrap(),
+            "one\nmine\n"
+        );
+    }
+
+    #[test]
+    fn a_file_chosen_in_the_open_dialog_asks_before_dropping_edits() {
+        // Regression for #7.
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other.md");
+        fs::write(&other, "other\n").unwrap();
+        let mut app = app(dir.path(), None);
+        let (tx, rx) = mpsc::channel();
+        app.dialog = Some(rx);
+        // Typing while the dialog is open.
+        type_into(&mut app, "draft");
+        tx.send(DialogResult::Open(Some(other.clone()))).unwrap();
+        app.poll_dialog(&egui::Context::default());
+        assert_eq!(text(&app), "draft");
+        assert_eq!(app.confirm, Some(Confirm::OpenPath(other)));
+    }
+
+    #[test]
+    fn leaving_live_only_mode_brings_the_code_pane_along() {
+        // Regression for #2.
+        let dir = tempfile::tempdir().unwrap();
+        let text: String = (0..200).map(|i| format!("line {i}\n\n")).collect();
+        let path = dir.path().join("long.md");
+        fs::write(&path, &text).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(path));
+        app.mode = Mode::Live;
+        app.focus = Pane::Live;
+        let pos = inkmark_view::ScrollPos {
+            line: 120,
+            frac: 0.0,
+        };
+        let parse = app.parse.output().clone();
+        app.live.set_scroll_pos(&app.doc, &parse, pos);
+        app.cycle_mode(&ctx);
+        assert!(app.mode == Mode::Split);
+        assert_eq!(app.code.scroll_pos(), pos);
     }
 }
