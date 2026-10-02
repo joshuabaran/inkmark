@@ -369,7 +369,13 @@ impl App {
             // Edits may have been made while the dialog was up.
             Ok(DialogResult::Open(Some(path))) => self.request_open(path),
             Ok(DialogResult::SaveAs(Some(path))) => self.save_as(path),
-            Ok(DialogResult::Folder(Some(path))) => self.browser.set_root(path),
+            Ok(DialogResult::Folder(Some(path))) => {
+                self.browser.set_root(path);
+                // The picker can be opened while the sidebar is hidden.
+                self.sidebar.visible = true;
+                self.sidebar.save();
+                self.browser.request_focus();
+            }
             Ok(DialogResult::Open(None) | DialogResult::SaveAs(None)) => {
                 self.close_after_save = false;
             }
@@ -1364,6 +1370,49 @@ mod tests {
         tx.send(DialogResult::Folder(Some(other.clone()))).unwrap();
         app.poll_dialog(&ctx);
         assert_eq!(app.browser.root(), other);
+        assert_eq!(app.doc.path(), Some(file.as_path()));
+        assert_eq!(text(&app), "keep\n");
+    }
+
+    #[test]
+    fn open_folder_while_hidden_shows_and_focuses_the_sidebar() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        let other = dir.path().join("other");
+        fs::create_dir(&notes).unwrap();
+        fs::create_dir(&other).unwrap();
+        let file = notes.join("a.md");
+        fs::write(&file, "keep\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::with_recent(
+            &ctx,
+            Some(file.clone()),
+            recent::Recent::from_store(Some(dir.path().join("recent"))),
+        );
+        let mut time = 0.0;
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(
+                egui::Key::E,
+                egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+            )],
+        );
+        assert!(!app.sidebar.visible);
+
+        let (tx, dialog_rx) = mpsc::channel();
+        app.dialog = Some(dialog_rx);
+        tx.send(DialogResult::Folder(Some(other.clone()))).unwrap();
+        drive(&ctx, &mut app, &mut time, vec![]);
+        assert!(app.sidebar.visible);
+        assert_eq!(app.browser.root(), other);
+        assert!(
+            app.browser.has_focus(&ctx),
+            "the sidebar did not take focus"
+        );
+        let stored = fs::read_to_string(dir.path().join("sidebar")).unwrap();
+        assert!(stored.starts_with("1\n"), "{stored}");
         assert_eq!(app.doc.path(), Some(file.as_path()));
         assert_eq!(text(&app), "keep\n");
     }
