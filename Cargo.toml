@@ -10,6 +10,7 @@ publish = false
 
 [workspace.dependencies]
 inkmark-buffer = { path = "crates/inkmark-buffer" }
+inkmark-files = { path = "crates/inkmark-files" }
 inkmark-parse = { path = "crates/inkmark-parse" }
 inkmark-text = { path = "crates/inkmark-text" }
 inkmark-view = { path = "crates/inkmark-view" }
@@ -20,6 +21,7 @@ eframe = "0.36.2"
 egui = "0.36.2"
 # Live-view images; formats limited to keep the build lean (no SVG).
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+notify = "8.2.0"
 pulldown-cmark = "0.13.4"
 rfd = "0.17.2"
 # LF-only line breaks: files are normalized to LF on load (PLAN.md §1).
