@@ -364,6 +364,78 @@ fn a_folder_change_keeps_a_sibling_subfolder_expanded() {
 }
 
 #[test]
+fn a_listing_for_a_removed_folder_does_not_land_on_the_reused_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("old");
+    fs::create_dir(&old).unwrap();
+    touch(&old.join("a.md"));
+    let mut tree = Tree::new(dir.path());
+    tree.load_pending();
+    let index = row(&mut tree, "old").index;
+    tree.set_expanded(index, true);
+    let generation = tree
+        .pending()
+        .into_iter()
+        .find(|job| job.index == index)
+        .expect("old should be waiting to list")
+        .generation;
+
+    fs::remove_dir_all(&old).unwrap();
+    touch(&dir.path().join("new.md"));
+    let root = tree.dirs_at(dir.path())[0];
+    tree.invalidate(root);
+    tree.load_pending();
+
+    let replacement = row(&mut tree, "new.md");
+    assert_eq!(
+        replacement.index, index,
+        "the removed folder's slot was not reused"
+    );
+    // The worker answers with the generation it started with.
+    tree.apply(
+        index,
+        generation,
+        Ok(vec![Entry {
+            name: "a.md".into(),
+            path: old.join("a.md"),
+            kind: Kind::File { openable: true },
+        }]),
+    );
+    let replacement = row(&mut tree, "new.md");
+    assert!(
+        matches!(replacement.kind, Kind::File { .. }),
+        "stale listing rewrote the new file: {:?}",
+        replacement.kind
+    );
+    assert!(!names(&mut tree).iter().any(|name| name.contains("a.md")));
+}
+
+#[test]
+fn replacing_a_folders_entries_does_not_grow_the_node_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tree = Tree::new(dir.path());
+    for round in 0..20 {
+        if round > 0 {
+            for i in 0..40 {
+                fs::remove_file(dir.path().join(format!("f{}-{i}.md", round - 1))).unwrap();
+            }
+        }
+        for i in 0..40 {
+            touch(&dir.path().join(format!("f{round}-{i}.md")));
+        }
+        let root = tree.dirs_at(dir.path())[0];
+        tree.invalidate(root);
+        tree.load_pending();
+    }
+    assert_eq!(tree.rows().len(), 40);
+    let stored = tree.stored_nodes();
+    assert!(
+        stored <= 50,
+        "stored {stored} nodes after replacing the folder 20 times"
+    );
+}
+
+#[test]
 fn expanding_again_reads_the_folder() {
     let dir = tempfile::tempdir().unwrap();
     let sub = dir.path().join("sub");

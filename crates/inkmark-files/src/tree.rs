@@ -46,6 +46,9 @@ pub struct Tree {
     root: PathBuf,
     show_all: bool,
     nodes: Vec<Node>,
+    /// Dead slots, reused so a folder that keeps changing does not grow the
+    /// table by one entry per reload.
+    free: Vec<usize>,
     rows: Vec<Row>,
     rows_dirty: bool,
     /// Open file whose parents should expand as listings arrive.
@@ -78,6 +81,7 @@ impl Tree {
             root,
             show_all: false,
             nodes: vec![node],
+            free: Vec::new(),
             rows: Vec::new(),
             rows_dirty: true,
             reveal: None,
@@ -86,6 +90,12 @@ impl Tree {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Slots in the node table, including ones waiting to be reused.
+    /// Reloading a folder does not grow this past the largest listing seen.
+    pub fn stored_nodes(&self) -> usize {
+        self.nodes.len()
     }
 
     pub fn root_name(&self) -> &str {
@@ -345,22 +355,30 @@ impl Tree {
                 by_path.insert(self.nodes[child].path.clone(), child);
             }
         }
-        let mut next = Vec::with_capacity(entries.len());
+        // Drop names that left before allocating the new ones, so those slots
+        // are reused in this same listing instead of one reload later.
+        let mut plan = Vec::with_capacity(entries.len());
         for entry in entries {
             if let Some(child) = by_path.remove(&entry.path) {
                 if self.nodes[child].kind.is_dir() == entry.kind.is_dir() {
                     self.reuse(child, entry);
-                    next.push(child);
+                    plan.push(Ok(child));
                     continue;
                 }
                 self.kill(child);
             }
-            next.push(self.alloc(index, entry));
+            plan.push(Err(entry));
         }
         for child in by_path.into_values() {
             self.kill(child);
         }
-        self.nodes[index].children = next;
+        self.nodes[index].children = plan
+            .into_iter()
+            .map(|item| match item {
+                Ok(child) => child,
+                Err(entry) => self.alloc(index, entry),
+            })
+            .collect();
     }
 
     fn reuse(&mut self, index: usize, entry: Entry) {
@@ -394,8 +412,7 @@ impl Tree {
     }
 
     fn alloc(&mut self, parent: usize, entry: Entry) -> usize {
-        let index = self.nodes.len();
-        self.nodes.push(Node {
+        let mut node = Node {
             parent: Some(parent),
             name: entry.name,
             path: entry.path,
@@ -406,8 +423,19 @@ impl Tree {
             generation: 1,
             alive: true,
             children: Vec::new(),
-        });
-        index
+        };
+        if let Some(index) = self.free.pop() {
+            // The slot's generation was bumped when its last occupant died.
+            // Keep that, so a listing still in flight for the old file cannot
+            // apply to this one.
+            node.generation = self.nodes[index].generation;
+            self.nodes[index] = node;
+            index
+        } else {
+            let index = self.nodes.len();
+            self.nodes.push(node);
+            index
+        }
     }
 
     fn drop_children(&mut self, index: usize) {
@@ -424,6 +452,7 @@ impl Tree {
         self.nodes[index].alive = false;
         self.nodes[index].generation += 1;
         self.drop_children(index);
+        self.free.push(index);
     }
 
     fn ancestor_canons(&mut self, index: usize) -> Vec<PathBuf> {
