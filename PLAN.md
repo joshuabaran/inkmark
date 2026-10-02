@@ -305,7 +305,7 @@ One smoke test is intentionally left failing: it wants the space after a task ma
 
 A sidebar on the left showing a folder's structure, for opening other Markdown files in it.
 
-**Done 2026-10-02** on branch `file-browser`: F1 `5c52f01`, F2 `5620cd6`, F3 `c7e6fb5`.
+**Done 2026-10-02:** F1 `5c52f01`, F2 `5620cd6`, F3 `c7e6fb5`.
 
 **Decisions (2026-10-02)**
 
