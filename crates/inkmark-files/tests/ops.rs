@@ -16,20 +16,19 @@ fn tree() -> tempfile::TempDir {
 }
 
 #[test]
-fn a_renamed_note_keeps_its_extension_unless_one_is_typed() {
+fn rename_uses_the_name_exactly_as_given() {
+    // Review of #24: guessing whether a name has an extension broke dotted
+    // names. The prompt keeps the extension by selecting only the stem.
     let dir = tree();
     let a = dir.path().join("notes/a.md");
-    let ideas = rename(&a, "ideas").unwrap();
-    assert_eq!(ideas, dir.path().join("notes/ideas.md"));
-    assert_eq!(fs::read_to_string(&ideas).unwrap(), "a");
-    assert!(!a.exists());
-    let typed = rename(&ideas, "ideas.markdown").unwrap();
-    assert_eq!(typed, dir.path().join("notes/ideas.markdown"));
-    // A non-Markdown file is renamed exactly as typed.
+    let dotted = rename(&a, "2024.01.02.md").unwrap();
+    assert_eq!(dotted, dir.path().join("notes/2024.01.02.md"));
+    assert_eq!(fs::read_to_string(&dotted).unwrap(), "a");
+    // Unchanged: nothing to do.
+    assert_eq!(rename(&dotted, "2024.01.02.md").unwrap(), dotted);
+    // Without an extension, as typed.
     let todo = rename(&dir.path().join("todo.txt"), "later").unwrap();
     assert_eq!(todo, dir.path().join("later"));
-    // Renaming to the same name is nothing to do.
-    assert_eq!(rename(&typed, "ideas.markdown").unwrap(), typed);
 }
 
 #[test]
@@ -37,7 +36,7 @@ fn rename_never_overwrites() {
     let dir = tree();
     let a = dir.path().join("notes/a.md");
     assert_eq!(
-        rename(&a, "b"),
+        rename(&a, "b.md"),
         Err(OpError::Exists(dir.path().join("notes/b.md")))
     );
     assert_eq!(fs::read_to_string(&a).unwrap(), "a");
@@ -51,12 +50,8 @@ fn rename_never_overwrites() {
         rename(&dir.path().join("notes"), "taken"),
         Err(OpError::Exists(dir.path().join("taken")))
     );
-    // A file can't take a folder's name.
-    assert_eq!(
-        rename(&a, "deep.md").map(|p| p.exists()),
-        Ok(true),
-        "deep.md is free; only the folder `deep` exists"
-    );
+    // Only the folder `deep` exists, so `deep.md` is free.
+    assert_eq!(rename(&a, "deep.md").map(|p| p.exists()), Ok(true));
     fs::create_dir(dir.path().join("notes/folder.md")).unwrap();
     assert_eq!(
         rename(&dir.path().join("notes/b.md"), "folder.md"),
@@ -99,6 +94,11 @@ fn moving_a_file_into_a_folder() {
     // Into the folder it's already in: nothing happens.
     let b = dir.path().join("notes/b.md");
     assert_eq!(move_into(&b, &dir.path().join("notes")).unwrap(), b);
+    // Review of #24: the same folder spelled differently, as a folder
+    // picker may return it, is still "already there".
+    assert_eq!(move_into(&b, &dir.path().join("notes/.")).unwrap(), b);
+    std::os::unix::fs::symlink(dir.path().join("notes"), dir.path().join("link")).unwrap();
+    assert_eq!(move_into(&b, &dir.path().join("link")).unwrap(), b);
     assert!(b.exists());
 }
 

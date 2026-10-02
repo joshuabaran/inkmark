@@ -141,6 +141,8 @@ struct RenamePrompt {
     path: PathBuf,
     name: String,
     error: Option<String>,
+    /// Select this many leading chars when the prompt first shows.
+    select: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -868,12 +870,15 @@ impl App {
         let detail = prompt.dir.display().to_string();
         let (submit, cancel) = name_modal(
             ctx,
-            "new_file",
-            "New file",
-            &detail,
-            "Create",
+            PromptText {
+                id: "new_file",
+                heading: "New file",
+                detail: &detail,
+                action: "Create",
+            },
             &mut prompt.name,
             prompt.error.as_deref(),
+            None,
         );
         if cancel {
             self.new_file = None;
@@ -885,26 +890,29 @@ impl App {
         }
     }
 
-    /// Rename… for a sidebar entry. A Markdown file's name is offered
-    /// without its extension, which `rename` keeps.
+    /// Rename… for a sidebar entry: the whole name, with the part before
+    /// a file's extension selected, so typing keeps the extension.
     fn begin_rename(&mut self, path: PathBuf) {
         if self.confirm.is_some() || self.new_file.is_some() {
             return;
         }
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let name = if !path.is_dir() && inkmark_files::is_markdown_name(&name) {
-            path.file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            name.into_owned()
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let stem_chars = match path.extension() {
+            Some(ext) if !path.is_dir() => {
+                name.chars().count() - ext.to_string_lossy().chars().count() - 1
+            }
+            _ => name.chars().count(),
         };
         self.recent_list = None;
         self.rename = Some(RenamePrompt {
             path,
             name,
             error: None,
+            select: Some(stem_chars),
         });
     }
 
@@ -915,12 +923,15 @@ impl App {
         let detail = prompt.path.display().to_string();
         let (submit, cancel) = name_modal(
             ctx,
-            "rename",
-            "Rename",
-            &detail,
-            "Rename",
+            PromptText {
+                id: "rename",
+                heading: "Rename",
+                detail: &detail,
+                action: "Rename",
+            },
             &mut prompt.name,
             prompt.error.as_deref(),
+            prompt.select.take(),
         );
         if cancel {
             self.rename = None;
@@ -983,6 +994,24 @@ impl App {
                 new.join(rest)
             };
             self.doc.moved_to(followed, was_unchanged);
+        }
+        // Places to go back to, and a jump waiting on a file, follow too.
+        let follow = |p: &mut PathBuf| {
+            if let Ok(rest) = p.strip_prefix(old) {
+                *p = if rest.as_os_str().is_empty() {
+                    new.to_path_buf()
+                } else {
+                    new.join(rest)
+                };
+            }
+        };
+        for place in &mut self.back {
+            if let Some(path) = &mut place.path {
+                follow(path);
+            }
+        }
+        if let Some((path, _)) = &mut self.pending_jump {
+            follow(path);
         }
         self.recent.moved(old, new);
         for dir in [old.parent(), new.parent()].into_iter().flatten() {
@@ -1162,6 +1191,9 @@ impl App {
                     self.back.push(here);
                 }
             }
+            links::Target::File { path, .. } if !path.exists() => {
+                self.show_hint(format!("{} doesn't exist", display_name(&path)));
+            }
             links::Target::File { path, anchor } => {
                 self.back.push(here);
                 self.pending_jump = anchor.map(|a| (path.clone(), Jump::Anchor(a)));
@@ -1177,6 +1209,11 @@ impl App {
             return;
         };
         match place.path {
+            // Gone since (deleted, or moved by another program): say so
+            // rather than open an empty new file in its place.
+            Some(path) if Some(path.as_path()) != self.doc.path() && !path.exists() => {
+                self.show_hint(format!("{} no longer exists", display_name(&path)));
+            }
             Some(path) if Some(path.as_path()) != self.doc.path() => {
                 self.pending_jump = Some((path.clone(), Jump::Offset(place.offset)));
                 self.request_open(path);
@@ -1198,13 +1235,13 @@ impl App {
         }
     }
 
-    /// Puts the caret at `offset` in the focused pane, scrolled into view.
+    /// Puts the caret at `offset`, scrolled into view. Both panes: a
+    /// Ctrl+click lands here before its release moves focus to the clicked
+    /// pane, whose caret is then mirrored to the other.
     fn jump_to(&mut self, offset: usize) {
         let caret = inkmark_buffer::Selection::caret(offset);
-        match self.focus {
-            Pane::Code => self.code.set_selection(caret),
-            Pane::Live => self.live.set_selection(caret),
-        }
+        self.code.set_selection(caret);
+        self.live.set_selection(caret);
     }
 
     /// Applies a jump waiting on a file opened from a link, once that file
@@ -1376,15 +1413,29 @@ fn display_name(path: &Path) -> String {
 
 /// A small dialog asking for a name. Returns (submit, cancel); Enter
 /// submits and Escape cancels.
+/// The fixed text of a name prompt.
+struct PromptText<'a> {
+    id: &'a str,
+    heading: &'a str,
+    /// The folder or path it applies to.
+    detail: &'a str,
+    /// The confirming button.
+    action: &'a str,
+}
+
 fn name_modal(
     ctx: &egui::Context,
-    id: &str,
-    heading: &str,
-    detail: &str,
-    action: &str,
+    text: PromptText<'_>,
     name: &mut String,
     error: Option<&str>,
+    select: Option<usize>,
 ) -> (bool, bool) {
+    let PromptText {
+        id,
+        heading,
+        detail,
+        action,
+    } = text;
     let (mut submit, mut cancel) = ctx.input_mut(|i| {
         (
             i.consume_key(Modifiers::NONE, Key::Enter),
@@ -1399,11 +1450,17 @@ fn name_modal(
         if !ui.memory(|m| m.has_focus(field)) {
             ui.memory_mut(|m| m.request_focus(field));
         }
-        ui.add(
-            egui::TextEdit::singleline(name)
-                .id(field)
-                .desired_width(f32::INFINITY),
-        );
+        let mut edit = egui::TextEdit::singleline(name)
+            .id(field)
+            .desired_width(f32::INFINITY)
+            .show(ui);
+        if let Some(n) = select {
+            use egui::text::{CCursor, CCursorRange};
+            edit.state
+                .cursor
+                .set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(n))));
+            edit.state.store(ui.ctx(), field);
+        }
         if let Some(error) = error {
             ui.label(RichText::new(error).color(Color32::from_rgb(255, 140, 120)));
         }
@@ -2101,13 +2158,17 @@ mod tests {
         let mut app = app(dir.path(), Some(old.clone()));
         type_into(&mut app, "unsaved\n");
         app.begin_rename(old.clone());
-        assert_eq!(
-            app.rename.as_ref().unwrap().name,
-            "draft",
-            "offered without .md"
-        );
-        app.rename.as_mut().unwrap().name = "final".into();
+        assert_eq!(app.rename.as_ref().unwrap().name, "draft.md");
         let mut time = 0.0;
+        // The stem is selected: typing replaces it and keeps `.md`.
+        drive(&ctx, &mut app, &mut time, vec![]);
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![egui::Event::Text("final".into())],
+        );
+        assert_eq!(app.rename.as_ref().unwrap().name, "final.md");
         drive(
             &ctx,
             &mut app,
@@ -2139,7 +2200,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = app(dir.path(), Some(a.clone()));
         app.begin_rename(a.clone());
-        app.rename.as_mut().unwrap().name = "b".into();
+        app.rename.as_mut().unwrap().name = "b.md".into();
         let mut time = 0.0;
         drive(
             &ctx,
@@ -2362,5 +2423,174 @@ mod tests {
             vec![shortcut(egui::Key::ArrowLeft, egui::Modifiers::ALT)],
         );
         assert_eq!(app.selection().head, 2);
+    }
+
+    #[test]
+    fn confirming_a_rename_unchanged_keeps_a_dotted_name() {
+        // Review of #24: `my.notes.md` used to lose its `.md`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("2024.01.02.md");
+        fs::write(&path, "x\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(path.clone()));
+        let mut time = 0.0;
+        app.begin_rename(path.clone());
+        drive(&ctx, &mut app, &mut time, vec![]);
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert!(app.rename.is_none());
+        assert!(path.exists());
+        assert_eq!(app.doc.path(), Some(path.as_path()));
+        // Editing the selected stem keeps the extension too.
+        app.begin_rename(path.clone());
+        drive(&ctx, &mut app, &mut time, vec![]);
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![egui::Event::Text("2024.01.03".into())],
+        );
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        let renamed = dir.path().join("2024.01.03.md");
+        assert!(renamed.exists());
+        assert_eq!(app.doc.path(), Some(renamed.as_path()));
+    }
+
+    #[test]
+    fn back_follows_a_rename_and_never_opens_a_missing_file() {
+        // Review of #24: Back to the old name used to open an empty new
+        // file there, dropping the note.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "Claim[^1].\n\n[^1]: Source.\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        app.jump_to(2);
+        app.follow(offset_of(&app, "[^1]"));
+        let b = dir.path().join("b.md");
+        app.begin_rename(a.clone());
+        app.rename.as_mut().unwrap().name = "b.md".into();
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert_eq!(app.doc.path(), Some(b.as_path()));
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::ArrowLeft, egui::Modifiers::ALT)],
+        );
+        assert_eq!(app.doc.path(), Some(b.as_path()));
+        assert_eq!(app.selection().head, 2);
+        assert_eq!(text(&app), "Claim[^1].\n\n[^1]: Source.\n");
+
+        // A place in a file deleted since: say so, stay put.
+        let gone = dir.path().join("gone.md");
+        app.back.push(Place {
+            path: Some(gone.clone()),
+            offset: 0,
+        });
+        app.go_back();
+        assert_eq!(app.doc.path(), Some(b.as_path()));
+        assert!(app.hint.as_ref().unwrap().0.contains("gone.md"));
+        assert!(!gone.exists());
+    }
+
+    #[test]
+    fn a_link_to_a_missing_note_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "[todo](later.md)\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        app.follow(1);
+        assert_eq!(app.doc.path(), Some(a.as_path()));
+        assert!(app.hint.as_ref().unwrap().0.contains("later.md"));
+        assert!(app.back.is_empty());
+    }
+
+    #[test]
+    fn ctrl_click_in_the_live_pane_jumps_while_the_code_pane_has_focus() {
+        // Review of #24: the jump ran before the click's release moved
+        // focus, and mirroring the clicked pane's old caret undid it.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "Claim[^1] here.\n\nMore.\n\n[^1]: The source.\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a));
+        app.sidebar.visible = false;
+        assert!(app.mode == Mode::Split && app.focus == Pane::Code);
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![egui::Event::ModifiersChanged(egui::Modifiers::COMMAND)],
+        );
+        // Find the reference in the live pane (right half) by the hand
+        // cursor Ctrl shows over links.
+        let frame_cursor = |app: &mut App, time: &mut f64, pos: egui::Pos2| {
+            *time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_max(
+                    egui::Pos2::ZERO,
+                    egui::pos2(1000.0, 700.0),
+                )),
+                time: Some(*time),
+                events: vec![egui::Event::PointerMoved(pos)],
+                ..Default::default()
+            };
+            let out = ctx.run_ui(input, |ui| app.editor(ui));
+            out.platform_output.cursor_icon
+        };
+        let y = 30.0;
+        let mut found = None;
+        for x in (520..900).step_by(3) {
+            for y in [y - 20.0, y - 10.0, y, y + 10.0] {
+                let pos = egui::pos2(x as f32, y);
+                if frame_cursor(&mut app, &mut time, pos) == egui::CursorIcon::PointingHand {
+                    found = Some(pos);
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let pos = found.expect("the reference shows a hand under Ctrl");
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        drive(&ctx, &mut app, &mut time, vec![button(true)]);
+        drive(&ctx, &mut app, &mut time, vec![button(false)]);
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+        );
+        let note = offset_of(&app, "The source");
+        assert_eq!(app.live.selection().head, note);
+        assert_eq!(app.code.selection().head, note);
     }
 }

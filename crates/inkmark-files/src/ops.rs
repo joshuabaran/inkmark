@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 use rustix::io::Errno;
 
-use crate::list::is_markdown_name;
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum OpError {
     /// No name, or a name that is a path (`a/b`, `..`).
@@ -40,21 +38,14 @@ impl std::fmt::Display for OpError {
     }
 }
 
-/// Renames `path` within its folder. A file whose new name has no
-/// extension keeps its Markdown extension (`notes.md` renamed to `ideas`
-/// becomes `ideas.md`). Returns the new path.
+/// Renames `path` within its folder to exactly `new_name`. (The prompt
+/// offers the whole name with the part before the extension selected, so
+/// typing keeps the extension; guessing one here can't tell `my.notes`
+/// from a name with an extension.) Returns the new path.
 pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, OpError> {
     let name = valid_name(new_name)?;
-    let is_dir = path.is_dir();
-    let mut file_name = name.to_owned();
-    if !is_dir
-        && Path::new(name).extension().is_none()
-        && let Some(ext) = path.extension().filter(|_| is_markdown_path(path))
-    {
-        file_name = format!("{name}.{}", ext.to_string_lossy());
-    }
     let dir = path.parent().ok_or(OpError::Invalid)?;
-    let to = dir.join(file_name);
+    let to = dir.join(name);
     if to == path {
         return Ok(to);
     }
@@ -67,7 +58,15 @@ pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, OpError> {
 pub fn move_into(path: &Path, dir: &Path) -> Result<PathBuf, OpError> {
     let name = path.file_name().ok_or(OpError::Invalid)?;
     let to = dir.join(name);
-    if path.parent() == Some(dir) {
+    // Already there, however the folder is spelled (`dir/.`, a symlink to
+    // it): nothing to do. renameat2 would call that "exists".
+    let same = |a: &Path, b: &Path| {
+        a == b
+            || a.canonicalize()
+                .ok()
+                .is_some_and(|a| Some(a) == b.canonicalize().ok())
+    };
+    if path.parent().is_some_and(|parent| same(parent, dir)) {
         return Ok(path.to_path_buf());
     }
     if path.is_dir() {
@@ -103,12 +102,6 @@ fn valid_name(name: &str) -> Result<&str, OpError> {
         return Err(OpError::Invalid);
     }
     Ok(name)
-}
-
-fn is_markdown_path(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(is_markdown_name)
 }
 
 fn rename_no_replace(from: &Path, to: &Path) -> Result<(), OpError> {

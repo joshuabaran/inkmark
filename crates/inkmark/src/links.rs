@@ -26,15 +26,35 @@ pub fn resolve(dest: &str, base: &Path) -> Target {
     if let Some(anchor) = dest.strip_prefix('#') {
         return Target::Anchor(decode(anchor));
     }
+    // `//host/path` is a URL without a scheme, not an absolute path.
+    if dest.starts_with("//") {
+        return Target::Refused("Links to other hosts aren't opened".into());
+    }
     if let Some(scheme) = scheme(dest) {
         return match scheme.to_ascii_lowercase().as_str() {
             "http" | "https" | "mailto" => Target::External(dest.to_owned()),
-            // file:///abs/path: the path after the empty host.
-            "file" => local(dest[scheme.len() + 1..].trim_start_matches("//"), base),
+            "file" => file_url(&dest[scheme.len() + 1..], base),
             _ => Target::Refused(format!("{scheme}: links aren't opened")),
         };
     }
     local(dest, base)
+}
+
+/// The part of a `file:` URL after the colon. `file:///p` and
+/// `file://localhost/p` are the local `/p` (RFC 8089); `file:/p` too. A
+/// file on another host isn't opened.
+fn file_url(rest: &str, base: &Path) -> Target {
+    let Some(authority_and_path) = rest.strip_prefix("//") else {
+        return local(rest, base);
+    };
+    let (host, path) = match authority_and_path.find('/') {
+        Some(i) => authority_and_path.split_at(i),
+        None => (authority_and_path, ""),
+    };
+    if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) || path.is_empty() {
+        return Target::Refused(format!("file: links to {host} aren't opened"));
+    }
+    local(path, base)
 }
 
 fn local(dest: &str, base: &Path) -> Target {
@@ -124,6 +144,29 @@ mod tests {
                 anchor: None
             }
         );
+        // Review of #24: a host in a file: URL, and protocol-relative links.
+        assert_eq!(
+            resolve("file://localhost/abs/z.md#h", base),
+            Target::File {
+                path: "/abs/z.md".into(),
+                anchor: Some("h".into())
+            }
+        );
+        assert_eq!(
+            resolve("file:/abs/w.md", base),
+            Target::File {
+                path: "/abs/w.md".into(),
+                anchor: None
+            }
+        );
+        assert!(matches!(
+            resolve("file://example.com/a.md", base),
+            Target::Refused(_)
+        ));
+        assert!(matches!(
+            resolve("//example.com/a.md", base),
+            Target::Refused(_)
+        ));
         assert!(matches!(
             resolve("javascript:alert(1)", base),
             Target::Refused(_)

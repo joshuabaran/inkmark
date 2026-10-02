@@ -376,11 +376,11 @@ Working with a folder of notes: manage files from the sidebar, and follow links 
 | Question | Decision |
 |---|---|
 | Delete | Moves to the freedesktop trash (restorable from the file manager), after a confirmation. No in-app undo. Trashing the open file keeps its buffer, with the missing-file banner, as when another program deletes it. |
-| Rename | In place (F2 or the context menu), prefilled with the current name. Never overwrites: an existing name is refused, atomically (`renameat2` with `RENAME_NOREPLACE`). A file keeps its extension unless you type one. |
+| Rename | F2 or the context menu, in a prompt holding the whole name with the part before the extension selected (as file managers do), so typing keeps the extension; the name is used exactly as written. Never overwrites: an existing name is refused, atomically (`renameat2` with `RENAME_NOREPLACE`). |
 | Move | Drag a row onto a folder, or **Move to…** with the portal folder picker. Same no-overwrite rule; a folder can't move into itself; moving to another filesystem is refused rather than copied. |
 | The open file | When it (or a folder above it) is renamed or moved, the document follows it: same buffer, undo history and unsaved edits, new path, and no "changed on disk" banner caused by the move itself. |
-| Links | Ctrl+click in either pane follows the link under the pointer: `http(s)` and `mailto` open in the default app (`xdg-open`); a relative or absolute path to a Markdown file opens it in inkmark, through the unsaved-changes prompt; `#heading` jumps to the heading (GitHub's slug rules), also after a file path; a footnote reference jumps to its definition. Other targets (non-Markdown files, other schemes) aren't opened: the status bar says why. |
-| Back | Alt+Left returns to where the last followed link was clicked, in the same file or the previous one. |
+| Links | Ctrl+click in either pane follows the link under the pointer: `http(s)` and `mailto` open in the default app (`xdg-open`); a relative or absolute path to a Markdown file opens it in inkmark, through the unsaved-changes prompt; `#heading` jumps to the heading (GitHub's slug rules), also after a file path; a footnote reference jumps to its definition. Other targets (non-Markdown files, a Markdown file that doesn't exist, other schemes, `//host/…`, `file:` on another host) aren't opened: the status bar says why. |
+| Back | Alt+Left returns to where the last followed link was clicked, in the same file or the previous one. The history follows renames and moves; a place in a file deleted since is reported, never reopened as a new empty file. |
 | Links to a renamed note | Not rewritten this round; that needs a cross-file search and a preview. |
 
 **Slices**
