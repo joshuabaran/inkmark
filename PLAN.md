@@ -2,7 +2,7 @@
 
 **Name (working):** `inkmark` · Rust · egui/eframe · Linux/Wayland (Omarchy/Hyprland) first · no Electron/WebView
 
-**Status:** Signed off 2026-10-01. MVP (M1–M6) and GFM (G1–G4) complete 2026-10-02; the first outside review's 21 issues are fixed. Next: the [file browser](#file-browser-next). See [Results](#results) for measurements and the [Roadmap](#roadmap) for what's planned. Changes to locked decisions require updating this doc first.
+**Status:** Signed off 2026-10-01. MVP (M1–M6), GFM (G1–G4) and the [file browser](#file-browser-next) (F1–F3) are complete as of 2026-10-02; the first outside review's 21 issues are fixed. See [Results](#results) for measurements and the [Roadmap](#roadmap) for what's planned. Changes to locked decisions require updating this doc first.
 
 ---
 
@@ -229,7 +229,7 @@ inkmark/
     inkmark-text/            # cosmic-text layout, swash glyph atlas, Mesh building, HeightCache
     inkmark-view/            # CodeView, LiveView, reveal rules, smart edit rules, hit-test, scroll sync
     inkmark-minimap/         # sampling + paint helpers
-    inkmark-files/           # (planned, file browser) folder tree model, listing, watching
+    inkmark-files/           # folder tree model, listing, watching
   fixtures/                  # CommonMark and GFM spec examples (CC-BY-SA 4.0)
   pack/                      # PKGBUILD / install notes
   README.md
@@ -305,6 +305,8 @@ One smoke test is intentionally left failing: it wants the space after a task ma
 
 A sidebar on the left showing a folder's structure, for opening other Markdown files in it.
 
+**Done 2026-10-02** on branch `file-browser`: F1 `5c52f01`, F2 `5620cd6`, F3 `c7e6fb5`.
+
 **Decisions (2026-10-02)**
 
 | Question | Decision |
@@ -325,6 +327,20 @@ A sidebar on the left showing a folder's structure, for opening other Markdown f
 | **F3** | Live updates + New file | Expanded folders are watched (inotify via the `notify` crate), so files created, renamed or deleted elsewhere appear or disappear within a second; the open file's own disk banners keep working. **New file** (Ctrl+N, or from a folder) asks for a name, adds `.md` if missing, refuses existing names, creates the file and opens it. |
 
 **Targets:** listing a folder with 10,000 entries doesn't stall the UI (listing off the UI thread, rows virtualized, frames under 16 ms); an external change shows up in the tree within 1 s; the panes' editing and scrolling numbers in [Results](#results) are unchanged with the sidebar open.
+
+**Measured 2026-10-02** on the same host, release build, sidebar open at its default width:
+
+| Measure | Target | Result |
+|---|---|---|
+| 10,000-entry folder | frames under 16 ms, only visible rows painted | frame p50 0.55 ms, p95 0.55 ms, max 0.56 ms; 26 rows painted |
+| External create / rename / delete | visible within 1 s | inotify on expanded folders; the tests poll until it appears and fail at 1 s |
+| Startup, sidebar open | unchanged | empty 116 ms · 1 MB 122 ms · 5 MB 126 ms · 10 MB 138 ms |
+| Parse settled, sidebar open | off the UI thread | 5 MB 153 ms · 10 MB 173 ms |
+| Idle RSS, sidebar open | unchanged | empty 117 MB · 1 MB 126 MB · 5 MB 156 MB · 10 MB 188 MB |
+| Scroll, split, both minimaps, sidebar open | unchanged | 240 fps, p95 frame interval 4.5 ms, at 1, 5 and 10 MB |
+| Pane benches (same harness as the table above; they don't open the sidebar) | unchanged | code edit p95 0.33 ms · live paragraph p95 4.24 ms · full reparse 68 ms · GFM 5.2 MB 96 ms · local reparse p95 0.02 ms · live scroll p95 0.66 ms · cold jumps p95 1.97 ms |
+
+A same-day run of `master` (no sidebar) on this host was empty 113 ms / 116 MB, 5 MB 120 ms / 159 MB, 10 MB 150 ms / 189 MB, scroll still 240 fps at p95 4.5 ms. Large-file RSS is higher than the [Results](#results) table on both trees; opening the sidebar does not add it. Startup and scroll with the sidebar open match that run.
 
 **Risks:** inotify watch limits on very large trees (only expanded folders are watched); slow or network filesystems (listing is off-thread and can be cancelled); symlink loops (not followed when expanding).
 
