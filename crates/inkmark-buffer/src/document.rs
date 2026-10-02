@@ -45,6 +45,19 @@ pub struct Document {
     disk_stamp: Option<DiskStamp>,
 }
 
+impl std::fmt::Debug for Document {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The text itself can be megabytes; show what identifies it.
+        f.debug_struct("Document")
+            .field("path", &self.path)
+            .field("len", &self.len())
+            .field("epoch", &self.epoch)
+            .field("dirty", &self.is_dirty())
+            .field("encoding", &self.encoding)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for Document {
     fn default() -> Self {
         Self::from_text("")
@@ -632,5 +645,16 @@ mod tests {
             .map_since(parsed_at, para, crate::edit::Bias::Left)
             .unwrap();
         assert_eq!(&doc.slice(mapped..mapped + 4), "Para");
+    }
+
+    #[test]
+    fn debug_shows_what_identifies_the_document_not_its_text() {
+        let doc = Document::from_text("secret body text");
+        let shown = format!("{doc:?}");
+        assert!(shown.contains("len: 16"), "{shown}");
+        assert!(!shown.contains("secret"), "{shown}");
+        // `unwrap_err` needs `Debug` on the success type.
+        let missing = Document::open(std::path::Path::new("/nonexistent/inkmark.md"));
+        let _ = missing.unwrap_err();
     }
 }

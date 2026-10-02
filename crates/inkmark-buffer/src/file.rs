@@ -123,14 +123,25 @@ pub fn encode(rope: &Rope, encoding: Encoding, out: &mut impl Write) -> io::Resu
 pub struct DiskStamp {
     pub modified: SystemTime,
     pub len: u64,
+    /// Which file this is (device, inode): replacing it, as an atomic save
+    /// by another program does, gives a new inode.
+    pub file_id: (u64, u64),
+    /// Status-change time. Every write sets it, and unlike mtime it can't
+    /// be set back, so a same-length rewrite that restores mtime still
+    /// shows up.
+    pub changed: (i64, i64),
 }
 
 impl DiskStamp {
     pub fn of(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
         let meta = fs::metadata(path)?;
         Ok(Self {
             modified: meta.modified()?,
             len: meta.len(),
+            file_id: (meta.dev(), meta.ino()),
+            changed: (meta.ctime(), meta.ctime_nsec()),
         })
     }
 }
@@ -224,13 +235,17 @@ pub fn write_atomic(
         out.flush()?;
         drop(out);
         file.sync_all()?;
-        fs::rename(&tmp, &target)?;
-        File::open(&dir)?.sync_all()
+        fs::rename(&tmp, &target)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result?;
+    // The new bytes are in place once the rename succeeds. Syncing the
+    // directory makes the rename itself durable; if that can't be done (a
+    // directory without read permission can't be opened), the save still
+    // happened, so it isn't reported as failed.
+    let _ = File::open(&dir).and_then(|d| d.sync_all());
     DiskStamp::of(&target)
 }
 
@@ -392,5 +407,63 @@ mod tests {
         assert_eq!(disk_status(&path, stamp).unwrap(), DiskStatus::Modified);
         fs::remove_file(&path).unwrap();
         assert_eq!(disk_status(&path, stamp).unwrap(), DiskStatus::Missing);
+    }
+
+    #[test]
+    fn a_rewrite_that_keeps_length_and_mtime_is_noticed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "one\n").unwrap();
+        let seen = DiskStamp::of(&path).unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        // Same length, same mtime, different bytes, written in place.
+        fs::write(&path, "two\n").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 4);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        assert_eq!(disk_status(&path, seen).unwrap(), DiskStatus::Modified);
+    }
+
+    #[test]
+    fn a_replaced_file_is_noticed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "one\n").unwrap();
+        let seen = DiskStamp::of(&path).unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        let other = dir.path().join("b.md");
+        fs::write(&other, "two\n").unwrap();
+        File::options()
+            .write(true)
+            .open(&other)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        fs::rename(&other, &path).unwrap();
+        assert_eq!(disk_status(&path, seen).unwrap(), DiskStatus::Modified);
+    }
+
+    #[test]
+    fn a_save_counts_even_when_the_folder_cant_be_synced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("locked");
+        fs::create_dir(&sub).unwrap();
+        let path = sub.join("a.md");
+        fs::write(&path, "old\n").unwrap();
+        // Writable and searchable, but not readable: the folder can't be
+        // opened to fsync it.
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o311)).unwrap();
+        let result = write_atomic(&path, |out| out.write_all(b"new\n"));
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        let stamp = result.expect("the bytes were saved");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        assert_eq!(disk_status(&path, stamp).unwrap(), DiskStatus::Unchanged);
     }
 }
