@@ -192,6 +192,29 @@ fn wait_for_names(h: &mut Harness, mut pred: impl FnMut(&[String]) -> bool) {
 }
 
 #[test]
+fn a_new_sibling_does_not_collapse_an_expanded_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    fs::create_dir(&projects).unwrap();
+    fs::write(projects.join("note.md"), "n\n").unwrap();
+    fs::write(dir.path().join("todo.md"), "t\n").unwrap();
+    let mut h = Harness::new(dir.path());
+    h.wait_until(|browser| browser.row_names().iter().any(|name| name == "projects"));
+    h.browser.request_focus();
+    h.press(Key::ArrowDown);
+    h.press(Key::ArrowRight);
+    h.wait_until(|browser| browser.row_names().iter().any(|name| name == "note.md"));
+
+    fs::write(dir.path().join("later.md"), "l\n").unwrap();
+    wait_for_names(&mut h, |names| names.iter().any(|name| name == "later.md"));
+    assert!(
+        h.browser.row_names().iter().any(|name| name == "note.md"),
+        "expanded folder collapsed: {:?}",
+        h.browser.row_names()
+    );
+}
+
+#[test]
 fn external_create_rename_and_delete_show_up_in_the_sidebar() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.md"), "a\n").unwrap();

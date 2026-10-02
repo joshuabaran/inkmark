@@ -325,6 +325,45 @@ fn the_root_follows_a_file_a_folder_a_missing_path_or_no_argument() {
 }
 
 #[test]
+fn a_folder_change_keeps_a_sibling_subfolder_expanded() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    let src = projects.join("src");
+    fs::create_dir_all(&src).unwrap();
+    touch(&src.join("main.md"));
+    touch(&dir.path().join("todo.md"));
+
+    let mut tree = Tree::new(dir.path());
+    tree.load_pending();
+    let projects_index = row(&mut tree, "projects").index;
+    tree.expand(projects_index);
+    let src_index = row(&mut tree, "src").index;
+    tree.expand(src_index);
+    assert!(row(&mut tree, "projects").expanded);
+    assert!(row(&mut tree, "src").expanded);
+
+    // A sibling save re-lists the parent. The expanded folders have to stay.
+    fs::remove_file(dir.path().join("todo.md")).unwrap();
+    touch(&dir.path().join("later.md"));
+    let root = tree.dirs_at(dir.path())[0];
+    tree.invalidate(root);
+    tree.load_pending();
+
+    assert!(row(&mut tree, "projects").expanded, "projects collapsed");
+    assert!(row(&mut tree, "src").expanded, "src collapsed");
+    let listed = names(&mut tree);
+    assert!(
+        listed.iter().any(|name| name == "    main.md"),
+        "{listed:?}"
+    );
+    assert!(listed.iter().any(|name| name == "later.md"), "{listed:?}");
+    assert!(
+        !listed.iter().any(|name| name == "todo.md"),
+        "removed file stayed: {listed:?}"
+    );
+}
+
+#[test]
 fn expanding_again_reads_the_folder() {
     let dir = tempfile::tempdir().unwrap();
     let sub = dir.path().join("sub");

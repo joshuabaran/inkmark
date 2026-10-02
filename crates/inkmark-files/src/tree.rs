@@ -1,6 +1,7 @@
 //! Lazy folder tree. A directory's children are read the first time it is
 //! expanded; nothing walks the tree ahead of that.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -197,12 +198,13 @@ impl Tree {
         self.finish(index, generation, listing);
     }
 
-    /// Forgets one directory's children so the next load reads the disk again.
+    /// Marks one directory stale so the next load reads the disk again.
+    /// Children stay until that listing is merged, so an expanded subfolder
+    /// stays expanded when a sibling is created, renamed or deleted.
     pub fn invalidate(&mut self, index: usize) {
         if !self.nodes.get(index).is_some_and(|node| node.alive) {
             return;
         }
-        self.drop_children(index);
         self.nodes[index].loaded = false;
         self.nodes[index].generation += 1;
         self.rows_dirty = true;
@@ -305,25 +307,23 @@ impl Tree {
         if !node.alive || node.generation != generation {
             return;
         }
-        self.drop_children(index);
         match listing {
             Listing::Entries(entries) => {
                 self.nodes[index].kind = Kind::Dir {
                     unreadable: false,
                     looped: false,
                 };
-                for entry in entries {
-                    let child = self.alloc(index, entry);
-                    self.nodes[index].children.push(child);
-                }
+                self.adopt(index, entries);
             }
             Listing::Unreadable => {
+                self.drop_children(index);
                 self.nodes[index].kind = Kind::Dir {
                     unreadable: true,
                     looped: false,
                 };
             }
             Listing::Loop => {
+                self.drop_children(index);
                 self.nodes[index].kind = Kind::Dir {
                     unreadable: false,
                     looped: true,
@@ -333,6 +333,64 @@ impl Tree {
         self.nodes[index].loaded = true;
         self.rows_dirty = true;
         self.nudge_reveal();
+    }
+
+    /// Keeps a child whose path is still in the folder, in the new order.
+    /// A file that became a directory (or the reverse) is a different node.
+    fn adopt(&mut self, index: usize, entries: Vec<Entry>) {
+        let old = std::mem::take(&mut self.nodes[index].children);
+        let mut by_path = HashMap::with_capacity(old.len());
+        for child in old {
+            if self.nodes[child].alive {
+                by_path.insert(self.nodes[child].path.clone(), child);
+            }
+        }
+        let mut next = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if let Some(child) = by_path.remove(&entry.path) {
+                if self.nodes[child].kind.is_dir() == entry.kind.is_dir() {
+                    self.reuse(child, entry);
+                    next.push(child);
+                    continue;
+                }
+                self.kill(child);
+            }
+            next.push(self.alloc(index, entry));
+        }
+        for child in by_path.into_values() {
+            self.kill(child);
+        }
+        self.nodes[index].children = next;
+    }
+
+    fn reuse(&mut self, index: usize, entry: Entry) {
+        self.nodes[index].name = entry.name;
+        match (self.nodes[index].kind, entry.kind) {
+            (Kind::File { .. }, kind @ Kind::File { .. }) => {
+                self.nodes[index].kind = kind;
+            }
+            (
+                Kind::Dir { looped, unreadable },
+                Kind::Dir {
+                    looped: now_looped,
+                    unreadable: now_unreadable,
+                },
+            ) => {
+                // The parent listing cannot see an ancestor cycle, so a loop
+                // found while expanding has to stay. A folder that is now a
+                // self-loop or unreadable loses the children it had.
+                if now_looped || now_unreadable {
+                    self.nodes[index].kind = entry.kind;
+                    self.drop_children(index);
+                    self.nodes[index].loaded = true;
+                } else if unreadable && !looped {
+                    self.nodes[index].kind = entry.kind;
+                    self.nodes[index].loaded = false;
+                    self.nodes[index].generation += 1;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn alloc(&mut self, parent: usize, entry: Entry) -> usize {
