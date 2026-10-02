@@ -53,6 +53,37 @@ impl Split {
         self.frame(vec![]);
     }
 
+    /// One frame with only one pane shown, mirroring the app's single-pane
+    /// modes: the shown pane's caret is copied onto the hidden one.
+    fn frame_one(&mut self, events: Vec<Event>, code: bool) {
+        self.time += 1.0 / 60.0;
+        let input = RawInput {
+            screen_rect: Some(SCREEN),
+            time: Some(self.time),
+            events,
+            ..Default::default()
+        };
+        let (code_view, live, doc, parse) = (
+            &mut self.code,
+            &mut self.live,
+            &mut self.doc,
+            &mut self.parse,
+        );
+        let mut out = self.ctx.run_ui(input, |ui| {
+            if code {
+                code_view.show(ui, doc, Some(parse));
+            } else {
+                live.show(ui, doc, Some(parse));
+            }
+        });
+        out.textures_delta.clear();
+        if code {
+            self.live.mirror_selection(self.code.selection());
+        } else {
+            self.code.mirror_selection(self.live.selection());
+        }
+    }
+
     fn frame(&mut self, events: Vec<Event>) {
         self.time += 1.0 / 60.0;
         let input = RawInput {
@@ -525,4 +556,70 @@ fn a_caret_move_ends_the_undo_group() {
     s.type_text("c");
     s.key(Key::Z, Modifiers::COMMAND);
     assert_eq!(s.text(), "helloab");
+}
+
+#[test]
+fn a_hidden_pane_takes_the_caret_as_it_is() {
+    // Regression for #13: the hidden pane must not map the caret it was
+    // handed through the same edits a second time.
+    let mut s = Split::new("hello\n");
+    s.code.request_focus(&s.ctx);
+    s.frame_one(vec![], true);
+    s.code.set_selection(Selection::caret(0));
+    for ch in ["X", "Y", "Z"] {
+        s.frame_one(vec![Event::Text(ch.into())], true);
+    }
+    assert_eq!(s.code.selection().head, 3);
+    s.live.request_focus(&s.ctx);
+    for _ in 0..4 {
+        s.frame_one(vec![], false);
+    }
+    assert_eq!(s.live.selection().head, 3);
+}
+
+#[test]
+fn a_hidden_pane_takes_the_scroll_position_as_it_is() {
+    // Regression for #13, scroll half: the position handed to the hidden
+    // pane is already current. This document is one long paragraph, which
+    // also checks positions inside a block that hasn't been drawn yet.
+    let text: String = (0..50).map(|i| format!("line {i}\n")).collect();
+    let mut s = Split::new(&text);
+    let parse = s.parse.output().clone();
+    s.code.set_scroll_pos(inkmark_view::ScrollPos {
+        line: 40,
+        frac: 0.0,
+    });
+    s.live.set_scroll_pos(
+        &s.doc,
+        &parse,
+        inkmark_view::ScrollPos {
+            line: 40,
+            frac: 0.0,
+        },
+    );
+    s.frame(vec![]);
+    for _ in 0..2 {
+        s.doc
+            .apply(
+                vec![inkmark_buffer::Edit::insert(0, "\n")],
+                Selection::caret(0),
+                Selection::caret(0),
+                inkmark_buffer::EditKind::Other,
+            )
+            .unwrap();
+    }
+    s.frame_one(vec![], true);
+    let pos = s.code.scroll_pos();
+    assert!(
+        pos.line >= 42,
+        "the shown pane follows the new lines: {pos:?}"
+    );
+    let parse = s.parse.output().clone();
+    s.live.set_scroll_pos(&s.doc, &parse, pos);
+    s.live.request_focus(&s.ctx);
+    for _ in 0..4 {
+        s.frame_one(vec![], false);
+    }
+    let parse = s.parse.output().clone();
+    assert_eq!(s.live.scroll_pos(&s.doc, &parse).line, pos.line);
 }

@@ -13,7 +13,9 @@ use inkmark_buffer::{Bias, Document, Edit, EditKind, Selection};
 use inkmark_parse::{
     BlockKind, Leaf, ParseOutput, ParseState, SpanKind, Style, Syntax, inline_images,
 };
-use inkmark_text::{GlyphMeshes, LineGeometry, RichLine, SharedFonts, TextConfig, TextRenderer};
+use inkmark_text::{
+    GlyphMeshes, LineGeometry, RichLine, ScrollAnchor, SharedFonts, TextConfig, TextRenderer,
+};
 
 use crate::commands::{self, EditPlan, EnterContext};
 use crate::images::{ImageCache, ImageSlot};
@@ -241,6 +243,11 @@ pub struct LiveView {
     pub show_minimap: bool,
     /// The caret moved since the last edit: start a new undo step.
     seal_undo: bool,
+    /// The selection was set from outside in current offsets: don't map it
+    /// through edits on the next sync.
+    selection_current: bool,
+    /// A scroll position set from outside, applied after the next sync.
+    pending_scroll: Option<ScrollPos>,
     /// Task checkboxes drawn last frame: hit area, source offset of the
     /// `[ ]` marker, checked.
     checkboxes: Vec<(Rect, usize, bool)>,
@@ -269,6 +276,8 @@ impl LiveView {
             preedit: String::new(),
             show_minimap: true,
             seal_undo: false,
+            selection_current: false,
+            pending_scroll: None,
             checkboxes: Vec::new(),
             images: None,
             font_size: 16.0,
@@ -282,6 +291,7 @@ impl LiveView {
 
     pub fn set_selection(&mut self, selection: Selection) {
         self.selection = selection;
+        self.selection_current = true;
         self.preferred_x = None;
         self.reveal_caret = REVEAL_FRAMES;
     }
@@ -289,6 +299,7 @@ impl LiveView {
     /// Shows `selection` without scrolling to it (mirroring the other pane).
     pub fn mirror_selection(&mut self, selection: Selection) {
         self.selection = selection;
+        self.selection_current = true;
     }
 
     pub fn reset(&mut self) {
@@ -323,18 +334,25 @@ impl LiveView {
     /// Where the view is scrolled to, in source lines: a position inside a
     /// block counts proportionally through the block's lines.
     pub fn scroll_pos(&self, doc: &Document, parse: &ParseOutput) -> ScrollPos {
+        if let Some(pos) = self.pending_scroll {
+            return pos;
+        }
         let heights = &self.lines.heights;
         let anchor = self.lines.anchor;
         if anchor.line >= heights.len() {
             return ScrollPos::default();
         }
         match leaf_lines(doc, parse, anchor.line) {
-            Some((first, last)) if first == anchor.line => {
-                let height = heights.height(first).max(1.0);
-                let progress = (anchor.offset / height).clamp(0.0, 1.0);
+            Some((first, last)) => {
+                // The block's height is everything from its first line to
+                // the line after it: measured, it all sits on the first
+                // line; not yet drawn, it's spread over every line's estimate.
+                let top = heights.offset_of(first);
+                let height = (heights.offset_of(last + 1) - top).max(1.0);
+                let progress = ((heights.anchor_y(anchor) - top) / height).clamp(0.0, 1.0) as f32;
                 let lines = progress * (last - first + 1) as f32;
                 ScrollPos {
-                    line: first + lines as usize,
+                    line: (first + lines as usize).min(last),
                     frac: lines.fract(),
                 }
             }
@@ -346,19 +364,42 @@ impl LiveView {
     }
 
     /// Scrolls to `pos`, the inverse of [`scroll_pos`](Self::scroll_pos).
-    pub fn set_scroll_pos(&mut self, doc: &Document, parse: &ParseOutput, pos: ScrollPos) {
-        let heights = &self.lines.heights;
-        if pos.line >= heights.len() {
+    /// The position is current for the document as it is now; it's applied
+    /// once the view has caught up with the document (so a pane that was
+    /// hidden doesn't shift it through the same edits again).
+    pub fn set_scroll_pos(&mut self, _doc: &Document, _parse: &ParseOutput, pos: ScrollPos) {
+        self.pending_scroll = Some(pos);
+    }
+
+    fn apply_scroll_pos(
+        &mut self,
+        doc: &Document,
+        parse: &ParseOutput,
+        pos: ScrollPos,
+        width: f32,
+    ) {
+        if pos.line >= self.lines.heights.len() {
             return;
         }
-        let y = match leaf_lines(doc, parse, pos.line) {
-            Some((first, last)) => {
-                let progress = ((pos.line - first) as f32 + pos.frac) / (last - first + 1) as f32;
-                heights.offset_of(first) + f64::from(progress * heights.height(first))
-            }
-            None => heights.offset_of(pos.line) + f64::from(pos.frac * heights.height(pos.line)),
+        let Some(leaf) = leaf_at_line(doc, parse, pos.line) else {
+            let heights = &self.lines.heights;
+            let y = heights.offset_of(pos.line) + f64::from(pos.frac * heights.height(pos.line));
+            self.lines.anchor = heights.line_at(y);
+            return;
         };
-        self.lines.anchor = heights.line_at(y);
+        // Lay the block out first, so the position inside it uses its real
+        // height rather than estimates that drawing would then collapse.
+        let p = self.place(doc, parse, leaf, width);
+        self.lines.heights.set_measured(p.first_line, p.height);
+        for l in p.first_line + 1..=p.last_line {
+            self.lines.heights.set_measured(l, 0.0);
+        }
+        let progress =
+            ((pos.line - p.first_line) as f32 + pos.frac) / (p.last_line - p.first_line + 1) as f32;
+        self.lines.anchor = ScrollAnchor {
+            line: p.first_line,
+            offset: progress.clamp(0.0, 1.0) * p.height,
+        };
     }
 
     pub fn show(
@@ -431,6 +472,9 @@ impl LiveView {
             return response;
         }
         self.sync(doc, true);
+        if let Some(pos) = self.pending_scroll.take() {
+            self.apply_scroll_pos(doc, state.output(), pos, frame.width);
+        }
 
         // A click on a task checkbox toggles it (a one-byte source patch)
         // instead of moving the caret.
@@ -513,6 +557,8 @@ impl LiveView {
     /// date with `doc`.
     fn sync(&mut self, doc: &Document, map_selection: bool) {
         let text = &self.text;
+        // A selection set from outside is already in current offsets.
+        let map_selection = map_selection && !std::mem::take(&mut self.selection_current);
         if let Synced::Changed(changes) = self.lines.sync(doc, |chars| text.estimate_height(chars))
             && map_selection
         {

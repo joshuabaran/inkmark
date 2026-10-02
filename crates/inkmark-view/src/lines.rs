@@ -30,7 +30,11 @@ pub(crate) enum Synced {
 pub(crate) struct LineIndex {
     pub heights: HeightCache,
     pub anchor: ScrollAnchor,
+    /// Epoch the anchor (and the caller's selection) were last mapped to.
     synced_epoch: Option<u64>,
+    /// Heights must be re-estimated (layout changed), but edits since
+    /// `synced_epoch` still need mapping first.
+    heights_stale: bool,
 }
 
 impl LineIndex {
@@ -39,38 +43,50 @@ impl LineIndex {
             heights: HeightCache::new([]),
             anchor: ScrollAnchor::default(),
             synced_epoch: None,
+            heights_stale: true,
         }
     }
 
-    /// Re-estimate everything on the next sync (e.g. the font changed).
+    /// Re-estimate every height on the next sync (e.g. the font or width
+    /// changed). Edits made since the last sync are still mapped.
     pub fn invalidate(&mut self) {
-        self.synced_epoch = None;
+        self.heights_stale = true;
     }
 
     /// Forget the document entirely.
     pub fn reset(&mut self) {
         self.synced_epoch = None;
+        self.heights_stale = true;
         self.anchor = ScrollAnchor::default();
     }
 
-    /// Brings heights up to date with `doc`. `estimate` guesses a line's
-    /// height from its length in chars.
+    /// Brings heights and the anchor up to date with `doc`. `estimate`
+    /// guesses a line's height from its length in chars.
     pub fn sync(&mut self, doc: &Document, estimate: impl Fn(usize) -> f32) -> Synced {
-        let Some(since) = self.synced_epoch else {
-            return self.rebuild(doc, estimate);
+        let changes: Option<Vec<Change>> = match self.synced_epoch {
+            Some(since) if since == doc.epoch() => Some(Vec::new()),
+            Some(since) => doc.log().changes_since(since).map(|c| c.copied().collect()),
+            None => None,
         };
-        if since == doc.epoch() {
+        let Some(changes) = changes else {
+            return self.rebuild(doc, estimate, Vec::new());
+        };
+        if self.heights_stale {
+            // Map the anchor through the edits even though heights are
+            // rebuilt: a pane that was hidden must land where it was.
+            for c in &changes {
+                self.shift_anchor(c);
+            }
+            return self.rebuild(doc, estimate, changes);
+        }
+        if changes.is_empty() {
             return Synced::Unchanged;
         }
-        let Some(changes) = doc.log().changes_since(since) else {
-            return self.rebuild(doc, estimate);
-        };
-        let changes: Vec<Change> = changes.copied().collect();
         for c in &changes {
             let lines = c.lines;
             let old = lines.start..lines.start + lines.removed + 1;
             if old.end > self.heights.len() {
-                return self.rebuild(doc, estimate);
+                return self.rebuild(doc, estimate, Vec::new());
             }
             // Estimates only; real heights arrive when the lines are drawn.
             let estimates: Vec<f32> = (lines.start..lines.start + lines.inserted + 1)
@@ -84,22 +100,28 @@ impl LineIndex {
                 })
                 .collect();
             self.heights.splice(old, estimates.into_iter());
-            if self.anchor.line > lines.start {
-                if self.anchor.line <= lines.start + lines.removed {
-                    self.anchor = ScrollAnchor {
-                        line: lines.start,
-                        offset: 0.0,
-                    };
-                } else {
-                    self.anchor.line = self.anchor.line - lines.removed + lines.inserted;
-                }
-            }
+            self.shift_anchor(c);
         }
         if self.heights.len() != doc.line_count() {
-            return self.rebuild(doc, estimate);
+            return self.rebuild(doc, estimate, Vec::new());
         }
         self.synced_epoch = Some(doc.epoch());
         Synced::Changed(changes)
+    }
+
+    /// Moves the anchor through one edit's line changes.
+    fn shift_anchor(&mut self, c: &Change) {
+        let lines = c.lines;
+        if self.anchor.line > lines.start {
+            if self.anchor.line <= lines.start + lines.removed {
+                self.anchor = ScrollAnchor {
+                    line: lines.start,
+                    offset: 0.0,
+                };
+            } else {
+                self.anchor.line = self.anchor.line - lines.removed + lines.inserted;
+            }
+        }
     }
 
     /// Wheel (when `hovered`) and scrollbar input for a pane whose
@@ -172,12 +194,24 @@ impl LineIndex {
         painter.rect_filled(thumb, 3.0, SCROLL_THUMB);
     }
 
-    fn rebuild(&mut self, doc: &Document, estimate: impl Fn(usize) -> f32) -> Synced {
+    /// Re-estimates every height. `changes` (already applied to the anchor)
+    /// are passed on so callers can still map their selection.
+    fn rebuild(
+        &mut self,
+        doc: &Document,
+        estimate: impl Fn(usize) -> f32,
+        changes: Vec<Change>,
+    ) -> Synced {
         self.heights
             .reset_estimates(doc.rope().lines().map(|l| estimate(l.len_chars())));
         self.anchor.line = self.anchor.line.min(self.heights.len().saturating_sub(1));
         self.synced_epoch = Some(doc.epoch());
-        Synced::Rebuilt
+        self.heights_stale = false;
+        if changes.is_empty() {
+            Synced::Rebuilt
+        } else {
+            Synced::Changed(changes)
+        }
     }
 }
 

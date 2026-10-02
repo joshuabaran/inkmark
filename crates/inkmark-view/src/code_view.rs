@@ -60,6 +60,11 @@ pub struct CodeView {
     viewport: f32,
     /// Per-pane minimap toggle; survives mode switches with the view.
     pub show_minimap: bool,
+    /// The selection was set from outside in current offsets: don't map it
+    /// through edits on the next sync.
+    selection_current: bool,
+    /// A scroll position set from outside, applied after the next sync.
+    pending_scroll: Option<ScrollPos>,
     pub font_size: f32,
     pub line_height: f32,
 }
@@ -95,6 +100,8 @@ impl CodeView {
             scrolled: false,
             viewport: 0.0,
             show_minimap: true,
+            selection_current: false,
+            pending_scroll: None,
             font_size: 14.0,
             line_height: 21.0,
         }
@@ -107,6 +114,7 @@ impl CodeView {
     /// Moves the selection (e.g. from search or the other pane) and scrolls to it.
     pub fn set_selection(&mut self, selection: Selection) {
         self.selection = selection;
+        self.selection_current = true;
         self.preferred_x = None;
         self.reveal_caret = REVEAL_FRAMES;
     }
@@ -114,6 +122,7 @@ impl CodeView {
     /// Shows `selection` without scrolling to it (mirroring the other pane).
     pub fn mirror_selection(&mut self, selection: Selection) {
         self.selection = selection;
+        self.selection_current = true;
     }
 
     pub fn has_focus(&self, ctx: &egui::Context) -> bool {
@@ -122,6 +131,9 @@ impl CodeView {
 
     /// Where the view is scrolled to, as a source line and fraction.
     pub fn scroll_pos(&self) -> ScrollPos {
+        if let Some(pos) = self.pending_scroll {
+            return pos;
+        }
         let anchor = self.lines.anchor;
         let height = if anchor.line < self.lines.heights.len() {
             self.lines.heights.height(anchor.line)
@@ -139,7 +151,14 @@ impl CodeView {
     }
 
     /// Scrolls to `pos` (e.g. to follow the other pane).
+    /// The position is current for the document as it is now; it's applied
+    /// once the view has caught up with the document (so a pane that was
+    /// hidden doesn't shift it through the same edits again).
     pub fn set_scroll_pos(&mut self, pos: ScrollPos) {
+        self.pending_scroll = Some(pos);
+    }
+
+    fn apply_scroll_pos(&mut self, pos: ScrollPos) {
         let heights = &self.lines.heights;
         if pos.line < heights.len() {
             self.lines.anchor = ScrollAnchor {
@@ -230,6 +249,9 @@ impl CodeView {
             self.lines.invalidate();
         }
         self.sync(doc, true);
+        if let Some(pos) = self.pending_scroll.take() {
+            self.apply_scroll_pos(pos);
+        }
 
         if focused {
             self.handle_events(ui, doc, viewport);
@@ -285,6 +307,8 @@ impl CodeView {
     /// date with `doc`.
     fn sync(&mut self, doc: &Document, map_selection: bool) {
         let text = &self.text;
+        // A selection set from outside is already in current offsets.
+        let map_selection = map_selection && !std::mem::take(&mut self.selection_current);
         if let Synced::Changed(changes) = self.lines.sync(doc, |chars| text.estimate_height(chars))
             && map_selection
         {
