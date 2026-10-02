@@ -13,7 +13,7 @@
 | Buffer | `ropey::Rope`. **All positions are UTF-8 byte offsets**; the buffer crate wraps ropey's char-indexed API so nothing else sees char indices. |
 | UI | egui/eframe, `wgpu` renderer by default (`glow` kept buildable as a fallback feature). |
 | Text | cosmic-text shapes, lays out and hit-tests; swash rasterizes into **our own glyph atlas** (egui `TextureHandle`s), painted as egui `Mesh`es. No egui text layout inside editor panes; no glyphon. |
-| Parser | `pulldown-cmark` (with `into_offset_iter`) behind `MarkdownParser`; CommonMark only in MVP; GFM later via `comrak` or similar implementing the same trait. |
+| Parser | `pulldown-cmark` (with `into_offset_iter`) behind `MarkdownParser`; CommonMark only in MVP. **GFM (decided 2026-10-02):** a `GfmParser` behind the same trait, using pulldown-cmark's tables, strikethrough and task-list extensions plus an inkmark pass for autolink literals (bare URLs, `www.`, emails), which pulldown-cmark lacks. Chosen over `comrak` because live editing depends on byte-exact source positions, which pulldown-cmark's offsets give and comrak's line/column positions don't guarantee for inline content. |
 | Parse strategy | Background full reparse is authoritative; synchronous **local reparse** of the edited top-level block for immediate feedback (see §2). Incremental parsing beyond that is a later optimization. |
 | Live editing model | **Reveal-at-cursor** (Typora/Obsidian style). Live is the source with syntax hidden away from the caret; every live edit is a direct source byte-range patch. No AST→Markdown re-emit. |
 | History | One document epoch, one undo stack shared by both panes. |
@@ -269,6 +269,15 @@ Measured 2026-10-02 on the Omarchy host (240 Hz 1440p monitor, scale 1, Mesa rad
 
 ## Known issues and next steps
 
-- **GFM** (tables, task lists, strikethrough, autolinks) is the next feature: an `inkmark-parse-gfm` crate behind the same trait.
+- **GFM** (tables, task lists, strikethrough, autolinks) is in progress: see the GFM milestone below.
 - **Fallback glyphs in the code pane** (box drawing, CJK) don't snap to whole monospace cells, so ASCII-art alignment can be off.
 - **Images:** no SVG; remote URLs aren't fetched (MVP has no network); reference definitions deleted by a local edit linger until the next full parse.
+
+## GFM milestone (started 2026-10-02)
+
+| # | Slice | Done when |
+|---|--------|-----------|
+| **G1** | `GfmParser` + source map | Every GFM spec example (cmark-gfm `spec.txt`) maps every byte exactly once and reproduces pulldown-cmark's text; table pipes and delimiter rows, task markers and strikethrough delimiters are classified; autolink literals match the spec's links |
+| **G2** | Code pane + commands | Code pane colors the new syntax; the app parses GFM; Ctrl+Shift+X toggles strikethrough, Ctrl+Enter toggles a task, Enter continues task items |
+| **G3** | Live rendering | Strikethrough, clickable task checkboxes (a click is a one-byte source patch), autolinks styled as links |
+| **G4** | Live tables | Grid layout with alignment; typing in a cell patches that cell; Tab/Shift+Tab between cells; Enter in the last row adds a row; a typed `\|` is escaped. Re-padding columns to keep pipes aligned is out of scope |
