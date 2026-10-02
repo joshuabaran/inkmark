@@ -627,6 +627,15 @@ impl CodeView {
                 };
                 self.delete(doc, head..end, EditKind::Deleting);
             }
+            Key::Enter if cmd => {
+                self.apply_plan(doc, commands::toggle_task(doc, self.selection));
+            }
+            Key::X if cmd && shift => {
+                self.apply_plan(
+                    doc,
+                    commands::toggle_wrap(doc, self.selection, "~~", &["~"]),
+                );
+            }
             Key::Enter => self.insert(doc, "\n", EditKind::Typing),
             Key::Tab if shift => self.outdent(doc),
             Key::Tab if self.selected_lines(doc).len() > 1 => self.indent(doc),

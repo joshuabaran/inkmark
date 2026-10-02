@@ -29,12 +29,14 @@ struct Prefix {
     marker: Option<Range<usize>>,
     /// Spaces after the marker.
     spacing: Range<usize>,
+    /// A GFM task box after the marker, `[ ]` or `[x]`, and the space after it.
+    task: Option<Range<usize>>,
 }
 
 impl Prefix {
     /// Where the line's content starts (relative to the line).
     fn content_start(&self) -> usize {
-        self.spacing.end
+        self.task.as_ref().map_or(self.spacing.end, |t| t.end)
     }
 }
 
@@ -78,17 +80,24 @@ fn prefix(line: &str) -> Prefix {
             indent: i..i,
             marker: None,
             spacing: i..i,
+            task: None,
         };
     };
     let mut s = k;
     while s < b.len() && s - k < 4 && b[s] == b' ' {
         s += 1;
     }
+    let rest = &b[s..];
+    let task = (rest.len() >= 3
+        && matches!(&rest[..3], b"[ ]" | b"[x]" | b"[X]")
+        && (rest.len() == 3 || rest[3] == b' '))
+        .then(|| s..(s + 4).min(b.len()));
     Prefix {
         quote,
         indent,
         marker: Some(j..k),
         spacing: k..s,
+        task,
     }
 }
 
@@ -161,8 +170,10 @@ pub(crate) fn smart_enter(doc: &Document, sel: Selection, ctx: EnterContext) -> 
                 "" => " ",
                 s => s,
             };
+            // Task items continue as unchecked tasks.
+            let task = if p.task.is_some() { "[ ] " } else { "" };
             let next = format!(
-                "\n{quote}{}{}{spacing}",
+                "\n{quote}{}{}{spacing}{task}",
                 &text[p.indent.clone()],
                 next_marker(&text[marker.clone()]),
             );
@@ -203,6 +214,18 @@ pub(crate) fn smart_backspace(doc: &Document, sel: Selection) -> Option<EditPlan
     let (line, text) = line_of(doc, sel.head);
     let col = sel.head - line.start;
     let p = prefix(&text);
+    if let Some(task) = &p.task
+        && col == p.content_start()
+    {
+        // First Backspace removes the checkbox, the next one the bullet.
+        let remove = line.start + task.start..line.start + task.end;
+        let caret = remove.start;
+        return Some(caret_plan(
+            vec![Edit::delete(remove)],
+            caret,
+            EditKind::Other,
+        ));
+    }
     if let Some(marker) = &p.marker
         && col == p.content_start()
     {
@@ -358,6 +381,48 @@ pub(crate) fn toggle_wrap(
     }
 }
 
+/// Ctrl+Enter: toggle the task box on the caret's line. `[ ]` and `[x]`
+/// swap; a list item without one gains `[ ] `; any other line becomes
+/// `- [ ] ` + its text.
+pub(crate) fn toggle_task(doc: &Document, sel: Selection) -> EditPlan {
+    let (line, text) = line_of(doc, sel.head);
+    let p = prefix(&text);
+    let shift = |by: isize, from: usize| {
+        let map = |o: usize| {
+            if o >= from {
+                o.saturating_add_signed(by)
+            } else {
+                o
+            }
+        };
+        Selection {
+            anchor: map(sel.anchor),
+            head: map(sel.head),
+        }
+    };
+    let (edit, selection) = match (&p.task, &p.marker) {
+        (Some(task), _) => {
+            let checked = &text[task.start + 1..task.start + 2] != " ";
+            let at = line.start + task.start + 1;
+            let edit = Edit::replace(at..at + 1, if checked { " " } else { "x" });
+            (edit, sel)
+        }
+        (None, Some(_)) => {
+            let at = line.start + p.spacing.end;
+            (Edit::insert(at, "[ ] "), shift(4, at))
+        }
+        (None, None) => {
+            let at = line.start + p.quote.end;
+            (Edit::insert(at, "- [ ] "), shift(6, at))
+        }
+    };
+    EditPlan {
+        edits: vec![edit],
+        selection,
+        kind: EditKind::Other,
+    }
+}
+
 /// Whether `doc` has `s` at byte `at` (false if that's mid-character or
 /// past the end).
 fn is_at(doc: &Document, at: usize, s: &str) -> bool {
@@ -492,6 +557,30 @@ mod tests {
         assert_eq!(enter("> - in quote|"), "> - in quote\n> - |");
         assert_eq!(enter("> quoted|"), "> quoted\n>\n> |");
         assert_eq!(enter("plain|"), "plain\n\n|");
+    }
+
+    #[test]
+    fn task_items_continue_toggle_and_backspace() {
+        assert_eq!(enter("- [x] done|"), "- [x] done\n- [ ] |");
+        assert_eq!(enter("- [ ] |"), "\n|");
+        let toggle = |input: &str| {
+            let (text, sel) = at(input);
+            apply(&text, sel, toggle_task)
+        };
+        assert_eq!(toggle("- [ ] t|odo"), "- [x] t|odo");
+        assert_eq!(toggle("- [X] t|odo"), "- [ ] t|odo");
+        assert_eq!(toggle("- t|odo"), "- [ ] t|odo");
+        assert_eq!(toggle("> pl|ain"), "> - [ ] pl|ain");
+        let (text, sel) = at("- [ ] |todo");
+        let mut doc = Document::from_text(&text);
+        let p = smart_backspace(&doc, sel).unwrap();
+        doc.apply(p.edits, sel, p.selection, p.kind).unwrap();
+        assert_eq!(doc.slice(0..doc.len()), "- todo");
+        let (text, sel) = at("a [struck] c");
+        assert_eq!(
+            apply(&text, sel, |d, s| toggle_wrap(d, s, "~~", &["~"])),
+            "a ~~[struck]~~ c"
+        );
     }
 
     #[test]

@@ -734,6 +734,10 @@ impl LiveView {
                 let end = self.step(doc, parse, true, cmd);
                 return self.delete(doc, sel.head..end, EditKind::Deleting);
             }
+            Key::Enter if cmd => return self.apply_plan(doc, commands::toggle_task(doc, sel)),
+            Key::X if cmd && shift => {
+                return self.apply_plan(doc, commands::toggle_wrap(doc, sel, "~~", &["~"]));
+            }
             Key::Enter if shift => return self.apply_plan(doc, commands::hard_break(doc, sel)),
             Key::Enter => {
                 let ctx = EnterContext {

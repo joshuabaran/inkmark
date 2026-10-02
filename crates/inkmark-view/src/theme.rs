@@ -19,11 +19,16 @@ const HTML: Color32 = Color32::from_rgb(220, 150, 100);
 const STRONG: Color32 = Color32::from_gray(245);
 const EMPHASIS: Color32 = Color32::from_rgb(220, 200, 150);
 const QUOTE: Color32 = Color32::from_gray(160);
+const STRUCK: Color32 = Color32::from_gray(125);
+const TASK_OPEN: Color32 = Color32::from_rgb(215, 180, 110);
+const TASK_DONE: Color32 = Color32::from_rgb(130, 190, 120);
 const ENTITY: Color32 = Color32::from_rgb(200, 150, 220);
 
 /// Code-pane color for a span, or `None` for the default text color.
 pub fn code_color(span: &Span) -> Option<Color32> {
     match &span.kind {
+        SpanKind::Syntax(Syntax::TaskMarker(true)) => Some(TASK_DONE),
+        SpanKind::Syntax(Syntax::TaskMarker(false)) => Some(TASK_OPEN),
         SpanKind::Syntax(Syntax::LinkMarkup) => Some(LINK_MARKUP),
         SpanKind::Syntax(_) => Some(MARKUP),
         SpanKind::Replaced(_) if !span.style.contains(Style::CODE_BLOCK) => Some(ENTITY),
@@ -35,6 +40,7 @@ pub fn code_color(span: &Span) -> Option<Color32> {
 fn text_color(style: Style) -> Option<Color32> {
     // Most specific first.
     [
+        (Style::STRIKE, STRUCK),
         (Style::CODE, CODE),
         (Style::CODE_BLOCK, CODE),
         (Style::HTML, HTML),
@@ -42,6 +48,7 @@ fn text_color(style: Style) -> Option<Color32> {
         (Style::LINK, LINK),
         (Style::IMAGE, LINK),
         (Style::STRONG, STRONG),
+        (Style::TABLE_HEAD, STRONG),
         (Style::EMPHASIS, EMPHASIS),
         (Style::QUOTE, QUOTE),
     ]

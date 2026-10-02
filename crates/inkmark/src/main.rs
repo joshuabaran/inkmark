@@ -8,7 +8,7 @@ use eframe::egui::{
     ViewportCommand, pos2,
 };
 use inkmark_buffer::{DiskStatus, Document, LineEnding, OpenError};
-use inkmark_parse::{ParseState, PulldownParser};
+use inkmark_parse::{GfmParser, ParseState};
 use inkmark_text::Fonts;
 use inkmark_view::{CodeView, LiveView};
 
@@ -131,8 +131,8 @@ impl App {
             focus: Pane::Code,
             parse: {
                 let ctx = ctx.clone();
-                // The swap point for a GFM parser later.
-                ParseState::new(Arc::new(PulldownParser), &Document::default(), move || {
+                // GitHub Flavored Markdown; PulldownParser is plain CommonMark.
+                ParseState::new(Arc::new(GfmParser), &Document::default(), move || {
                     ctx.request_repaint()
                 })
             },
