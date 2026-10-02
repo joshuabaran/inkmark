@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
-use notify::event::EventKind;
+use notify::event::{EventKind, ModifyKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 pub struct Watch {
@@ -48,13 +48,15 @@ impl Watch {
     }
 
     /// Watched directories that gained, lost or renamed an entry since the
-    /// last call. Content reads are ignored, so listing a folder doesn't
-    /// schedule another listing.
+    /// last call. Writes to a file's contents or metadata are ignored, so
+    /// saving an open note does not list its folder again. The editor's
+    /// atomic save still creates a temp file and renames it; that is a real
+    /// directory change and is reported.
     pub fn changed(&mut self) -> Vec<PathBuf> {
         let mut out = HashSet::new();
         while let Ok(event) = self.rx.try_recv() {
             let Ok(event) = event else { continue };
-            if matches!(event.kind, EventKind::Access(_) | EventKind::Other) {
+            if !directory_changed(event.kind) {
                 continue;
             }
             for path in &event.paths {
@@ -74,4 +76,11 @@ impl Watch {
             .filter(|parent| self.dirs.contains(*parent))
             .map(Path::to_path_buf)
     }
+}
+
+fn directory_changed(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+    )
 }

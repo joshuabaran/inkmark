@@ -2,6 +2,7 @@
 //! polls until a deadline; it does not sleep for a fixed time and hope.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
 use inkmark_files::{NewFileError, Tree, Watch, create_new_file};
@@ -62,6 +63,35 @@ fn a_watched_folder_picks_up_create_rename_and_delete() {
         reload(&mut tree, &mut watch);
         !tree.rows().iter().any(|row| row.name == "b.md")
     });
+}
+
+#[test]
+fn a_content_write_does_not_report_the_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a.md");
+    fs::write(&file, "a\n").unwrap();
+    let mut watch = Watch::new(|| {}).unwrap();
+    watch.sync(&[dir.path().to_path_buf()]);
+
+    fs::write(&file, "changed\n").unwrap();
+    let mut perms = fs::metadata(&file).unwrap().permissions();
+    perms.set_mode(0o644);
+    fs::set_permissions(&file, perms).unwrap();
+
+    // inotify delivers a content write in a few tens of milliseconds. Drain
+    // well past that, then prove the watch is alive with a create.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(400) {
+        let changed = watch.changed();
+        assert!(
+            changed.is_empty(),
+            "content or metadata write reported {changed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    fs::write(dir.path().join("b.md"), "b\n").unwrap();
+    wait_until(|| watch.changed().iter().any(|path| path == dir.path()));
 }
 
 #[test]
