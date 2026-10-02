@@ -89,6 +89,9 @@ pub struct LiveView {
     preedit: String,
     /// Per-pane minimap toggle; survives mode switches with the view.
     pub show_minimap: bool,
+    /// Task checkboxes drawn last frame: hit area, source offset of the
+    /// `[ ]` marker, checked.
+    checkboxes: Vec<(Rect, usize, bool)>,
     /// Created on the first frame, when an egui context is at hand.
     images: Option<ImageCache>,
     pub font_size: f32,
@@ -113,6 +116,7 @@ impl LiveView {
             dragging: false,
             preedit: String::new(),
             show_minimap: true,
+            checkboxes: Vec::new(),
             images: None,
             font_size: 16.0,
             line_height: 26.0,
@@ -275,13 +279,45 @@ impl LiveView {
         }
         self.sync(doc, true);
 
+        // A click on a task checkbox toggles it (a one-byte source patch)
+        // instead of moving the caret.
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        let on_box = pointer.and_then(|p| {
+            self.checkboxes
+                .iter()
+                .find(|(r, ..)| r.contains(p))
+                .copied()
+        });
+        if on_box.is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        let mut box_clicked = false;
+        if let Some((_, at, checked)) = on_box
+            && ui.input(|i| i.pointer.primary_pressed())
+        {
+            let edit = Edit::replace(at + 1..at + 2, if checked { " " } else { "x" });
+            if doc
+                .apply(vec![edit], self.selection, self.selection, EditKind::Other)
+                .is_ok()
+            {
+                self.after_edit(doc);
+                self.reveal_caret = 0;
+                if let Some(wait) = state.update(doc) {
+                    ui.ctx().request_repaint_after(wait);
+                }
+            }
+            box_clicked = true;
+        }
+
         if self.focused {
             self.handle_events(ui, doc, state, frame);
         } else {
             self.preedit.clear();
         }
         let parse = state.output();
-        self.handle_pointer(ui, &response, doc, parse, frame);
+        if !box_clicked {
+            self.handle_pointer(ui, &response, doc, parse, frame);
+        }
         let mut minimap_hovered = false;
         if let Some(r) = minimap {
             let (scrolled, hovered) = self.lines.minimap_input(ui, self.id, r, rect.height());
@@ -875,6 +911,7 @@ impl LiveView {
         frame: Frame,
     ) -> Option<Rect> {
         let rect = frame.rect;
+        self.checkboxes.clear();
         let heights_len = self.lines.heights.len();
         if heights_len == 0 {
             return None;
@@ -1073,10 +1110,43 @@ impl LiveView {
                     painter.rect_filled(bar, 1.0, QUOTE_BAR);
                 }
                 BlockKind::Item if doc.byte_to_line(c.range.start) == p.first_line => {
-                    let marker = list_marker(doc, parse, c, &p.leaf.containers);
                     let y = top + p.seg_tops.first().copied().unwrap_or(0.0);
-                    self.text
-                        .draw_line(meshes, &marker, pos2(x + 4.0, y), LIST_MARKER);
+                    let row = p
+                        .geometry
+                        .first()
+                        .and_then(|g| g.rows.first())
+                        .map_or(self.text.row_height(), |r| r.height);
+                    match task_marker(parse, c.range.start, p.leaf.block.range.start) {
+                        Some((at, checked)) => {
+                            let size = (row * 0.62).round();
+                            let b = Rect::from_min_size(
+                                pos2(x + 2.0, y + ((row - size) / 2.0).round()),
+                                vec2(size, size),
+                            );
+                            if checked {
+                                painter.rect_filled(b, 3.0, theme::CHECKBOX_DONE);
+                                let tick = [
+                                    pos2(b.left() + size * 0.22, b.top() + size * 0.52),
+                                    pos2(b.left() + size * 0.42, b.top() + size * 0.72),
+                                    pos2(b.left() + size * 0.78, b.top() + size * 0.3),
+                                ];
+                                painter.line(tick.to_vec(), Stroke::new(2.0, BACKGROUND));
+                            } else {
+                                painter.rect_stroke(
+                                    b,
+                                    3.0,
+                                    Stroke::new(1.5, LIST_MARKER),
+                                    StrokeKind::Inside,
+                                );
+                            }
+                            self.checkboxes.push((b.expand(3.0), at, checked));
+                        }
+                        None => {
+                            let marker = list_marker(doc, parse, c, &p.leaf.containers);
+                            self.text
+                                .draw_line(meshes, &marker, pos2(x + 4.0, y), LIST_MARKER);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1131,6 +1201,18 @@ impl LiveView {
                 TEXT,
                 &seg.colors,
             );
+            for strike in &seg.strikes {
+                let mut rects = Vec::new();
+                p.geometry[i].selection_rects(strike.clone(), false, 0.0, &mut rects);
+                for r in rects {
+                    let r = r.translate(origin.to_vec2());
+                    painter.hline(
+                        r.x_range(),
+                        r.top() + r.height() * 0.55,
+                        Stroke::new(1.3, theme::STRUCK),
+                    );
+                }
+            }
         }
         for image in &p.images {
             let r = Rect::from_min_size(pos2(text_left, top + image.top), image.size);
@@ -1150,6 +1232,19 @@ impl LiveView {
             self.text.draw_line(meshes, &label, label_pos, MARKUP);
         }
     }
+}
+
+/// The GFM task marker of the item starting at `item_start`, if any:
+/// (offset of `[`, checked). It sits between the bullet and the text.
+fn task_marker(parse: &ParseOutput, item_start: usize, text_start: usize) -> Option<(usize, bool)> {
+    parse
+        .map
+        .spans_in(item_start..text_start.max(item_start + 1))
+        .into_iter()
+        .find_map(|s| match s.kind {
+            SpanKind::Syntax(Syntax::TaskMarker(checked)) => Some((s.range.start, checked)),
+            _ => None,
+        })
 }
 
 /// A stable pseudo-random 0..1 per row, so paragraph ink looks ragged like

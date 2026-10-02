@@ -9,7 +9,7 @@ use egui::{
     Event, Id, ImeEvent, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, UiBuilder, pos2,
 };
 use inkmark_buffer::{Document, Selection};
-use inkmark_parse::{ParseState, PulldownParser};
+use inkmark_parse::{GfmParser, ParseState};
 use inkmark_view::{CodeView, LiveView};
 
 const SCREEN: Rect = Rect::from_min_max(Pos2::ZERO, pos2(1600.0, 600.0));
@@ -30,7 +30,8 @@ impl Split {
         let ctx = egui::Context::default();
         let fonts = inkmark_text::Fonts::shared(&ctx);
         let doc = Document::from_text(text);
-        let parse = ParseState::new(Arc::new(PulldownParser), &doc, || {});
+        // As in the app: GFM.
+        let parse = ParseState::new(Arc::new(GfmParser), &doc, || {});
         let mut s = Self {
             code: CodeView::with_fonts(fonts.clone(), Id::new("code")),
             live: LiveView::with_fonts(fonts, Id::new("live")),
@@ -370,4 +371,21 @@ fn bench_live_typing_long_paragraph() {
         times[times.len() * 95 / 100],
         times[times.len() - 1],
     );
+}
+
+#[test]
+fn clicking_a_checkbox_toggles_the_task() {
+    let mut s = Split::new("- [ ] write tests\n- [x] ship\n");
+    s.caret(s.doc.len());
+    let before = s.live.selection();
+    // The first item's checkbox sits where its bullet would be.
+    s.click(pos2(LIVE_X + 38.0, 13.0));
+    assert_eq!(s.text(), "- [x] write tests\n- [x] ship\n");
+    assert_eq!(
+        s.live.selection(),
+        before,
+        "a checkbox click doesn't move the caret"
+    );
+    s.click(pos2(LIVE_X + 38.0, 13.0));
+    assert_eq!(s.text(), "- [ ] write tests\n- [x] ship\n");
 }

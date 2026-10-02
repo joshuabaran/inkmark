@@ -19,7 +19,7 @@ const HTML: Color32 = Color32::from_rgb(220, 150, 100);
 const STRONG: Color32 = Color32::from_gray(245);
 const EMPHASIS: Color32 = Color32::from_rgb(220, 200, 150);
 const QUOTE: Color32 = Color32::from_gray(160);
-const STRUCK: Color32 = Color32::from_gray(125);
+pub const STRUCK: Color32 = Color32::from_gray(125);
 const TASK_OPEN: Color32 = Color32::from_rgb(215, 180, 110);
 const TASK_DONE: Color32 = Color32::from_rgb(130, 190, 120);
 const ENTITY: Color32 = Color32::from_rgb(200, 150, 220);
@@ -74,6 +74,7 @@ pub const CODE_BACKGROUND: Color32 = Color32::from_rgb(30, 31, 38);
 pub const QUOTE_BAR: Color32 = Color32::from_gray(70);
 pub const RULE: Color32 = Color32::from_gray(70);
 pub const LIST_MARKER: Color32 = Color32::from_gray(140);
+pub const CHECKBOX_DONE: Color32 = Color32::from_rgb(110, 165, 105);
 
 // Minimap ink: dimmer versions of the text colors.
 pub const MINI_TEXT: Color32 = Color32::from_gray(95);

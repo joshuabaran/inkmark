@@ -28,6 +28,8 @@ pub(crate) struct Segment {
     pub runs: Vec<(Range<usize>, FontStyle)>,
     pub colors: Vec<(Range<usize>, Color32)>,
     pub pieces: Vec<Piece>,
+    /// Display ranges with a line through them (GFM strikethrough).
+    pub strikes: Vec<Range<usize>>,
     /// Source offset of the segment start, for placing a caret in an empty one.
     pub source_start: usize,
 }
@@ -58,6 +60,8 @@ struct Builder<'a> {
     src: &'a Document,
     style: LeafStyle,
     segments: Vec<Segment>,
+    /// The span being added is struck-through text (not its `~~`).
+    strike: bool,
 }
 
 impl Builder<'_> {
@@ -111,6 +115,7 @@ impl Builder<'_> {
         font: FontStyle,
         color: Option<Color32>,
     ) {
+        let strike = self.strike;
         let seg = self.segment();
         let start = seg.text.len();
         seg.text.push_str(text);
@@ -120,6 +125,9 @@ impl Builder<'_> {
         }
         if let Some(c) = color {
             seg.colors.push((display.clone(), c));
+        }
+        if strike {
+            seg.strikes.push(display.clone());
         }
         seg.pieces.push(Piece {
             display,
@@ -142,9 +150,10 @@ pub(crate) struct Reveal {
 }
 
 /// Inline style flags whose delimiters reveal per element.
-const INLINE: [Style; 5] = [
+const INLINE: [Style; 6] = [
     Style::EMPHASIS,
     Style::STRONG,
+    Style::STRIKE,
     Style::CODE,
     Style::LINK,
     Style::IMAGE,
@@ -197,6 +206,7 @@ pub(crate) fn build(
             source_start: range.start,
             ..Segment::default()
         }],
+        strike: false,
     };
     let spans = map.spans_in(range.clone());
     let elements = reveal
@@ -223,6 +233,8 @@ pub(crate) fn build(
             continue;
         }
         let font = b.font(&span);
+        b.strike = span.style.contains(Style::STRIKE)
+            && matches!(span.kind, SpanKind::Text | SpanKind::Replaced(_));
         let raw = match span.kind {
             SpanKind::Syntax(Syntax::Delimiter | Syntax::LinkMarkup) => in_element(&r),
             SpanKind::Syntax(Syntax::Escape) | SpanKind::Replaced(_) => touching(&r),
@@ -388,6 +400,27 @@ mod tests {
         let src = "## Title *x*\n";
         let l = layout_at(src, src.find("Ti").unwrap());
         assert_eq!(texts(&l), vec!["## Title x"]);
+    }
+
+    #[test]
+    fn strikethrough_text_is_marked_but_not_its_delimiters() {
+        let doc = Document::from_text("a ~~old~~ b\n");
+        let out = inkmark_parse::GfmParser.parse("a ~~old~~ b\n");
+        let leaf = out.blocks.leaves_from(0).next().unwrap();
+        let l = build(&doc, &out.map, &leaf, None);
+        assert_eq!(texts(&l), vec!["a old b"]);
+        assert_eq!(l.segments[0].strikes, vec![2..5]);
+        let l = build(
+            &doc,
+            &out.map,
+            &leaf,
+            Some(Reveal {
+                line: 0..12,
+                caret: 5,
+            }),
+        );
+        assert_eq!(texts(&l), vec!["a ~~old~~ b"]);
+        assert_eq!(l.segments[0].strikes, vec![4..7]);
     }
 
     #[test]
