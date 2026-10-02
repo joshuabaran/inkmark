@@ -2,6 +2,7 @@
 
 mod code_view;
 mod commands;
+mod images;
 mod lines;
 mod live_layout;
 mod live_view;

@@ -6,14 +6,17 @@ use std::ops::Range;
 
 use egui::output::IMEOutput;
 use egui::{
-    CursorIcon, Event, EventFilter, IMEPurpose, Id, ImeEvent, Key, Modifiers, Pos2, Rect, Response,
-    Sense, Stroke, Ui, pos2, vec2,
+    Color32, CursorIcon, Event, EventFilter, IMEPurpose, Id, ImeEvent, Key, Modifiers, Pos2, Rect,
+    Response, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
 use inkmark_buffer::{Bias, Document, Edit, EditKind, Selection};
-use inkmark_parse::{BlockKind, Leaf, ParseOutput, ParseState};
+use inkmark_parse::{
+    BlockKind, Leaf, ParseOutput, ParseState, SpanKind, Style, Syntax, inline_images,
+};
 use inkmark_text::{GlyphMeshes, LineGeometry, RichLine, SharedFonts, TextConfig, TextRenderer};
 
 use crate::commands::{self, EditPlan, EnterContext};
+use crate::images::{ImageCache, ImageSlot};
 use crate::lines::{LineIndex, SCROLLBAR_WIDTH, ScrollPos, Synced};
 use crate::live_layout::{self, LeafLayout, LeafStyle};
 use crate::motion;
@@ -27,6 +30,8 @@ const ITEM_INDENT: f32 = 28.0;
 const CODE_PAD: f32 = 10.0;
 const CARET_WIDTH: f32 = 2.0;
 const NEWLINE_WIDTH: f32 = 6.0;
+/// Space between a paragraph's text and an image below it.
+const IMAGE_GAP: f32 = 6.0;
 const REVEAL_FRAMES: u8 = 3;
 /// Height of a blank source line, in rows.
 const BLANK_LINE: f32 = 0.6;
@@ -41,7 +46,18 @@ struct Placed {
     indent: f32,
     seg_tops: Vec<f32>,
     geometry: Vec<LineGeometry>,
+    /// An image-only paragraph away from the caret shows just its images.
+    text_hidden: bool,
+    images: Vec<PlacedImage>,
     height: f32,
+}
+
+/// An image below a leaf's text, in leaf coordinates.
+struct PlacedImage {
+    top: f32,
+    size: Vec2,
+    slot: ImageSlot,
+    dest: String,
 }
 
 impl Placed {
@@ -71,6 +87,8 @@ pub struct LiveView {
     dragging: bool,
     /// IME composition shown at the caret until committed.
     preedit: String,
+    /// Created on the first frame, when an egui context is at hand.
+    images: Option<ImageCache>,
     pub font_size: f32,
     pub line_height: f32,
 }
@@ -92,6 +110,7 @@ impl LiveView {
             focused: false,
             dragging: false,
             preedit: String::new(),
+            images: None,
             font_size: 16.0,
             line_height: 26.0,
         }
@@ -124,6 +143,12 @@ impl LiveView {
 
     pub fn has_focus(&self, ctx: &egui::Context) -> bool {
         ctx.memory(|m| m.has_focus(self.id))
+    }
+
+    /// Total height of the document as laid out so far (unmeasured lines
+    /// are estimates), in points.
+    pub fn content_height(&self) -> f64 {
+        self.lines.heights.total()
     }
 
     pub fn take_scrolled(&mut self) -> bool {
@@ -217,6 +242,9 @@ impl LiveView {
         }
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, BACKGROUND);
+        if self.images.is_none() {
+            self.images = Some(ImageCache::new(ui.ctx()));
+        }
         let Some(state) = parse else {
             return response;
         };
@@ -303,6 +331,26 @@ impl LiveView {
             LeafStyle::Code | LeafStyle::Html => (CODE_PAD, CODE_PAD, CODE_PAD),
             LeafStyle::Paragraph | LeafStyle::Rule => (0.0, 0.0, 0.0),
         };
+        let range = leaf.block.range.clone();
+        let first_line = doc.byte_to_line(range.start);
+        let last_line = doc.byte_to_line(range.end.saturating_sub(1).max(range.start));
+
+        let spans = map.spans_in(range.clone());
+        let has_image = spans.iter().any(|s| s.style.contains(Style::IMAGE));
+        let image_only = has_image
+            && spans.iter().all(|s| {
+                s.style.contains(Style::IMAGE)
+                    || matches!(
+                        s.kind,
+                        SpanKind::Whitespace
+                            | SpanKind::SoftBreak
+                            | SpanKind::Syntax(Syntax::QuotePrefix | Syntax::ListMarker)
+                    )
+            });
+        let caret_line = doc.byte_to_line(self.selection.head);
+        let text_hidden =
+            image_only && !(self.focused && (first_line..=last_line).contains(&caret_line));
+
         let wrap = (width - containers - 2.0 * inner).max(40.0);
         let mut y = pad_top;
         let mut seg_tops = Vec::with_capacity(layout.segments.len());
@@ -314,19 +362,46 @@ impl LiveView {
                 wrap_width: Some(wrap),
             });
             seg_tops.push(y);
-            y += g.height();
+            if !text_hidden {
+                y += g.height();
+            }
             geometry.push(g);
         }
-        let range = &leaf.block.range;
+
+        let mut images = Vec::new();
+        if has_image && let Some(cache) = &self.images {
+            let base = doc.path().and_then(|p| p.parent());
+            for image in inline_images(&doc.slice(range)) {
+                let slot = cache.get(&image.dest, base);
+                let size = match &slot {
+                    ImageSlot::Ready { size, .. } if size.x > wrap => *size * (wrap / size.x),
+                    ImageSlot::Ready { size, .. } => *size,
+                    ImageSlot::Loading => vec2(wrap.min(320.0), 120.0),
+                    ImageSlot::Failed(_) | ImageSlot::Remote => vec2(wrap, row * 2.0),
+                };
+                if !(text_hidden && images.is_empty()) {
+                    y += IMAGE_GAP;
+                }
+                images.push(PlacedImage {
+                    top: y,
+                    size,
+                    slot,
+                    dest: image.dest,
+                });
+                y += size.y;
+            }
+        }
         Placed {
-            first_line: doc.byte_to_line(range.start),
-            last_line: doc.byte_to_line(range.end.saturating_sub(1).max(range.start)),
+            first_line,
+            last_line,
             indent: containers + inner,
             height: y + pad_bottom,
             leaf,
             layout,
             seg_tops,
             geometry,
+            text_hidden,
+            images,
         }
     }
 
@@ -929,7 +1004,7 @@ impl LiveView {
                     painter.rect_filled(r.translate(origin.to_vec2()), 0.0, SELECTION);
                 }
             }
-            if p.layout.style == LeafStyle::Rule && seg.text.is_empty() {
+            if p.text_hidden || (p.layout.style == LeafStyle::Rule && seg.text.is_empty()) {
                 continue;
             }
             self.text.draw_rich(
@@ -943,6 +1018,23 @@ impl LiveView {
                 TEXT,
                 &seg.colors,
             );
+        }
+        for image in &p.images {
+            let r = Rect::from_min_size(pos2(text_left, top + image.top), image.size);
+            let label = match &image.slot {
+                ImageSlot::Ready { texture, .. } => {
+                    let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                    painter.image(texture.id(), r, uv, Color32::WHITE);
+                    continue;
+                }
+                ImageSlot::Loading => "Loading image…".to_owned(),
+                ImageSlot::Failed(e) => format!("Can't show {}: {e}", image.dest),
+                ImageSlot::Remote => format!("Remote image not loaded: {}", image.dest),
+            };
+            painter.rect_filled(r, 4.0, CODE_BACKGROUND);
+            painter.rect_stroke(r, 4.0, Stroke::new(1.0, QUOTE_BAR), StrokeKind::Inside);
+            let label_pos = pos2(r.left() + 10.0, r.center().y - self.text.row_height() / 2.0);
+            self.text.draw_line(meshes, &label, label_pos, MARKUP);
         }
     }
 }

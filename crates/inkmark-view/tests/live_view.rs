@@ -228,3 +228,48 @@ fn bench_live_scroll_5mb() {
         jump.2
     );
 }
+
+#[test]
+fn image_paragraphs_show_the_loaded_image() {
+    let dir = tempfile::tempdir().unwrap();
+    image::RgbaImage::from_pixel(100, 300, image::Rgba([0, 128, 255, 255]))
+        .save(dir.path().join("tall.png"))
+        .unwrap();
+    let path = dir.path().join("doc.md");
+    std::fs::write(&path, "Intro\n\n![tall](tall.png)\n\nOutro\n").unwrap();
+
+    let ctx = egui::Context::default();
+    let doc = Document::open(&path).unwrap();
+    let parse = ParseState::new(Arc::new(PulldownParser), &doc, || {});
+    let mut h = Harness {
+        view: LiveView::new(&ctx, Id::new("live")),
+        ctx,
+        doc,
+        parse,
+        time: 0.0,
+    };
+    // Caret on "Intro", so the image paragraph shows only the image.
+    h.view.request_focus(&h.ctx);
+    let mut height = 0.0;
+    for _ in 0..500 {
+        h.frame(vec![]);
+        height = h.view.content_height();
+        if height > 300.0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        height > 300.0,
+        "image never loaded: content height {height}"
+    );
+    // With the caret on the image's line, its source shows above the image.
+    let at = h.doc.slice(0..h.doc.len()).find("![").unwrap();
+    h.view.set_selection(Selection::caret(at));
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(
+        h.view.content_height() > height + 10.0,
+        "revealed source adds a row"
+    );
+}
