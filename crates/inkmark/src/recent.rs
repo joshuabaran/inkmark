@@ -39,6 +39,11 @@ impl Recent {
         &self.entries
     }
 
+    /// The file the list is stored in, when there is somewhere to put it.
+    pub(crate) fn store_path(&self) -> Option<&Path> {
+        self.store.as_deref()
+    }
+
     /// Moves `path` to the front and saves. Failures to save are ignored:
     /// the list is a convenience.
     pub fn add(&mut self, path: &Path) {

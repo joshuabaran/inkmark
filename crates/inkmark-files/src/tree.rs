@@ -446,12 +446,6 @@ impl Tree {
     }
 }
 
-impl Kind {
-    fn looped(self) -> bool {
-        matches!(self, Self::Dir { looped: true, .. })
-    }
-}
-
 enum Listing {
     Entries(Vec<Entry>),
     Unreadable,

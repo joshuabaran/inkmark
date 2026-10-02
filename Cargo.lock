@@ -1714,6 +1714,7 @@ dependencies = [
  "egui",
  "image",
  "inkmark-buffer",
+ "inkmark-files",
  "inkmark-minimap",
  "inkmark-parse",
  "inkmark-text",

@@ -36,6 +36,20 @@ impl Kind {
     pub fn openable(self) -> bool {
         matches!(self, Self::File { openable: true })
     }
+
+    pub fn looped(self) -> bool {
+        matches!(self, Self::Dir { looped: true, .. })
+    }
+
+    pub fn unreadable(self) -> bool {
+        matches!(
+            self,
+            Self::Dir {
+                unreadable: true,
+                ..
+            }
+        )
+    }
 }
 
 pub fn is_markdown_name(name: &str) -> bool {
