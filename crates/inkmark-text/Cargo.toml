@@ -8,3 +8,10 @@ publish.workspace = true
 [dependencies]
 cosmic-text.workspace = true
 egui.workspace = true
+
+[dev-dependencies]
+eframe.workspace = true
+
+[features]
+# Lets the spike example run on the glow renderer (`--features glow -- --glow`).
+glow = ["eframe/glow"]
