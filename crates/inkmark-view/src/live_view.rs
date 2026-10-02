@@ -29,6 +29,8 @@ use crate::theme::{
 const PADDING: f32 = 28.0;
 const QUOTE_INDENT: f32 = 22.0;
 const ITEM_INDENT: f32 = 28.0;
+/// Room for a footnote definition's `[label]` in the margin.
+const FOOTNOTE_INDENT: f32 = 44.0;
 const CODE_PAD: f32 = 10.0;
 const CARET_WIDTH: f32 = 2.0;
 const NEWLINE_WIDTH: f32 = 6.0;
@@ -243,6 +245,8 @@ pub struct LiveView {
     pub show_minimap: bool,
     /// The caret moved since the last edit: start a new undo step.
     seal_undo: bool,
+    /// A short explanation for a key that did nothing, for the status bar.
+    hint: Option<&'static str>,
     /// The selection was set from outside in current offsets: don't map it
     /// through edits on the next sync.
     selection_current: bool,
@@ -276,6 +280,7 @@ impl LiveView {
             preedit: String::new(),
             show_minimap: true,
             seal_undo: false,
+            hint: None,
             selection_current: false,
             pending_scroll: None,
             checkboxes: Vec::new(),
@@ -283,6 +288,11 @@ impl LiveView {
             font_size: 16.0,
             line_height: 26.0,
         }
+    }
+
+    /// Why the last key did nothing, if it's not obvious. Taken once.
+    pub fn take_hint(&mut self) -> Option<&'static str> {
+        self.hint.take()
     }
 
     pub fn selection(&self) -> Selection {
@@ -574,6 +584,25 @@ impl LiveView {
     /// What raw syntax to show: around the caret, while focused.
     fn reveal(&self, doc: &Document) -> Option<Reveal> {
         self.focused.then(|| reveal_at(doc, self.selection.head))
+    }
+
+    /// `[label]`, or as much of the label as fits in `width` followed by
+    /// an ellipsis.
+    fn fit_marker(&mut self, label: &str, width: f32) -> String {
+        let fits =
+            |this: &mut Self, text: &str| this.text.geometry(text).caret_x(0, text.len()) <= width;
+        let full = format!("[{label}]");
+        if fits(self, &full) {
+            return full;
+        }
+        let chars: Vec<char> = label.chars().collect();
+        for n in (1..chars.len()).rev() {
+            let short = format!("[{}…]", chars[..n].iter().collect::<String>());
+            if fits(self, &short) {
+                return short;
+            }
+        }
+        "[…]".into()
     }
 
     fn place(&mut self, doc: &Document, parse: &ParseOutput, leaf: Leaf, width: f32) -> Placed {
@@ -1188,7 +1217,10 @@ impl LiveView {
             Key::Tab if here + 1 < cells.len() => goto(self, cells[here + 1]),
             Key::Tab => self.add_table_row(doc, &t),
             // A line break would end the row; Shift+Enter does nothing here.
-            Key::Enter if shift => false,
+            Key::Enter if shift => {
+                self.hint = Some("A line break would end the table row");
+                false
+            }
             Key::Enter if t.row + 1 < t.rows.len() => {
                 let below = &t.rows[t.row + 1].1;
                 if below.is_empty() {
@@ -1717,6 +1749,14 @@ impl LiveView {
                         }
                     }
                 }
+                BlockKind::FootnoteDefinition => {
+                    if let Some(label) = footnote_label(doc, parse, c, &p.leaf.block) {
+                        let y = top + p.body.seg_tops.first().copied().unwrap_or(0.0);
+                        let marker = self.fit_marker(&label, FOOTNOTE_INDENT - 6.0);
+                        self.text
+                            .draw_line(meshes, &marker, pos2(x + 2.0, y), LIST_MARKER);
+                    }
+                }
                 _ => {}
             }
             x += container_indent(c);
@@ -1863,6 +1903,7 @@ fn container_indent(c: &inkmark_parse::Block) -> f32 {
     match c.kind {
         BlockKind::BlockQuote => QUOTE_INDENT,
         BlockKind::Item => ITEM_INDENT,
+        BlockKind::FootnoteDefinition => FOOTNOTE_INDENT,
         _ => 0.0,
     }
 }
@@ -1888,6 +1929,40 @@ fn leaf_lines(doc: &Document, parse: &ParseOutput, line: usize) -> Option<(usize
         doc.byte_to_line(r.start),
         doc.byte_to_line(r.end.saturating_sub(1).max(r.start)),
     ))
+}
+
+/// A footnote definition's label, as written, when `leaf` is its first leaf
+/// (the margin marker goes beside that one only). Read from the `[^label]:`
+/// that opens the definition; the first block may itself be a list or a
+/// quote, and a label may contain escaped brackets (`[^a\]b]`).
+fn footnote_label(
+    doc: &Document,
+    parse: &ParseOutput,
+    def: &inkmark_parse::Block,
+    leaf: &inkmark_parse::Block,
+) -> Option<String> {
+    let first = parse.blocks.leaves_from(def.range.start).next()?;
+    if first.block.range.start != leaf.range.start {
+        return None;
+    }
+    let line_end = doc
+        .line_range(doc.byte_to_line(def.range.start))
+        .end
+        .min(def.range.end);
+    let head = doc.slice(def.range.start..line_end);
+    let rest = head.strip_prefix("[^")?;
+    let mut escaped = false;
+    for (i, c) in rest.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            ']' => return rest[i + 1..].starts_with(':').then(|| rest[..i].to_owned()),
+            // An unescaped `[` can't be in a label: not a definition marker.
+            '[' => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// "•" (by nesting depth) for bullet items. Ordered items count up from
@@ -1949,6 +2024,46 @@ mod tests {
                 list_marker(&doc, &parse, &item, &leaf.containers)
             })
             .collect()
+    }
+
+    /// The margin label drawn beside each leaf of `src`, if any.
+    fn footnote_labels(src: &str) -> Vec<Option<String>> {
+        use inkmark_parse::GfmParser;
+
+        let doc = Document::from_text(src);
+        let parse = GfmParser.parse(src);
+        parse
+            .blocks
+            .leaves_from(0)
+            .map(|leaf| {
+                let def = leaf
+                    .containers
+                    .iter()
+                    .find(|c| c.kind == BlockKind::FootnoteDefinition)?;
+                footnote_label(&doc, &parse, def, &leaf.block)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_footnote_label_is_read_from_the_definitions_start() {
+        // Review of #23: a first block that is a list or quote, or a label
+        // with an escaped bracket, used to lose its margin label.
+        let one = || Some("1".to_owned());
+        assert_eq!(footnote_labels("[^1]: Note\n"), vec![one()]);
+        assert_eq!(footnote_labels("[^1]: - item\n"), vec![one()]);
+        assert_eq!(footnote_labels("[^1]: 1. item\n"), vec![one()]);
+        assert_eq!(footnote_labels("[^1]: > quote\n"), vec![one()]);
+        assert_eq!(
+            footnote_labels("[^foo\\]bar]: note\n"),
+            vec![Some("foo\\]bar".to_owned())]
+        );
+        // Beside the first leaf only.
+        assert_eq!(
+            footnote_labels("[^1]: First\n\n    Second\n"),
+            vec![one(), None]
+        );
+        assert_eq!(footnote_labels("[^1]: - a\n    - b\n"), vec![one(), None]);
     }
 
     #[test]

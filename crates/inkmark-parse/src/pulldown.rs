@@ -17,19 +17,24 @@ impl MarkdownParser for PulldownParser {
 }
 
 /// GitHub Flavored Markdown: CommonMark plus tables, strikethrough, task
-/// lists (pulldown-cmark's extensions) and autolink literals (ours).
+/// lists, footnotes (pulldown-cmark's extensions) and autolink literals
+/// (ours).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GfmParser;
 
 impl MarkdownParser for GfmParser {
     fn parse(&self, src: &str) -> ParseOutput {
-        let options =
-            Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-        let mut out = Builder::new(src, options).run();
+        let mut out = Builder::new(src, GFM_OPTIONS).run();
         crate::autolinks::mark(src, &mut out.map);
         out
     }
 }
+
+/// pulldown-cmark's extensions that make up GFM (autolinks are ours).
+pub(crate) const GFM_OPTIONS: Options = Options::ENABLE_TABLES
+    .union(Options::ENABLE_STRIKETHROUGH)
+    .union(Options::ENABLE_TASKLISTS)
+    .union(Options::ENABLE_FOOTNOTES);
 
 /// An element open while walking events.
 struct Open {
@@ -53,11 +58,13 @@ enum OpenTag {
     Link,
     Image,
     InlineHtml,
+    FootnoteReference,
     Strikethrough,
     Table,
     TableHead,
     TableRow,
     TableCell,
+    FootnoteDefinition,
     /// Extension tags we don't enable; kept so the stack stays balanced.
     Other,
 }
@@ -73,6 +80,7 @@ struct Builder<'a> {
     /// Implicit paragraph for the text of a tight list item (pulldown-cmark
     /// emits none), so every piece of inline content has a leaf block.
     tight: Option<usize>,
+    footnotes: std::collections::BTreeSet<String>,
 }
 
 impl<'a> Builder<'a> {
@@ -85,6 +93,7 @@ impl<'a> Builder<'a> {
             stack: Vec::new(),
             cursor: 0,
             tight: None,
+            footnotes: Default::default(),
         }
     }
 
@@ -132,6 +141,17 @@ impl<'a> Builder<'a> {
                     }
                     self.push(range, SpanKind::Syntax(Syntax::TaskMarker(checked)));
                 }
+                Event::FootnoteReference(label) => {
+                    // Shown as `[label]` until the caret touches it, like an
+                    // entity; then as typed.
+                    self.fill_to(range.start);
+                    self.stack.push(Open {
+                        tag: OpenTag::FootnoteReference,
+                        block: None,
+                    });
+                    self.push(range, SpanKind::Replaced(format!("[{label}]").into()));
+                    self.stack.pop();
+                }
                 Event::Rule => {
                     self.fill_to(range.start);
                     self.blocks.push(Block {
@@ -155,6 +175,7 @@ impl<'a> Builder<'a> {
             blocks: BlockTree::from_blocks(self.blocks),
             map: SourceMap::from_spans(self.spans),
             link_defs,
+            footnotes: self.footnotes,
         }
     }
 
@@ -163,6 +184,7 @@ impl<'a> Builder<'a> {
             Event::Text(_)
             | Event::Code(_)
             | Event::InlineHtml(_)
+            | Event::FootnoteReference(_)
             | Event::SoftBreak
             | Event::HardBreak => true,
             Event::Start(tag) => !is_block(tag),
@@ -240,6 +262,13 @@ impl<'a> Builder<'a> {
             Tag::TableHead => (OpenTag::TableHead, Some(BlockKind::TableHead)),
             Tag::TableRow => (OpenTag::TableRow, Some(BlockKind::TableRow)),
             Tag::TableCell => (OpenTag::TableCell, Some(BlockKind::TableCell)),
+            Tag::FootnoteDefinition(label) => {
+                self.footnotes.insert(label.into_string());
+                (
+                    OpenTag::FootnoteDefinition,
+                    Some(BlockKind::FootnoteDefinition),
+                )
+            }
             _ => (OpenTag::Other, None),
         };
         let block = block.map(|kind| {
@@ -276,7 +305,9 @@ impl<'a> Builder<'a> {
                 OpenTag::Image => style.insert(Style::IMAGE),
                 OpenTag::Strikethrough => style.insert(Style::STRIKE),
                 OpenTag::TableHead => style.insert(Style::TABLE_HEAD),
+                OpenTag::FootnoteReference => style.insert(Style::FOOTNOTE),
                 OpenTag::Paragraph
+                | OpenTag::FootnoteDefinition
                 | OpenTag::Other
                 | OpenTag::Table
                 | OpenTag::TableRow
@@ -474,6 +505,21 @@ impl<'a> Builder<'a> {
             }
             _ => {}
         }
+        // A footnote definition's own `[^label]: ` (the gap holding its
+        // first byte). Later gaps in the note, like the `[` of a link that
+        // starts a lazy continuation line, are classified as usual.
+        if let Some(def) = self
+            .stack
+            .iter()
+            .rev()
+            .find(|o| o.tag == OpenTag::FootnoteDefinition)
+            .and_then(|o| o.block)
+        {
+            let start = self.blocks[def].range.start;
+            if at <= start && start < at + text.len() {
+                return Syntax::FootnoteLabel;
+            }
+        }
         if line_start && let Some(c) = container {
             return container_syntax(c, text);
         }
@@ -664,6 +710,142 @@ mod tests {
                 (BlockKind::Item, 1),
                 (BlockKind::Paragraph, 2),
             ]
+        );
+    }
+
+    #[test]
+    fn footnotes_map_every_byte() {
+        let src = "Text[^1] and[^long].\n\n[^1]: One.\n\n[^long]: First\n    lazy line.\n\n    Second para.\n\n> Quoted[^1]\n\n- tight item[^1]\n- [^1] first\n\nNo[^missing] def.\n";
+        let out = GfmParser.parse(src);
+        out.map.validate(src.len()).unwrap();
+        // Every reference is inside a leaf, so the live view draws it; a
+        // tight list item's implicit paragraph has to take it in.
+        let leaves: Vec<_> = out
+            .blocks
+            .iter()
+            .filter(|b| b.kind.is_leaf())
+            .map(|b| b.range)
+            .collect();
+        for s in out.map.iter().filter(|s| s.style.contains(Style::FOOTNOTE)) {
+            assert!(
+                leaves
+                    .iter()
+                    .any(|l| l.start <= s.range.start && s.range.end <= l.end),
+                "{:?} at {:?} is outside every leaf",
+                &src[s.range.clone()],
+                s.range
+            );
+        }
+        let shown: Vec<(&str, SpanKind)> = out
+            .map
+            .iter()
+            .filter(|s| s.style.contains(Style::FOOTNOTE))
+            .map(|s| (&src[s.range], s.kind))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                ("[^1]", SpanKind::Replaced("[1]".into())),
+                ("[^long]", SpanKind::Replaced("[long]".into())),
+                ("[^1]", SpanKind::Replaced("[1]".into())),
+                ("[^1]", SpanKind::Replaced("[1]".into())),
+                ("[^1]", SpanKind::Replaced("[1]".into())),
+            ],
+            "a reference without a definition stays text"
+        );
+        let labels: Vec<&str> = out
+            .map
+            .iter()
+            .filter(|s| s.kind == SpanKind::Syntax(Syntax::FootnoteLabel))
+            .map(|s| &src[s.range])
+            .collect();
+        assert_eq!(labels, vec!["[^1]: ", "[^long]: "]);
+        let defs: Vec<(&str, u16)> = out
+            .blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::FootnoteDefinition)
+            .map(|b| (&src[b.range], b.depth))
+            .collect();
+        assert_eq!(
+            defs,
+            vec![
+                ("[^1]: One.\n\n", 0),
+                ("[^long]: First\n    lazy line.\n\n    Second para.\n\n", 0),
+            ]
+        );
+        // The note's paragraphs are leaves inside the definition.
+        let paragraphs: Vec<(&str, u16)> = out
+            .blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::Paragraph && b.depth == 1)
+            .map(|b| (&src[b.range], b.depth))
+            .collect();
+        assert!(
+            paragraphs.contains(&("Second para.\n", 1)),
+            "{paragraphs:?}"
+        );
+        assert_eq!(
+            out.footnotes.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["1", "long"]
+        );
+    }
+
+    #[test]
+    fn commonmark_has_no_footnotes() {
+        let src = "Text[^1].\n\n[^1]: One.\n";
+        let out = PulldownParser.parse(src);
+        assert!(out.map.iter().all(|s| !s.style.contains(Style::FOOTNOTE)));
+        assert!(out.footnotes.is_empty());
+    }
+
+    #[test]
+    fn markup_starting_a_line_in_a_footnote_keeps_its_kind() {
+        // Review of #23: only the definition's own `[^label]: ` is a label.
+        let syntax = |src: &str| -> Vec<(String, Syntax)> {
+            GfmParser
+                .parse(src)
+                .map
+                .iter()
+                .filter_map(|s| match s.kind {
+                    SpanKind::Syntax(k) => Some((src[s.range].to_owned(), k)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let label = ("[^1]: ".to_owned(), Syntax::FootnoteLabel);
+        assert_eq!(
+            syntax("[^1]: see\n[a link](http://x.com) here\n"),
+            vec![
+                label.clone(),
+                ("[".into(), Syntax::LinkMarkup),
+                ("](http://x.com)".into(), Syntax::LinkMarkup),
+            ]
+        );
+        assert_eq!(
+            syntax("[^1]: see\n*world* next\n"),
+            vec![
+                label.clone(),
+                ("*".into(), Syntax::Delimiter),
+                ("*".into(), Syntax::Delimiter),
+            ]
+        );
+        assert_eq!(
+            syntax("[^1]: see\n![alt](img.png)\n"),
+            vec![
+                label.clone(),
+                ("![".into(), Syntax::LinkMarkup),
+                ("](img.png)".into(), Syntax::LinkMarkup),
+            ]
+        );
+        assert_eq!(
+            syntax("> [^1]: q\n"),
+            vec![("> ".into(), Syntax::QuotePrefix), label.clone()]
+        );
+        // A first block that is a list or quote: the label still ends at
+        // the space, and the block's own marker keeps its kind.
+        assert_eq!(
+            syntax("[^1]: - item\n"),
+            vec![label.clone(), ("- ".into(), Syntax::ListMarker)]
         );
     }
 }

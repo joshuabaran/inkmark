@@ -2,7 +2,7 @@
 
 **Name (working):** `inkmark` · Rust · egui/eframe · Linux/Wayland (Omarchy/Hyprland) first · no Electron/WebView
 
-**Status:** Signed off 2026-10-01. MVP (M1–M6), GFM (G1–G4) and the [file browser](#file-browser-next) (F1–F3) are complete as of 2026-10-02; the first outside review's 21 issues are fixed. See [Results](#results) for measurements and the [Roadmap](#roadmap) for what's planned. Changes to locked decisions require updating this doc first.
+**Status:** Signed off 2026-10-01. MVP (M1–M6), GFM (G1–G4) and the [file browser](#file-browser-next) (F1–F3) are complete as of 2026-10-02; the first outside review's 21 issues and seven suggestions are fixed, and footnotes are in ([hardening and footnotes](#hardening-and-footnotes-2026-10-02)). See [Results](#results) for measurements and the [Roadmap](#roadmap) for what's planned. Changes to locked decisions require updating this doc first.
 
 ---
 
@@ -290,14 +290,7 @@ An outside review of `b5ca0ca` (Grok; `~/Projects/inkmark/REVIEW.md`, smoke test
 
 One smoke test is intentionally left failing: it wants the space after a task marker to be visible text. pulldown-cmark's item text doesn't include that space, and every visible span must reproduce that text exactly, so the task-marker span owns the space instead (`[x] `). It can no longer be dropped, which was the problem raised.
 
-**Suggestions from the review not acted on yet:**
-
-- Detect on-disk changes that keep both length and mtime (compare content or inode generation).
-- If the directory fsync after the atomic rename fails, the save has in fact happened; don't report it as failed.
-- `Recent::add` should canonicalize paths that don't exist yet, so one file isn't listed twice.
-- Announce on-disk changes even while an error banner is showing.
-- Say why Shift+Enter does nothing in a table.
-- `Document` could implement `Debug`.
+**Suggestions from the review:** all seven were done in the [hardening round](#hardening-and-footnotes-2026-10-02).
 
 ## Roadmap
 
@@ -346,12 +339,38 @@ A same-day run of `master` (no sidebar) on this host was empty 113 ms / 116 MB, 
 
 **Out of scope for this milestone:** rename, move, delete; search across files; links between notes and backlinks; tabs or several open files; git status in the tree.
 
+### Hardening and footnotes (2026-10-02)
+
+Built on branch `hardening-footnotes` and reviewed by Grok before merging.
+
+**The review's suggestions**
+
+| Suggestion | Done |
+|---|---|
+| Changes that keep both length and mtime go unnoticed | The disk stamp also holds the file's (device, inode) and its ctime. Any write sets ctime and it can't be set back; replacing the file changes the inode. Same `stat` call, so no extra cost. A `chmod` now also counts as a change, which errs on the side of asking. |
+| A failed directory fsync after the rename reports the save as failed | The save counts once the rename succeeds; the directory sync is best effort. |
+| A file added to recents before it exists can be listed twice | A missing file is stored as its folder's canonical path plus its name. |
+| An error banner hides disk changes | Errors have their own row above the disk banner; the disk check always runs. |
+| Shift+Enter in a table is silent | The live pane explains it in the status bar for four seconds (`LiveView::take_hint`). |
+| Item 999999999 continues as a ten-digit non-marker | Enter repeats 999999999. |
+| `Document` has no `Debug` | It shows path, length, epoch, dirty and encoding, never the text. |
+
+**Footnotes (decisions)**
+
+| Question | Decision |
+|---|---|
+| Syntax | pulldown-cmark's `ENABLE_FOOTNOTES` (the GFM / cmark-gfm form), in `GfmParser` only. A reference without a definition stays text, as in GFM. |
+| A reference `[^label]` | One `Replaced` span showing `[label]` in link color, with a new `Style::FOOTNOTE`. Like an entity, it shows its source when the caret touches it. |
+| A definition `[^label]: …` | A container block (`BlockKind::FootnoteDefinition`), like a list item: its paragraphs are ordinary leaves. `[^label]: ` is `Syntax::FootnoteLabel`, drawn in the margin as `[label]` (shortened with `…` to fit) and never revealed, like a list marker; it's edited in the code pane. |
+| Typing next to a reference | A local reparse only sees the edited block, and a reference needs its definition to parse. So the local parse gets stand-in definitions for the labels the document defines (`ParseOutput::footnotes`), appended after the region and dropped from the result. Without them the reference would flip to `[^1]` text on every keystroke. |
+| Not done | Jumping between a reference and its definition (links aren't clickable yet either); numbering notes in order of first use, as GitHub's HTML does. The live view shows the label as written. |
+
+GFM full parse of the 5.2 MB benchmark: 92 ms, unchanged.
+
 ### Later
 
-- Footnotes (pulldown-cmark supports them; not part of the GFM spec).
 - Tables: re-pad columns so pipes stay aligned as you type; add and remove columns.
 - File management in the browser: rename, move, delete to trash.
 - Code pane: snap fallback glyphs (box drawing, CJK) to whole monospace cells.
 - Images: SVG; remote images (needs a network policy).
-- The review suggestions above.
 - Still standing from the MVP: a link reference deleted by a local edit lingers until the next full parse.

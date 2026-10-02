@@ -47,7 +47,7 @@ impl Recent {
     /// Moves `path` to the front and saves. Failures to save are ignored:
     /// the list is a convenience.
     pub fn add(&mut self, path: &Path) {
-        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let path = canonical(path);
         self.entries.retain(|p| *p != path);
         self.entries.insert(0, path);
         self.entries.truncate(MAX_ENTRIES);
@@ -63,6 +63,21 @@ impl Recent {
             .join("\n");
         text.push('\n');
         let _ = std::fs::write(store, text);
+    }
+}
+
+/// `path` in one spelling, so a file is listed once. A file that doesn't
+/// exist yet (a new file) is its folder's canonical path plus its name.
+fn canonical(path: &Path) -> PathBuf {
+    if let Ok(path) = std::fs::canonicalize(path) {
+        return path;
+    }
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    match (absolute.parent(), absolute.file_name()) {
+        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+            .map(|dir| dir.join(name))
+            .unwrap_or(absolute),
+        _ => absolute,
     }
 }
 
@@ -93,5 +108,22 @@ mod tests {
         // A fresh load sees the same list.
         let reloaded = Recent::from_store(Some(store));
         assert_eq!(reloaded.entries(), recent.entries());
+    }
+
+    #[test]
+    fn a_new_file_is_listed_once_however_it_was_named() {
+        // From the first review: a path added before the file existed kept
+        // its spelling, so the file could be listed twice.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let mut recent = Recent::from_store(None);
+        recent.add(&dir.path().join("sub/../new.md"));
+        std::fs::write(dir.path().join("new.md"), "").unwrap();
+        recent.add(&dir.path().join("new.md"));
+        assert_eq!(recent.entries().len(), 1, "{:?}", recent.entries());
+        assert_eq!(
+            recent.entries()[0],
+            dir.path().join("new.md").canonicalize().unwrap()
+        );
     }
 }

@@ -32,13 +32,17 @@ fn examples() -> Vec<Example> {
 }
 
 fn rendered_text(src: &str) -> String {
-    let options =
-        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
     Parser::new_ext(src, options)
         .filter_map(|e| match e {
             Event::Text(t) | Event::Code(t) | Event::Html(t) | Event::InlineHtml(t) => {
                 Some(t.into_string())
             }
+            // The live view shows a reference as its label in brackets.
+            Event::FootnoteReference(label) => Some(format!("[{label}]")),
             _ => None,
         })
         .collect()

@@ -108,12 +108,13 @@ fn line_of(doc: &Document, offset: usize) -> (Range<usize>, String) {
 }
 
 /// The marker for the item after one with `marker` (bullets repeat,
-/// numbers count up).
+/// numbers count up). CommonMark allows at most nine digits, so the number
+/// stops at 999999999 rather than become a ten-digit non-marker.
 fn next_marker(marker: &str) -> String {
     let digits: String = marker.chars().take_while(char::is_ascii_digit).collect();
     match digits.parse::<u64>() {
-        Ok(n) => format!("{}{}", n + 1, &marker[digits.len()..]),
-        Err(_) => marker.to_owned(),
+        Ok(n) if (n + 1).to_string().len() <= 9 => format!("{}{}", n + 1, &marker[digits.len()..]),
+        _ => marker.to_owned(),
     }
 }
 
@@ -605,6 +606,16 @@ mod tests {
             apply(&text, sel, |d, s| toggle_wrap(d, s, "~~", &["~"])),
             "a ~~[struck]~~ c"
         );
+    }
+
+    #[test]
+    fn ordered_markers_stop_at_nine_digits() {
+        // From the first review's suggestions.
+        assert_eq!(next_marker("9."), "10.");
+        assert_eq!(next_marker("99999998)"), "99999999)");
+        assert_eq!(next_marker("999999998."), "999999999.");
+        assert_eq!(next_marker("999999999."), "999999999.");
+        assert_eq!(next_marker("-"), "-");
     }
 
     #[test]

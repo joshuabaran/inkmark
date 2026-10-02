@@ -25,6 +25,9 @@ pub struct ParseOutput {
     /// [`normalize_label`]. Local reparses only add to these; the next
     /// full parse drops ones that were deleted.
     pub link_defs: std::collections::HashMap<String, String>,
+    /// Labels of footnote definitions (`[^label]:`), as written. Like
+    /// `link_defs`, local reparses only add to these.
+    pub footnotes: std::collections::BTreeSet<String>,
 }
 
 /// A link label as CommonMark matches it: case-folded, with runs of

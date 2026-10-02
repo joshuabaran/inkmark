@@ -13,6 +13,9 @@ use inkmark_parse::{GfmParser, ParseState};
 use inkmark_text::Fonts;
 use inkmark_view::{BrowserOutput, CodeView, FileBrowser, LiveView};
 
+/// How long a key hint stays in the status bar.
+const HINT_TIME: Duration = Duration::from_secs(4);
+
 /// How often we look for changes made to the file by other programs.
 const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd", "txt"];
@@ -81,8 +84,9 @@ fn main() -> eframe::Result {
     )
 }
 
+/// The open file's state on disk, when it needs the user's attention.
+/// Errors are shown separately, so one never hides the other.
 enum Banner {
-    Error(String),
     /// Another program changed the file since we loaded or saved it.
     DiskChanged,
     DiskMissing,
@@ -127,6 +131,10 @@ struct App {
     /// The pane with keyboard focus (or that last had it).
     focus: Pane,
     banner: Option<Banner>,
+    /// The last thing that failed (open, save, a dialog), until dismissed.
+    error: Option<String>,
+    /// A pane's explanation for a key that did nothing, shown for a moment.
+    hint: Option<(&'static str, Instant)>,
     dialog: Option<Receiver<DialogResult>>,
     confirm: Option<Confirm>,
     close_after_save: bool,
@@ -178,6 +186,8 @@ impl App {
                 })
             },
             banner: None,
+            error: None,
+            hint: None,
             dialog: None,
             confirm: None,
             close_after_save: false,
@@ -228,10 +238,7 @@ impl App {
                 doc
             }
             Err(e) => {
-                self.banner = Some(Banner::Error(format!(
-                    "Couldn't open {}: {e}",
-                    path.display()
-                )));
+                self.error = Some(format!("Couldn't open {}: {e}", path.display()));
                 return;
             }
         };
@@ -246,6 +253,7 @@ impl App {
         self.live.reset();
         self.parse.reset(&self.doc);
         self.banner = None;
+        self.error = None;
     }
 
     /// Re-reads the open file. If it's gone, the buffer is kept (it may be
@@ -260,10 +268,7 @@ impl App {
                 self.banner = Some(Banner::DiskMissing);
             }
             Err(e) => {
-                self.banner = Some(Banner::Error(format!(
-                    "Couldn't reload {}: {e}",
-                    path.display()
-                )));
+                self.error = Some(format!("Couldn't reload {}: {e}", path.display()));
             }
         }
     }
@@ -279,7 +284,7 @@ impl App {
         }
         match self.doc.save() {
             Ok(()) => self.saved(),
-            Err(e) => self.banner = Some(Banner::Error(format!("Couldn't save: {e}"))),
+            Err(e) => self.error = Some(format!("Couldn't save: {e}")),
         }
     }
 
@@ -299,19 +304,13 @@ impl App {
                 self.recent.add(&path);
                 self.saved();
             }
-            Err(e) => {
-                self.banner = Some(Banner::Error(format!(
-                    "Couldn't save {}: {e}",
-                    path.display()
-                )))
-            }
+            Err(e) => self.error = Some(format!("Couldn't save {}: {e}", path.display())),
         }
     }
 
     fn saved(&mut self) {
-        if matches!(self.banner, Some(Banner::DiskChanged | Banner::DiskMissing)) {
-            self.banner = None;
-        }
+        self.banner = None;
+        self.error = None;
         if self.close_after_save {
             self.close_allowed = true;
         }
@@ -381,9 +380,7 @@ impl App {
             }
             Ok(DialogResult::Folder(None)) => {}
             Err(TryRecvError::Disconnected) => {
-                self.banner = Some(Banner::Error(
-                    "The file dialog failed. Is xdg-desktop-portal running?".into(),
-                ));
+                self.error = Some("The file dialog failed. Is xdg-desktop-portal running?".into());
             }
         }
         self.dialog = None;
@@ -393,13 +390,11 @@ impl App {
         let now = Instant::now();
         if now >= self.next_disk_check {
             self.next_disk_check = now + DISK_CHECK_INTERVAL;
-            if !matches!(self.banner, Some(Banner::Error(_))) {
-                self.banner = match self.doc.disk_status() {
-                    Ok(DiskStatus::Modified) => Some(Banner::DiskChanged),
-                    Ok(DiskStatus::Missing) => Some(Banner::DiskMissing),
-                    _ => None,
-                };
-            }
+            self.banner = match self.doc.disk_status() {
+                Ok(DiskStatus::Modified) => Some(Banner::DiskChanged),
+                Ok(DiskStatus::Missing) => Some(Banner::DiskMissing),
+                _ => None,
+            };
         }
         ctx.request_repaint_after(DISK_CHECK_INTERVAL);
     }
@@ -564,15 +559,22 @@ impl App {
     }
 
     fn banner_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(banner) = &self.banner else { return };
         let mut action = None;
-        ui.horizontal(|ui| match banner {
-            Banner::Error(message) => {
+        if let Some(message) = &self.error {
+            ui.horizontal(|ui| {
                 ui.label(RichText::new(message).color(Color32::from_rgb(255, 140, 120)));
                 if ui.button("Dismiss").clicked() {
                     action = Some("dismiss");
                 }
+            });
+        }
+        let Some(banner) = &self.banner else {
+            if action == Some("dismiss") {
+                self.error = None;
             }
+            return;
+        };
+        ui.horizontal(|ui| match banner {
             Banner::DiskChanged => {
                 ui.label("This file was changed by another program.");
                 if ui.button("Reload").clicked() {
@@ -590,13 +592,13 @@ impl App {
             }
         });
         match action {
-            Some("dismiss") => self.banner = None,
+            Some("dismiss") => self.error = None,
             Some("reload") => self.reload(),
             Some("keep") => {
-                self.banner = match self.doc.acknowledge_disk_state() {
-                    Ok(()) => None,
-                    Err(e) => Some(Banner::Error(format!("Couldn't check the file: {e}"))),
-                };
+                self.banner = None;
+                if let Err(e) = self.doc.acknowledge_disk_state() {
+                    self.error = Some(format!("Couldn't check the file: {e}"));
+                }
             }
             _ => {}
         }
@@ -620,6 +622,9 @@ impl App {
             ui.label(path);
             if self.doc.is_dirty() {
                 ui.label("●");
+            }
+            if let Some((hint, _)) = self.hint {
+                ui.label(RichText::new(hint).color(Color32::from_rgb(230, 200, 120)));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(if encoding.bom { "UTF-8 BOM" } else { "UTF-8" });
@@ -790,9 +795,7 @@ impl App {
             }
             Err(NewFileError::Io(message)) => {
                 self.new_file = None;
-                self.banner = Some(Banner::Error(format!(
-                    "Couldn't create the file: {message}"
-                )));
+                self.error = Some(format!("Couldn't create the file: {message}"));
             }
         }
     }
@@ -909,6 +912,16 @@ impl App {
 
     fn panes(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if let Some(hint) = self.live.take_hint() {
+            self.hint = Some((hint, Instant::now()));
+        }
+        if let Some((_, shown)) = self.hint {
+            if shown.elapsed() >= HINT_TIME {
+                self.hint = None;
+            } else {
+                ctx.request_repaint_after(HINT_TIME - shown.elapsed());
+            }
+        }
         match self.mode {
             Mode::Code => {
                 self.code.show(ui, &mut self.doc, Some(&mut self.parse));
@@ -973,7 +986,7 @@ impl eframe::App for App {
         self.recent_ui(&ctx);
         self.hold_focus_for_dialogs(&ctx);
 
-        if self.banner.is_some() {
+        if self.banner.is_some() || self.error.is_some() {
             egui::Panel::top("banner").show(ui, |ui| self.banner_ui(ui));
         }
         egui::Panel::bottom("status").show(ui, |ui| self.status_ui(ui));
@@ -1044,7 +1057,7 @@ mod tests {
         fs::write(&bad, b"\xff\xfe not utf-8").unwrap();
         let mut app = app(dir.path(), None);
         app.open(bad.clone());
-        assert!(matches!(app.banner, Some(Banner::Error(_))));
+        assert!(app.error.is_some());
         assert!(app.recent.entries().is_empty());
         // A new file at a missing path is deliberate, so it is remembered.
         app.open(dir.path().join("new.md"));
@@ -1650,5 +1663,22 @@ mod tests {
         app.check_disk(&ctx);
         assert!(matches!(app.banner, Some(Banner::DiskChanged)));
         assert_eq!(text(&app), "open\n");
+    }
+
+    #[test]
+    fn a_change_on_disk_is_announced_while_an_error_shows() {
+        // From the first review: an error banner used to hide disk changes
+        // until it was dismissed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "one\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(path.clone()));
+        app.error = Some("Couldn't save: disk full".into());
+        fs::write(&path, "changed elsewhere\n").unwrap();
+        app.next_disk_check = Instant::now();
+        app.check_disk(&ctx);
+        assert!(matches!(app.banner, Some(Banner::DiskChanged)));
+        assert_eq!(app.error.as_deref(), Some("Couldn't save: disk full"));
     }
 }

@@ -245,14 +245,14 @@ fn local_reparse_picks_up_new_syntax_immediately() {
     assert_eq!(out, PulldownParser.parse(&whole(&doc)));
 }
 
-const GFM_SAMPLE: &str = "| Name | Done |\n|:-----|-----:|\n| one  | ~~no~~ |\n| two  | yes |\n\n- [ ] task www.example.com/a_b_c\n- [x] done, mail me@example.org\n\nPlain https://x.org/y_z and ~~struck~~ text.\n";
+const GFM_SAMPLE: &str = "| Name | Done |\n|:-----|-----:|\n| one  | ~~no~~ |\n| two  | yes |\n\n- [ ] task www.example.com/a_b_c\n- [x] done, mail me@example.org\n\nPlain https://x.org/y_z and ~~struck~~ text.[^n]\n\n[^n]: A *note*\n    on two lines.\n\n    Second para.\n\nAfter[^n].\n";
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     #[test]
     fn gfm_edits_keep_the_parse_valid(
-        edits in prop::collection::vec((0.0..1.0f64, 0usize..4, prop::sample::select(&["a", "|", "~~", "[ ] ", "- ", "\n", "www.a.com ", "\\\\", "_"][..])), 1..25)
+        edits in prop::collection::vec((0.0..1.0f64, 0usize..4, prop::sample::select(&["a", "|", "~~", "[ ] ", "- ", "\n", "www.a.com ", "\\\\", "_", "[^n]", "[^", "]: ", "    "][..])), 1..25)
     ) {
         let mut doc = Document::from_text(GFM_SAMPLE);
         let mut out = GfmParser.parse(GFM_SAMPLE);
@@ -325,4 +325,55 @@ fn a_parse_in_flight_at_reset_is_not_used_for_the_new_document() {
     settle(&mut state, &new);
     assert_eq!(state.output().map.len(), new.len());
     assert_eq!(state.output(), &GfmParser.parse("# new\n"));
+}
+
+#[test]
+fn typing_beside_a_footnote_reference_keeps_it_a_footnote() {
+    // The definition is outside the re-parsed paragraph; without it the
+    // reference would flicker to plain `[^n]` text on every keystroke.
+    let src = "First[^n] para.\n\nOther text.\n\n[^n]: The note.\n";
+    let mut doc = Document::from_text(src);
+    let mut out = GfmParser.parse(src);
+    for (i, ch) in ["a", "b", "c"].into_iter().enumerate() {
+        let at = 5 + i;
+        let since = doc.epoch();
+        doc.apply(
+            vec![Edit::insert(at, ch)],
+            Selection::caret(at),
+            Selection::caret(at + 1),
+            EditKind::Typing,
+        )
+        .unwrap();
+        assert!(out.catch_up(&GfmParser, &doc, since));
+        assert_valid(&out, &doc);
+        assert_eq!(out, GfmParser.parse(&whole(&doc)), "after typing {ch:?}");
+    }
+    let reference = out
+        .map
+        .iter()
+        .find(|s| s.style.contains(inkmark_parse::Style::FOOTNOTE))
+        .expect("still a footnote reference");
+    assert_eq!(&whole(&doc)[reference.range], "[^n]");
+    assert_eq!(reference.kind, SpanKind::Replaced("[n]".into()));
+}
+
+#[test]
+fn a_local_reparse_at_the_end_adds_nothing_past_the_document() {
+    // The stand-in definitions follow the region; none of their spans or
+    // blocks may survive, even when the region ends the file without a
+    // newline.
+    let src = "[^a]: note\n\nend[^a]";
+    let mut doc = Document::from_text(src);
+    let mut out = GfmParser.parse(src);
+    let since = doc.epoch();
+    doc.apply(
+        vec![Edit::insert(src.len(), "!")],
+        Selection::caret(src.len()),
+        Selection::caret(src.len() + 1),
+        EditKind::Typing,
+    )
+    .unwrap();
+    assert!(out.catch_up(&GfmParser, &doc, since));
+    assert_valid(&out, &doc);
+    assert_eq!(out, GfmParser.parse(&whole(&doc)));
 }
