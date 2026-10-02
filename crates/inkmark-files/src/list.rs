@@ -52,7 +52,7 @@ impl Kind {
     }
 }
 
-/// Whether a file name has one of the [`MARKDOWN_EXTENSIONS`].
+/// Whether a file name has a Markdown extension (`MARKDOWN_EXTENSIONS`).
 pub fn is_markdown_name(name: &str) -> bool {
     Path::new(name)
         .extension()
@@ -65,7 +65,7 @@ pub fn is_markdown_name(name: &str) -> bool {
 }
 
 /// Lists `dir` itself. Dot-files and non-Markdown files are left out unless
-/// `show_all`. Folders sort first, then [`natural_cmp`], then the raw name
+/// `show_all`. Folders sort first, then natural order (`natural_cmp`), then the raw name
 /// so the order is total when case is the only difference.
 ///
 /// `epoch` / `ticket` let a slow listing stop when the browser has moved on

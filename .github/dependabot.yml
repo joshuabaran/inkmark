@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # Keep the CI actions current; Rust dependencies are updated by hand.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

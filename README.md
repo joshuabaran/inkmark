@@ -1,5 +1,7 @@
 # inkmark
 
+[![CI](https://github.com/joshuabaran/inkmark/actions/workflows/ci.yml/badge.svg)](https://github.com/joshuabaran/inkmark/actions/workflows/ci.yml)
+
 A fast, local Markdown editor for Linux and Wayland. Plain `.md` files on
 disk are the only source of truth: no accounts, sync or plugins.
 
@@ -116,6 +118,17 @@ cargo test --workspace                                  # unit, spec, fuzz tests
 cargo test --release --workspace -- --ignored --nocapture   # benchmarks
 scripts/measure.sh [big.md]                             # startup, memory, scroll fps
 FUZZ_ITERS=5000 cargo test --release -p inkmark-view --test live_edit fuzzed
+```
+
+CI (`.github/workflows/ci.yml`) runs formatting, clippy (also with the
+`glow` renderer), rustdoc, the tests, a release build, and coverage with
+[cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov). The coverage
+summary is on each run's page, with the HTML report and `lcov.info` as an
+artifact. Locally:
+
+```sh
+cargo install cargo-llvm-cov && rustup component add llvm-tools-preview
+cargo llvm-cov --workspace --open
 ```
 
 The workspace is split into `inkmark-buffer` (rope, edits, undo, file I/O),
