@@ -1656,6 +1656,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "inkmark-buffer",
+ "inkmark-files",
  "inkmark-minimap",
  "inkmark-parse",
  "inkmark-text",
@@ -1670,6 +1671,13 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "ropey",
+ "tempfile",
+]
+
+[[package]]
+name = "inkmark-files"
+version = "0.1.0"
+dependencies = [
  "tempfile",
 ]
 

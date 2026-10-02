@@ -8,6 +8,7 @@ use eframe::egui::{
     ViewportCommand, pos2,
 };
 use inkmark_buffer::{DiskStatus, Document, LineEnding, OpenError};
+use inkmark_files::{Launch, choose_root};
 use inkmark_parse::{GfmParser, ParseState};
 use inkmark_text::Fonts;
 use inkmark_view::{CodeView, LiveView};
@@ -115,6 +116,9 @@ struct App {
     recent: recent::Recent,
     /// The recent-files list is open, with this entry selected.
     recent_list: Option<usize>,
+    /// Folder the file browser lists. Set from the command line; Open Folder
+    /// and Up change it later.
+    root: PathBuf,
     /// A dialog took keyboard focus from the panes last frame.
     modal_was_open: bool,
 }
@@ -151,12 +155,23 @@ impl App {
             recent,
             recent_list: None,
             modal_was_open: false,
+            root: PathBuf::new(),
         };
-        match path {
-            Some(path) => app.open(path),
-            // Nothing to open: offer the recent files.
-            None if !app.recent.entries().is_empty() => app.recent_list = Some(0),
-            None => {}
+        // A file (including one that doesn't exist yet) browses its parent.
+        // A folder browses that folder with nothing open. No argument browses
+        // the current directory and still offers recent files.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match choose_root(path.as_deref(), &cwd) {
+            Launch::File { root, file } => {
+                app.root = root;
+                app.open(file);
+            }
+            Launch::Folder { root } => {
+                app.root = root;
+                if path.is_none() && !app.recent.entries().is_empty() {
+                    app.recent_list = Some(0);
+                }
+            }
         }
         app.code.request_focus(ctx);
         app
@@ -856,6 +871,59 @@ mod tests {
         app.poll_dialog(&egui::Context::default());
         assert_eq!(text(&app), "draft");
         assert_eq!(app.confirm, Some(Confirm::OpenPath(other)));
+    }
+
+    #[test]
+    fn command_line_picks_the_browser_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("notes");
+        fs::create_dir(&folder).unwrap();
+        let file = folder.join("a.md");
+        fs::write(&file, "# a\n").unwrap();
+        let missing = folder.join("new.md");
+
+        let opened = app(dir.path(), Some(file.clone()));
+        assert_eq!(opened.root, folder);
+        assert_eq!(opened.doc.path(), Some(file.as_path()));
+
+        let browsed = app(dir.path(), Some(folder.clone()));
+        assert_eq!(browsed.root, folder);
+        assert!(browsed.doc.path().is_none());
+        assert!(browsed.recent_list.is_none());
+        // Browsing a folder does not remember the folder as a file. The
+        // shared test store may still hold the file opened above.
+        assert!(browsed.recent.entries().iter().all(|p| p != &folder));
+
+        let created = app(dir.path(), Some(missing.clone()));
+        assert_eq!(created.root, folder);
+        assert_eq!(created.doc.path(), Some(missing.as_path()));
+        assert_eq!(text(&created), "");
+
+        let cwd = std::env::current_dir().unwrap();
+        let ctx = egui::Context::default();
+        let here = App::with_recent(
+            &ctx,
+            None,
+            recent::Recent::from_store(Some(dir.path().join("empty-recent"))),
+        );
+        assert_eq!(here.root, cwd);
+        assert!(here.doc.path().is_none());
+        assert!(here.recent_list.is_none());
+
+        // Recent files are still offered when nothing was passed, and not
+        // when a folder was.
+        let remembered = dir.path().join("old.md");
+        fs::write(&remembered, "old\n").unwrap();
+        let store = dir.path().join("recent2");
+        let mut recent = recent::Recent::from_store(Some(store.clone()));
+        recent.add(&remembered);
+        let offered = App::with_recent(&ctx, None, recent);
+        assert_eq!(offered.recent_list, Some(0));
+        assert_eq!(offered.root, cwd);
+        let again = recent::Recent::from_store(Some(store));
+        let folder_hides_recent = App::with_recent(&ctx, Some(folder), again);
+        assert!(folder_hides_recent.recent_list.is_none());
+        assert_eq!(folder_hides_recent.root, dir.path().join("notes"));
     }
 
     #[test]

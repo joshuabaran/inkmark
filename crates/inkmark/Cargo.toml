@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 eframe.workspace = true
 inkmark-buffer.workspace = true
+inkmark-files.workspace = true
 inkmark-minimap.workspace = true
 inkmark-parse.workspace = true
 inkmark-text.workspace = true

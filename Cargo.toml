@@ -10,6 +10,7 @@ publish = false
 
 [workspace.dependencies]
 inkmark-buffer = { path = "crates/inkmark-buffer" }
+inkmark-files = { path = "crates/inkmark-files" }
 inkmark-parse = { path = "crates/inkmark-parse" }
 inkmark-text = { path = "crates/inkmark-text" }
 inkmark-view = { path = "crates/inkmark-view" }

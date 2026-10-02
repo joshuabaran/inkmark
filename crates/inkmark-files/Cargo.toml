@@ -1,0 +1,11 @@
+[package]
+name = "inkmark-files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = "3.27.0"
