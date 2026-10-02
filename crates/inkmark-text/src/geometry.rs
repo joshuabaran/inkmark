@@ -73,11 +73,18 @@ impl LineGeometry {
                 return c.start;
             }
         }
-        let is_last = row + 1 == self.rows.len();
-        match r.clusters.last() {
-            // Past the end of a wrapped row: stay before its trailing
-            // cluster rather than jumping to the next row.
-            Some(last) if !is_last => last.start,
+        // Past the end of the row. A wrapped row's end can also be where
+        // the next row starts, and a caret there would show on that row; so
+        // stay before the wrap. The space a row wraps at may be one of its
+        // clusters (stop before it), outside its clusters but inside the row
+        // (stop after the last cluster), or in neither row (the row's end is
+        // unambiguous). Never before the last cluster's text itself: that
+        // cuts off the row's last character.
+        let next_start = self.rows.get(row + 1).map(|n| n.start);
+        match (r.clusters.last(), next_start) {
+            (Some(_), Some(next)) if r.end < next => r.end,
+            (Some(last), Some(_)) if last.end < r.end => last.end,
+            (Some(last), Some(_)) => last.start,
             _ => r.end,
         }
     }
@@ -224,5 +231,27 @@ mod tests {
             }],
         };
         assert_eq!(g.caret_x(0, 1), 6.0);
+    }
+
+    #[test]
+    fn past_a_wrapped_rows_end_stays_on_that_row() {
+        // "abc d|ef": the wrap space is a cluster of the first row.
+        let g = mono(&[0..4, 4..6]);
+        assert_eq!(g.hit_row(0, f32::INFINITY), 3, "before the trailing space");
+        // The shaper left the wrap space out of the row's clusters: the
+        // row ends after its last letter, not before it.
+        let mut g = mono(&[0..4, 4..6]);
+        g.rows[0].clusters.pop();
+        assert_eq!(g.hit_row(0, f32::INFINITY), 3);
+        let mut g = mono(&[0..5, 5..7]);
+        g.rows[0].clusters.pop();
+        assert_eq!(
+            g.hit_row(0, f32::INFINITY),
+            4,
+            "after `d`, before the space"
+        );
+        // The last row ends at its end.
+        let g = mono(&[0..4, 4..7]);
+        assert_eq!(g.hit_row(1, f32::INFINITY), 7);
     }
 }

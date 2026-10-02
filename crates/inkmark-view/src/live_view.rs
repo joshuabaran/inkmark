@@ -2079,4 +2079,43 @@ mod tests {
         assert_eq!(markers("1) a\n1) b\n"), vec!["1)", "2)"]);
         assert_eq!(markers("- a\n  - b\n"), vec!["•", "◦"]);
     }
+
+    #[test]
+    fn a_table_wider_than_the_pane_shares_the_width_out() {
+        use inkmark_parse::GfmParser;
+
+        let ctx = egui::Context::default();
+        let mut view = LiveView::with_fonts(inkmark_text::Fonts::shared(&ctx), Id::new("t"));
+        let width = 360.0;
+        view.text.begin_frame(
+            TextConfig {
+                monospace: false,
+                font_size: view.font_size,
+                line_height: view.line_height,
+                wrap_width: Some(width),
+            },
+            1.0,
+        );
+        let long = "a long cell with many words in it ".repeat(4);
+        let src = format!("| one | {long} | three |\n|---|---|---|\n| x | y | z |\n");
+        let doc = Document::from_text(&src);
+        let parse = GfmParser.parse(&src);
+        let leaf = parse.blocks.leaves_from(0).next().unwrap();
+        let placed = view.place(&doc, &parse, leaf, width);
+        let grid = placed.table.expect("a table");
+        assert!(
+            grid.width() <= width + 1.0,
+            "fits: {} in {width}",
+            grid.width()
+        );
+        // The long column wraps instead of squeezing the short ones to
+        // nothing: each keeps room for its longest word.
+        assert!(
+            grid.col_w[1] > grid.col_w[0] && grid.col_w[1] > grid.col_w[2],
+            "{:?}",
+            grid.col_w
+        );
+        assert!(grid.col_w.iter().all(|w| *w > 20.0), "{:?}", grid.col_w);
+        assert!(grid.row_h[0] > grid.row_h[1], "the long row wraps taller");
+    }
 }

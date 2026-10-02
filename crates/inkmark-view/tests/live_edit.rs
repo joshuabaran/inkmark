@@ -701,3 +701,50 @@ fn ctrl_click_on_a_link_reports_it_and_leaves_the_caret() {
     s.hold(Modifiers::NONE);
     assert!(s.code.take_follow().is_some());
 }
+
+#[test]
+fn home_and_end_go_to_the_wrapped_rows_edges() {
+    // Wider than the live pane, so it wraps into several rows.
+    let para = "word ".repeat(60).trim_end().to_owned();
+    let src = format!("{para}\n\nNext.\n");
+    let mut s = Split::new(&src);
+    let mid = para.len() / 2;
+    s.caret(mid);
+    s.press(Key::Home);
+    let row_start = s.live.selection().head;
+    assert!(row_start > 0 && row_start <= mid, "row start {row_start}");
+    s.press(Key::End);
+    let row_end = s.live.selection().head;
+    assert!(row_end >= mid && row_end < para.len(), "row end {row_end}");
+    // Home again from the row's end comes back to the same row start.
+    s.press(Key::Home);
+    assert_eq!(s.live.selection().head, row_start);
+    s.key(Key::End, Modifiers::COMMAND);
+    assert_eq!(s.live.selection().head, src.len());
+    s.key(Key::Home, Modifiers::COMMAND.plus(Modifiers::SHIFT));
+    assert_eq!(
+        s.live.selection().range(),
+        0..src.len(),
+        "Ctrl+Shift+Home selects to the start"
+    );
+    // Word steps in the live pane.
+    s.caret(0);
+    s.key(Key::ArrowRight, Modifiers::COMMAND);
+    assert_eq!(s.live.selection().head, 4);
+}
+
+#[test]
+fn a_table_wider_than_the_pane_still_edits_its_last_column() {
+    let long = "a long cell with many words in it ".repeat(4);
+    let src = format!("| one | {long} | three |\n|---|---|---|\n| x | y | z |\n");
+    let mut s = Split::new(&src);
+    // After the `z` in the last cell.
+    let z = src.find("| z").unwrap() + 3;
+    s.caret(z);
+    s.type_text("Z");
+    assert!(s.text().contains("| zZ |"), "{}", s.text());
+    // Shift+Tab: the start of the cell before.
+    s.key(Key::Tab, Modifiers::SHIFT);
+    s.type_text("Y");
+    assert!(s.text().contains("| Yy |"), "{}", s.text());
+}
