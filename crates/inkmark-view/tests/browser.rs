@@ -15,6 +15,8 @@ struct Harness {
     ctx: egui::Context,
     browser: FileBrowser,
     time: f64,
+    /// What the last frame drew, to find menu items by their text.
+    shapes: Vec<egui::epaint::ClippedShape>,
 }
 
 impl Harness {
@@ -25,6 +27,7 @@ impl Harness {
             ctx,
             browser: FileBrowser::new(root),
             time: 0.0,
+            shapes: Vec::new(),
         };
         harness.frame(vec![]);
         harness
@@ -44,7 +47,22 @@ impl Harness {
             output = browser.show(ui);
         });
         out.textures_delta.clear();
+        self.shapes = out.shapes;
         output
+    }
+
+    /// Where the last frame drew `text`, e.g. a context-menu item.
+    fn text_rect(&self, text: &str) -> Option<Rect> {
+        fn find(shape: &egui::Shape, text: &str) -> Option<Rect> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == text => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
+                _ => None,
+            }
+        }
+        self.shapes.iter().find_map(|c| find(&c.shape, text))
     }
 
     fn press(&mut self, key: Key) -> BrowserOutput {
@@ -303,4 +321,135 @@ fn bench_sidebar_10k_folder() {
     );
     assert!(at(0.95) < 16.0, "p95 {:.2} ms", at(0.95));
     assert!(h.browser.painted() < 40);
+}
+
+impl Harness {
+    /// Press on `from`, move to `to` in steps, release there. Returns the
+    /// outputs of every frame, so a drop on any of them is seen.
+    fn drag(&mut self, from: Pos2, to: Pos2) -> Vec<BrowserOutput> {
+        let button = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let mut outputs = vec![self.frame(vec![Event::PointerMoved(from), button(from, true)])];
+        for i in 1..=10 {
+            let pos = from + (to - from) * (i as f32 / 10.0);
+            outputs.push(self.frame(vec![Event::PointerMoved(pos)]));
+        }
+        outputs.push(self.frame(vec![button(to, false)]));
+        outputs.push(self.frame(vec![]));
+        outputs
+    }
+}
+
+fn dropped(outputs: Vec<BrowserOutput>) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    outputs.into_iter().find_map(|o| o.dropped)
+}
+
+#[test]
+fn f2_and_delete_ask_about_the_selected_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = dir.path().join("b.md");
+    fs::write(&b, "b\n").unwrap();
+    let mut h = Harness::new(dir.path());
+    h.wait_until(|browser| browser.row_rect(&b).is_some());
+    h.click(h.browser.row_rect(&b).unwrap().center());
+    let output = h.press(Key::F2);
+    assert_eq!(output.rename, Some(b.clone()));
+    assert!(output.trash.is_none());
+    let output = h.press(Key::Delete);
+    assert_eq!(output.trash, Some(b));
+}
+
+#[test]
+fn dragging_a_row_onto_a_folder_drops_it_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("inner.md"), "").unwrap();
+    let b = dir.path().join("b.md");
+    fs::write(&b, "b\n").unwrap();
+    let mut h = Harness::new(dir.path());
+    h.wait_until(|browser| browser.row_rect(&b).is_some() && browser.row_rect(&sub).is_some());
+
+    let (from, to) = (
+        h.browser.row_rect(&b).unwrap(),
+        h.browser.row_rect(&sub).unwrap(),
+    );
+    assert_eq!(
+        dropped(h.drag(from.center(), to.center())),
+        Some((b.clone(), sub.clone()))
+    );
+
+    // Onto itself, or onto a sibling in the folder it's already in: no drop.
+    let from = h.browser.row_rect(&sub).unwrap();
+    assert_eq!(
+        dropped(h.drag(from.center(), from.center() + egui::vec2(30.0, 2.0))),
+        None
+    );
+    let from = h.browser.row_rect(&b).unwrap();
+    let to = h.browser.row_rect(&sub).unwrap();
+    // Dragging b onto itself.
+    assert_eq!(
+        dropped(h.drag(from.center(), from.center() + egui::vec2(40.0, 0.0))),
+        None
+    );
+
+    // A file inside `sub`, dropped on empty space below the rows: the root.
+    h.click(to.center());
+    let inner = sub.join("inner.md");
+    h.wait_until(|browser| browser.row_rect(&inner).is_some());
+    let from = h.browser.row_rect(&inner).unwrap();
+    assert_eq!(
+        dropped(h.drag(from.center(), pos2(from.center().x, 500.0))),
+        Some((inner, dir.path().to_path_buf()))
+    );
+}
+
+#[test]
+fn the_context_menu_offers_rename_move_trash_and_new_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    let b = dir.path().join("b.md");
+    fs::write(&b, "b\n").unwrap();
+    let mut h = Harness::new(dir.path());
+    h.wait_until(|browser| browser.row_rect(&b).is_some() && browser.row_rect(&sub).is_some());
+    let right_click = |h: &mut Harness, pos: Pos2| {
+        let button = |pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        // Hover first, as a real pointer does after the last menu closed.
+        h.frame(vec![Event::PointerMoved(pos)]);
+        h.frame(vec![button(true)]);
+        h.frame(vec![button(false)]);
+        h.frame(vec![]);
+    };
+    let choose = |h: &mut Harness, row: &Path, item: &str| -> BrowserOutput {
+        right_click(h, h.browser.row_rect(row).unwrap().center());
+        let at = h.text_rect(item).unwrap_or_else(|| {
+            let mut texts = Vec::new();
+            fn all(shape: &egui::Shape, out: &mut Vec<String>) {
+                match shape {
+                    egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| all(s, out)),
+                    _ => {}
+                }
+            }
+            h.shapes.iter().for_each(|c| all(&c.shape, &mut texts));
+            panic!("no {item:?} in the menu; drawn: {texts:?}")
+        });
+        h.click(at.center())
+    };
+    assert_eq!(choose(&mut h, &b, "Rename…").rename, Some(b.clone()));
+    assert_eq!(choose(&mut h, &b, "Move to…").move_to, Some(b.clone()));
+    assert_eq!(choose(&mut h, &b, "Move to Trash").trash, Some(b.clone()));
+    let output = choose(&mut h, &sub, "New file here…");
+    assert!(output.new_file);
+    assert_eq!(h.browser.new_file_dir(), sub);
 }

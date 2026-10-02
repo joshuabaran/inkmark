@@ -52,6 +52,7 @@ impl Kind {
     }
 }
 
+/// Whether a file name has one of the [`MARKDOWN_EXTENSIONS`].
 pub fn is_markdown_name(name: &str) -> bool {
     Path::new(name)
         .extension()

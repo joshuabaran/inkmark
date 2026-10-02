@@ -115,6 +115,19 @@ impl Document {
         self.disk_stamp = None;
     }
 
+    /// The file was renamed or moved (by us): save to `path` from now on.
+    /// `was_unchanged` is whether it matched our last load or save just
+    /// before the move. If so, the moved file is taken as seen (a rename
+    /// changes its ctime, which isn't a change to the text); if not, the
+    /// earlier change on disk is still reported.
+    pub fn moved_to(&mut self, path: impl Into<PathBuf>, was_unchanged: bool) {
+        let path = path.into();
+        if was_unchanged {
+            self.disk_stamp = DiskStamp::of(&path).ok();
+        }
+        self.path = Some(path);
+    }
+
     /// Accepts the file's current on-disk state as seen ("keep my version"),
     /// so `disk_status` reports `Unchanged` until it changes again.
     pub fn acknowledge_disk_state(&mut self) -> io::Result<()> {
@@ -656,5 +669,26 @@ mod tests {
         // `unwrap_err` needs `Debug` on the success type.
         let missing = Document::open(std::path::Path::new("/nonexistent/inkmark.md"));
         let _ = missing.unwrap_err();
+    }
+
+    #[test]
+    fn a_moved_file_follows_without_looking_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("a.md");
+        std::fs::write(&old, "one\n").unwrap();
+        let mut doc = Document::open(&old).unwrap();
+        let new = dir.path().join("b.md");
+        std::fs::rename(&old, &new).unwrap();
+        doc.moved_to(&new, true);
+        assert_eq!(doc.path(), Some(new.as_path()));
+        assert_eq!(doc.disk_status().unwrap(), DiskStatus::Unchanged);
+
+        // Changed on disk before the move: still reported after it.
+        let mut doc = Document::open(&new).unwrap();
+        std::fs::write(&new, "someone else\n").unwrap();
+        let newer = dir.path().join("c.md");
+        std::fs::rename(&new, &newer).unwrap();
+        doc.moved_to(&newer, false);
+        assert_eq!(doc.disk_status().unwrap(), DiskStatus::Modified);
     }
 }

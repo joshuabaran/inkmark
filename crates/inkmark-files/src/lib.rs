@@ -11,7 +11,7 @@ mod sort;
 mod tree;
 mod watch;
 
-pub use list::{Entry, Kind, list_dir};
+pub use list::{Entry, Kind, is_markdown_name, list_dir};
 pub use new_file::{NewFileError, create_new_file};
 pub use ops::{OpError, SystemTrash, Trash, move_into, rename};
 pub use root::{Launch, choose_root};

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
@@ -8,7 +8,9 @@ use eframe::egui::{
     ViewportCommand, pos2,
 };
 use inkmark_buffer::{DiskStatus, Document, LineEnding, OpenError};
-use inkmark_files::{Launch, NewFileError, choose_root, create_new_file};
+use inkmark_files::{
+    Launch, NewFileError, SystemTrash, Trash, choose_root, create_new_file, move_into, rename,
+};
 use inkmark_parse::{GfmParser, ParseState};
 use inkmark_text::Fonts;
 use inkmark_view::{BrowserOutput, CodeView, FileBrowser, LiveView};
@@ -102,17 +104,27 @@ enum Confirm {
     Close,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum DialogKind {
     Open,
     SaveAs,
     Folder,
+    /// Pick the folder to move this file or folder into.
+    MoveTo(PathBuf),
 }
 
 enum DialogResult {
     Open(Option<PathBuf>),
     SaveAs(Option<PathBuf>),
     Folder(Option<PathBuf>),
+    MoveTo(PathBuf, Option<PathBuf>),
+}
+
+#[derive(Clone)]
+struct RenamePrompt {
+    path: PathBuf,
+    name: String,
+    error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -149,6 +161,12 @@ struct App {
     sidebar: sidebar::Sidebar,
     /// Asks for a name, then creates the file and opens it.
     new_file: Option<NewFilePrompt>,
+    /// Asks for a new name for this file or folder.
+    rename: Option<RenamePrompt>,
+    /// Asks before moving this file or folder to the trash.
+    trash_confirm: Option<PathBuf>,
+    /// Where Move to Trash sends things; tests use their own.
+    trash: Box<dyn Trash>,
     /// A dialog took keyboard focus from the panes last frame.
     modal_was_open: bool,
     /// Tests receive the dialog kind instead of opening a portal window.
@@ -200,6 +218,9 @@ impl App {
             browser: FileBrowser::new(root),
             sidebar: sidebar::Sidebar::load(sidebar_store),
             new_file: None,
+            rename: None,
+            trash_confirm: None,
+            trash: Box::new(SystemTrash),
             modal_was_open: false,
             #[cfg(test)]
             dialog_hook: None,
@@ -321,7 +342,7 @@ impl App {
     fn spawn_dialog(&mut self, kind: DialogKind) {
         #[cfg(test)]
         if let Some(hook) = &self.dialog_hook {
-            let _ = hook.send(kind);
+            let _ = hook.send(kind.clone());
             return;
         }
         if self.dialog.is_some() {
@@ -352,6 +373,10 @@ impl App {
                         .save_file(),
                 ),
                 DialogKind::Folder => DialogResult::Folder(dialog.pick_folder()),
+                DialogKind::MoveTo(path) => {
+                    let folder = dialog.set_title("Move to…").pick_folder();
+                    DialogResult::MoveTo(path, folder)
+                }
             };
             let _ = tx.send(result);
         });
@@ -378,7 +403,8 @@ impl App {
             Ok(DialogResult::Open(None) | DialogResult::SaveAs(None)) => {
                 self.close_after_save = false;
             }
-            Ok(DialogResult::Folder(None)) => {}
+            Ok(DialogResult::MoveTo(path, Some(dir))) => self.move_entry(path, dir),
+            Ok(DialogResult::Folder(None) | DialogResult::MoveTo(_, None)) => {}
             Err(TryRecvError::Disconnected) => {
                 self.error = Some("The file dialog failed. Is xdg-desktop-portal running?".into());
             }
@@ -640,7 +666,11 @@ impl App {
     /// While a dialog is open the panes don't get keys (typing mustn't edit
     /// the document behind it); focus returns when it closes.
     fn hold_focus_for_dialogs(&mut self, ctx: &egui::Context) {
-        let open = self.recent_list.is_some() || self.confirm.is_some() || self.new_file.is_some();
+        let open = self.recent_list.is_some()
+            || self.confirm.is_some()
+            || self.new_file.is_some()
+            || self.rename.is_some()
+            || self.trash_confirm.is_some();
         if open {
             self.code.release_focus(ctx);
             self.live.release_focus(ctx);
@@ -804,39 +834,16 @@ impl App {
         let Some(mut prompt) = self.new_file.clone() else {
             return;
         };
-        let (submit_key, cancel_key) = ctx.input_mut(|i| {
-            (
-                i.consume_key(Modifiers::NONE, Key::Enter),
-                i.consume_key(Modifiers::NONE, Key::Escape),
-            )
-        });
-        let mut submit = submit_key;
-        let mut cancel = cancel_key;
-        let field = egui::Id::new("new_file_name");
-        egui::Modal::new(egui::Id::new("new_file")).show(ctx, |ui| {
-            ui.set_min_width(420.0);
-            ui.heading("New file");
-            ui.label(prompt.dir.display().to_string());
-            if !ui.memory(|m| m.has_focus(field)) {
-                ui.memory_mut(|m| m.request_focus(field));
-            }
-            ui.add(
-                egui::TextEdit::singleline(&mut prompt.name)
-                    .id(field)
-                    .desired_width(f32::INFINITY),
-            );
-            if let Some(error) = &prompt.error {
-                ui.label(RichText::new(error).color(Color32::from_rgb(255, 140, 120)));
-            }
-            ui.horizontal(|ui| {
-                if ui.button("Create").clicked() {
-                    submit = true;
-                }
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
-                }
-            });
-        });
+        let detail = prompt.dir.display().to_string();
+        let (submit, cancel) = name_modal(
+            ctx,
+            "new_file",
+            "New file",
+            &detail,
+            "Create",
+            &mut prompt.name,
+            prompt.error.as_deref(),
+        );
         if cancel {
             self.new_file = None;
             return;
@@ -844,6 +851,163 @@ impl App {
         self.new_file = Some(prompt);
         if submit {
             self.submit_new_file();
+        }
+    }
+
+    /// Rename… for a sidebar entry. A Markdown file's name is offered
+    /// without its extension, which `rename` keeps.
+    fn begin_rename(&mut self, path: PathBuf) {
+        if self.confirm.is_some() || self.new_file.is_some() {
+            return;
+        }
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let name = if !path.is_dir() && inkmark_files::is_markdown_name(&name) {
+            path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            name.into_owned()
+        };
+        self.recent_list = None;
+        self.rename = Some(RenamePrompt {
+            path,
+            name,
+            error: None,
+        });
+    }
+
+    fn rename_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut prompt) = self.rename.clone() else {
+            return;
+        };
+        let detail = prompt.path.display().to_string();
+        let (submit, cancel) = name_modal(
+            ctx,
+            "rename",
+            "Rename",
+            &detail,
+            "Rename",
+            &mut prompt.name,
+            prompt.error.as_deref(),
+        );
+        if cancel {
+            self.rename = None;
+            return;
+        }
+        self.rename = Some(prompt.clone());
+        if !submit {
+            return;
+        }
+        let was_unchanged = self.unchanged_if_affected(&prompt.path);
+        match rename(&prompt.path, &prompt.name) {
+            Ok(new) => {
+                self.rename = None;
+                self.moved(&prompt.path, &new, was_unchanged);
+            }
+            Err(e @ (inkmark_files::OpError::Exists(_) | inkmark_files::OpError::Invalid)) => {
+                if let Some(prompt) = &mut self.rename {
+                    // Not capitalized: the message may start with a file name.
+                    prompt.error = Some(format!("Can't rename: {e}"));
+                }
+            }
+            Err(e) => {
+                self.rename = None;
+                self.error = Some(format!(
+                    "Couldn't rename {}: {e}",
+                    display_name(&prompt.path)
+                ));
+            }
+        }
+    }
+
+    fn move_entry(&mut self, path: PathBuf, dir: PathBuf) {
+        let was_unchanged = self.unchanged_if_affected(&path);
+        match move_into(&path, &dir) {
+            Ok(new) if new == path => {}
+            Ok(new) => self.moved(&path, &new, was_unchanged),
+            Err(e) => {
+                self.error = Some(format!("Couldn't move {}: {e}", display_name(&path)));
+            }
+        }
+    }
+
+    /// Whether the open document is `path` or inside it, and matched the
+    /// disk just now (asked before a rename or move changes its ctime).
+    /// `false` when the document isn't affected.
+    fn unchanged_if_affected(&self, path: &Path) -> bool {
+        self.doc.path().is_some_and(|open| open.starts_with(path))
+            && matches!(self.doc.disk_status(), Ok(DiskStatus::Unchanged))
+    }
+
+    /// `old` became `new`: the document, the recent list and the sidebar
+    /// follow.
+    fn moved(&mut self, old: &Path, new: &Path, was_unchanged: bool) {
+        if let Some(open) = self.doc.path().map(Path::to_path_buf)
+            && let Ok(rest) = open.strip_prefix(old)
+        {
+            let followed = if rest.as_os_str().is_empty() {
+                new.to_path_buf()
+            } else {
+                new.join(rest)
+            };
+            self.doc.moved_to(followed, was_unchanged);
+        }
+        self.recent.moved(old, new);
+        for dir in [old.parent(), new.parent()].into_iter().flatten() {
+            self.browser.refresh_dir(dir);
+        }
+        self.browser.select(new);
+    }
+
+    fn trash_ui(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.trash_confirm.clone() else {
+            return;
+        };
+        let (confirm_key, cancel_key) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::Enter),
+                i.consume_key(Modifiers::NONE, Key::Escape),
+            )
+        });
+        let (mut confirm, mut cancel) = (confirm_key, cancel_key);
+        let open_inside = self.doc.path().is_some_and(|open| open.starts_with(&path));
+        egui::Modal::new(egui::Id::new("trash")).show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            ui.heading(format!("Move “{}” to the trash?", display_name(&path)));
+            ui.label("You can restore it from your file manager's trash.");
+            if open_inside {
+                ui.label("It's open: your text stays in the editor until you close it.");
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Move to Trash").clicked() {
+                    confirm = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if cancel {
+            self.trash_confirm = None;
+        } else if confirm {
+            self.trash_confirm = None;
+            match self.trash.trash(&path) {
+                Ok(()) => {
+                    if let Some(dir) = path.parent() {
+                        self.browser.refresh_dir(dir);
+                    }
+                    if open_inside {
+                        self.banner = Some(Banner::DiskMissing);
+                    }
+                }
+                Err(e) => {
+                    self.error = Some(format!(
+                        "Couldn't move {} to the trash: {e}",
+                        display_name(&path)
+                    ));
+                }
+            }
         }
     }
 }
@@ -907,6 +1071,20 @@ impl App {
         }
         if output.new_file {
             self.begin_new_file();
+        }
+        if let Some(path) = &output.rename {
+            self.begin_rename(path.clone());
+        }
+        if let Some(path) = &output.trash
+            && self.confirm.is_none()
+        {
+            self.trash_confirm = Some(path.clone());
+        }
+        if let Some(path) = &output.move_to {
+            self.spawn_dialog(DialogKind::MoveTo(path.clone()));
+        }
+        if let Some((path, dir)) = &output.dropped {
+            self.move_entry(path.clone(), dir.clone());
         }
     }
 
@@ -995,6 +1173,8 @@ impl eframe::App for App {
             .show(ui, |ui| self.editor(ui));
         // After the sidebar, so New file opens the prompt on the click's frame.
         self.new_file_ui(&ctx);
+        self.rename_ui(&ctx);
+        self.trash_ui(&ctx);
         self.confirm_ui(&ctx);
         self.update_title(&ctx);
         self.measure_step(&ctx);
@@ -1018,6 +1198,59 @@ impl App {
             }
         }
     }
+}
+
+/// A file or folder's name for messages.
+fn display_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// A small dialog asking for a name. Returns (submit, cancel); Enter
+/// submits and Escape cancels.
+fn name_modal(
+    ctx: &egui::Context,
+    id: &str,
+    heading: &str,
+    detail: &str,
+    action: &str,
+    name: &mut String,
+    error: Option<&str>,
+) -> (bool, bool) {
+    let (mut submit, mut cancel) = ctx.input_mut(|i| {
+        (
+            i.consume_key(Modifiers::NONE, Key::Enter),
+            i.consume_key(Modifiers::NONE, Key::Escape),
+        )
+    });
+    let field = egui::Id::new((id, "name"));
+    egui::Modal::new(egui::Id::new(id)).show(ctx, |ui| {
+        ui.set_min_width(420.0);
+        ui.heading(heading);
+        ui.label(detail);
+        if !ui.memory(|m| m.has_focus(field)) {
+            ui.memory_mut(|m| m.request_focus(field));
+        }
+        ui.add(
+            egui::TextEdit::singleline(name)
+                .id(field)
+                .desired_width(f32::INFINITY),
+        );
+        if let Some(error) = error {
+            ui.label(RichText::new(error).color(Color32::from_rgb(255, 140, 120)));
+        }
+        ui.horizontal(|ui| {
+            if ui.button(action).clicked() {
+                submit = true;
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+        });
+    });
+    (submit, cancel)
 }
 
 #[cfg(test)]
@@ -1211,6 +1444,8 @@ mod tests {
             app.hold_focus_for_dialogs(ui.ctx());
             app.editor(ui);
             app.new_file_ui(ui.ctx());
+            app.rename_ui(ui.ctx());
+            app.trash_ui(ui.ctx());
         });
         out.textures_delta.clear();
     }
@@ -1680,5 +1915,162 @@ mod tests {
         app.check_disk(&ctx);
         assert!(matches!(app.banner, Some(Banner::DiskChanged)));
         assert_eq!(app.error.as_deref(), Some("Couldn't save: disk full"));
+    }
+
+    /// A trash that moves things into a folder of the test's own.
+    struct FolderTrash(PathBuf);
+
+    impl Trash for FolderTrash {
+        fn trash(&self, path: &Path) -> std::io::Result<()> {
+            fs::rename(path, self.0.join(path.file_name().unwrap()))
+        }
+    }
+
+    #[test]
+    fn renaming_the_open_file_keeps_its_unsaved_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("draft.md");
+        fs::write(&old, "one\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(old.clone()));
+        type_into(&mut app, "unsaved\n");
+        app.begin_rename(old.clone());
+        assert_eq!(
+            app.rename.as_ref().unwrap().name,
+            "draft",
+            "offered without .md"
+        );
+        app.rename.as_mut().unwrap().name = "final".into();
+        let mut time = 0.0;
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        let new = dir.path().join("final.md");
+        assert!(app.rename.is_none());
+        assert_eq!(app.doc.path(), Some(new.as_path()));
+        assert_eq!(text(&app), "one\nunsaved\n");
+        assert!(app.doc.is_dirty());
+        // The rename itself isn't a change on disk.
+        app.next_disk_check = Instant::now();
+        app.check_disk(&ctx);
+        assert!(app.banner.is_none());
+        assert_eq!(app.recent.entries()[0], new.canonicalize().unwrap());
+        // Saving writes to the new name.
+        app.save();
+        assert_eq!(fs::read_to_string(&new).unwrap(), "one\nunsaved\n");
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn renaming_to_a_taken_name_says_so_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(dir.path().join("b.md"), "b\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        app.begin_rename(a.clone());
+        app.rename.as_mut().unwrap().name = "b".into();
+        let mut time = 0.0;
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        let prompt = app.rename.as_ref().expect("still asking");
+        assert!(
+            prompt.error.as_deref().unwrap().contains("b.md"),
+            "{:?}",
+            prompt.error
+        );
+        assert_eq!(fs::read_to_string(dir.path().join("b.md")).unwrap(), "b\n");
+        assert_eq!(app.doc.path(), Some(a.as_path()));
+    }
+
+    #[test]
+    fn moving_the_folder_of_the_open_file_takes_the_document_along() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        let archive = dir.path().join("archive");
+        fs::create_dir(&notes).unwrap();
+        fs::create_dir(&archive).unwrap();
+        let file = notes.join("a.md");
+        fs::write(&file, "a\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(file.clone()));
+        let (hook, kinds) = mpsc::channel();
+        app.dialog_hook = Some(hook);
+        app.apply_browser(&BrowserOutput {
+            move_to: Some(notes.clone()),
+            ..Default::default()
+        });
+        assert_eq!(kinds.try_recv().unwrap(), DialogKind::MoveTo(notes.clone()));
+        app.dialog_hook = None;
+        let (tx, rx) = mpsc::channel();
+        app.dialog = Some(rx);
+        tx.send(DialogResult::MoveTo(notes.clone(), Some(archive.clone())))
+            .unwrap();
+        app.poll_dialog(&ctx);
+        let moved = archive.join("notes/a.md");
+        assert!(moved.exists());
+        assert_eq!(app.doc.path(), Some(moved.as_path()));
+        app.next_disk_check = Instant::now();
+        app.check_disk(&ctx);
+        assert!(app.banner.is_none());
+
+        // Dropping a row works the same way, and a refusal is an error.
+        fs::write(dir.path().join("a.md"), "other\n").unwrap();
+        app.apply_browser(&BrowserOutput {
+            dropped: Some((moved.clone(), dir.path().to_path_buf())),
+            ..Default::default()
+        });
+        assert!(
+            app.error.as_deref().unwrap().contains("already exists"),
+            "{:?}",
+            app.error
+        );
+        assert_eq!(app.doc.path(), Some(moved.as_path()));
+    }
+
+    #[test]
+    fn trashing_asks_first_and_keeps_the_open_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        fs::write(&file, "a\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(file.clone()));
+        app.trash = Box::new(FolderTrash(bin.path().to_path_buf()));
+        app.apply_browser(&BrowserOutput {
+            trash: Some(file.clone()),
+            ..Default::default()
+        });
+        assert_eq!(app.trash_confirm, Some(file.clone()));
+        let mut time = 0.0;
+        // Escape cancels.
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Escape, egui::Modifiers::NONE)],
+        );
+        assert!(app.trash_confirm.is_none());
+        assert!(file.exists());
+        // Enter confirms.
+        app.trash_confirm = Some(file.clone());
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert!(!file.exists());
+        assert!(bin.path().join("a.md").exists());
+        assert_eq!(text(&app), "a\n");
+        assert!(matches!(app.banner, Some(Banner::DiskMissing)));
     }
 }
