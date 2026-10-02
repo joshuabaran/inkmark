@@ -367,6 +367,30 @@ Built on branch `hardening-footnotes` and reviewed by Grok before merging.
 
 GFM full parse of the 5.2 MB benchmark: 92 ms, unchanged.
 
+### Notes and links (next)
+
+Working with a folder of notes: manage files from the sidebar, and follow links between them.
+
+**Decisions (2026-10-02)**
+
+| Question | Decision |
+|---|---|
+| Delete | Moves to the freedesktop trash (restorable from the file manager), after a confirmation. No in-app undo. Trashing the open file keeps its buffer, with the missing-file banner, as when another program deletes it. |
+| Rename | In place (F2 or the context menu), prefilled with the current name. Never overwrites: an existing name is refused, atomically (`renameat2` with `RENAME_NOREPLACE`). A file keeps its extension unless you type one. |
+| Move | Drag a row onto a folder, or **Move to…** with the portal folder picker. Same no-overwrite rule; a folder can't move into itself; moving to another filesystem is refused rather than copied. |
+| The open file | When it (or a folder above it) is renamed or moved, the document follows it: same buffer, undo history and unsaved edits, new path, and no "changed on disk" banner caused by the move itself. |
+| Links | Ctrl+click in either pane follows the link under the pointer: `http(s)` and `mailto` open in the default app (`xdg-open`); a relative or absolute path to a Markdown file opens it in inkmark, through the unsaved-changes prompt; `#heading` jumps to the heading (GitHub's slug rules), also after a file path; a footnote reference jumps to its definition. Other targets (non-Markdown files, other schemes) aren't opened: the status bar says why. |
+| Back | Alt+Left returns to where the last followed link was clicked, in the same file or the previous one. |
+| Links to a renamed note | Not rewritten this round; that needs a cross-file search and a preview. |
+
+**Slices**
+
+| # | Slice | Done when |
+|---|--------|-----------|
+| **N1** | File operations | `inkmark-files` renames, moves and trashes files and folders with the rules above; the trash is behind a seam, so tests never touch the real one. Unit tests on temp trees, including refusals. |
+| **N2** | Sidebar UI | Right-click menu (Rename…, Move to…, Move to Trash, New file here), F2 and Delete keys, drag and drop with a highlighted target, the delete confirmation, and the open document following a rename or move. Headless egui and app tests. |
+| **N3** | Following links | Ctrl+click in both panes (pointer cursor while Ctrl is held over a link), the targets above, and Alt+Left. Tests for link resolution (relative paths, `%20`, anchors, reference links, footnotes) and for following and going back in the app. |
+
 ### Later
 
 - Tables: re-pad columns so pipes stay aligned as you type; add and remove columns.
