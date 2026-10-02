@@ -2,7 +2,7 @@
 
 **Name (working):** `inkmark` · Rust · egui/eframe · Linux/Wayland (Omarchy/Hyprland) first · no Electron/WebView
 
-**Status:** Signed off 2026-10-01. MVP (M1–M6) complete 2026-10-02; see [Results](#results). Changes to locked decisions require updating this doc first.
+**Status:** Signed off 2026-10-01. MVP (M1–M6) and GFM (G1–G4) complete 2026-10-02; the first outside review's 21 issues are fixed. Next: the [file browser](#file-browser-next). See [Results](#results) for measurements and the [Roadmap](#roadmap) for what's planned. Changes to locked decisions require updating this doc first.
 
 ---
 
@@ -17,7 +17,7 @@
 | Parse strategy | Background full reparse is authoritative; synchronous **local reparse** of the edited top-level block for immediate feedback (see §2). Incremental parsing beyond that is a later optimization. |
 | Live editing model | **Reveal-at-cursor** (Typora/Obsidian style). Live is the source with syntax hidden away from the caret; every live edit is a direct source byte-range patch. No AST→Markdown re-emit. |
 | History | One document epoch, one undo stack shared by both panes. |
-| Scope | Single-file open/save, dark theme, keyboard-usable. |
+| Scope | Single-file open/save, dark theme, keyboard-usable. **Since 2026-10-02:** still one open document at a time, but browsing a folder to pick it is planned ([file browser](#file-browser-next)). |
 | Perf target | Responsive on 5–10 MB CommonMark (~100k+ lines of typical prose). |
 | Platform | Native on the Omarchy host (Arch, Wayland, Hyprland). No Windows/macOS for MVP. |
 
@@ -36,7 +36,7 @@
 │           ├─▶ local reparse of edited top-level block (sync) │
 │           └─▶ full reparse (debounced, background thread)    │
 │  ParsePipeline                                              │
-│    MarkdownParser trait → pulldown-cmark (MVP)              │
+│    MarkdownParser trait → pulldown-cmark (+ GFM extensions) │
 │    → BlockTree: blocks with [start,end) byte spans          │
 │    → SourceMap: block/inline runs ↔ source ranges,          │
 │                 plus hidden-syntax ranges                   │
@@ -82,7 +82,8 @@
 - **Caret and selection:** always source byte offsets (plus affinity). Because syntax is revealed at the caret, the caret is always on a real source position. No snapping is needed.
 - **Reveal-at-cursor rules (live):**
   - *Inline* (emphasis, strong, code span, link, image): reveal the delimiters and destination while the caret is inside or touching the span.
-  - *Block markers* (heading `#`, list marker, `>` prefix, fence lines and info string, thematic break): reveal on the line that contains the caret.
+  - *Block markers* (heading `#`, fence lines and info string, thematic break): reveal on the line that contains the caret.
+  - *Container markup* (list markers, `>` prefixes, their indentation, table pipes and padding): drawn as bullets, numbers, bars, margins and grid lines and **never revealed**. They're edited through the smart editing rules (as built; revealing them made lists jump sideways as the caret moved).
   - With multi-line selections, reveal everything the selection covers.
 - **Live editing:**
   - *Typing:* inserts source characters at the caret. Nothing is auto-escaped; what you type is Markdown, as in Typora/Obsidian.
@@ -149,9 +150,11 @@ Each pane can show or hide its own minimap (VS Code style): a narrow overview yo
 
 GFM tables, task lists, strikethrough, autolinks, math, Mermaid, wikilinks, multi-file vaults, git, AI, export, collaboration, plugins, accessibility (AccessKit) for the custom editor widgets, light theme.
 
+*Since the MVP:* GFM is done (see [GFM milestone](#gfm-milestone-started-2026-10-02)), and browsing a folder of files is the next milestone ([file browser](#file-browser-next)). Multi-file vault features (links between notes, search) are still out.
+
 ### Future (do not design these out)
 
-Full GFM, then math and diagrams. Tables in particular will need a block-specific live editor that still emits source patches.
+Math and diagrams. (GFM, including a live table editor that emits source patches, is done.) Multi-file features beyond the [file browser](#file-browser-next): links between notes, search.
 
 ### Stack constraints
 
@@ -184,7 +187,7 @@ The live view comes after the SourceMap (M2 → M3), and the M2 spike tests the 
 ## Testing
 
 - **Buffer:** property tests check that random edit sequences give the same result on the rope and on a `String`, and that undo followed by redo returns to the same state.
-- **Parse/SourceMap:** the CommonMark spec examples are fixtures. Checks:
+- **Parse/SourceMap:** the CommonMark and GFM spec examples are fixtures. Checks:
   - spans cover each byte exactly once
   - a span rebased through the EditLog equals a fresh parse
   - after a local reparse, the next full reparse agrees on the edited block
@@ -193,6 +196,8 @@ The live view comes after the SourceMap (M2 → M3), and the M2 spike tests the 
   - Fuzzed live keystrokes must equal the same keystrokes applied at the mapped source offsets.
   - Patch size: a single character typed in live changes ≤ 1 inserted character plus any explicit smart-rule bytes.
 - **Benches** (as built): `#[ignore]`d tests that print timings, run with `cargo test --release --workspace -- --ignored --nocapture` (full and local reparse, code and live keystroke→frame, live scrolling and random jumps, glyph-atlas spike). App-level numbers (startup, RSS, real-GPU scroll fps) come from `INKMARK_MEASURE=1` via `scripts/measure.sh`, instead of an `instrument` feature.
+- **Regressions:** every bug from the outside review has a test in the suite where it lives, ported from the review's smoke tests.
+- **App shell:** unit tests in `crates/inkmark/src/main.rs` (open, reload, save-as, dialogs, mode switching), with the recent-files list in a temp directory.
 - **Also built:** headless egui tests that drive both panes with synthetic keyboard, mouse, clipboard and IME input; a typing fuzz (random clicks + keystrokes, each must insert exactly the typed character) and a mixed-operation fuzz (map stays valid, undo-all restores the original), both clean at 5000 iterations.
 
 ---
@@ -224,13 +229,14 @@ inkmark/
     inkmark-text/            # cosmic-text layout, swash glyph atlas, Mesh building, HeightCache
     inkmark-view/            # CodeView, LiveView, reveal rules, smart edit rules, hit-test, scroll sync
     inkmark-minimap/         # sampling + paint helpers
-  fixtures/                  # CommonMark spec examples, large synthetic .md
+    inkmark-files/           # (planned, file browser) folder tree model, listing, watching
+  fixtures/                  # CommonMark and GFM spec examples (CC-BY-SA 4.0)
   pack/                      # PKGBUILD / install notes
   README.md
   PLAN.md                    # this document
 ```
 
-As built, benches are `#[ignore]`d tests inside each crate, `scripts/measure.sh` drives the app-level measurements, and `pack/` holds the PKGBUILD, desktop entry and icon. A later `inkmark-parse-gfm` crate implements the same parser trait with `comrak`.
+As built, benches are `#[ignore]`d tests inside each crate, `scripts/measure.sh` drives the app-level measurements, and `pack/` holds the PKGBUILD, desktop entry and icon. GFM lives in `inkmark-parse` as `GfmParser` (pulldown-cmark plus an autolink pass), not a separate comrak crate as first sketched. Large test files stay outside the repo (`~/Projects/inkmark`).
 
 ---
 
@@ -267,11 +273,6 @@ Measured 2026-10-02 on the Omarchy host (240 Hz 1440p monitor, scale 1, Mesa rad
 - **Span size left at 48 bytes.** Prose produces few spans per paragraph, so halving them would save a few MB of 145; nearly all memory is the GPU stack.
 - **No shape-run cache.** cosmic-text caches whole same-script runs, and a Latin paragraph is one run that changes on every keystroke. 4.2 ms on the longest paragraph is well inside budget; incremental paragraph layout is the lever if it's ever needed.
 
-## Known issues and next steps
-
-- **Fallback glyphs in the code pane** (box drawing, CJK) don't snap to whole monospace cells, so ASCII-art alignment can be off.
-- **Images:** no SVG; remote URLs aren't fetched (MVP has no network); reference definitions deleted by a local edit linger until the next full parse.
-
 ## GFM milestone (started 2026-10-02)
 
 | # | Slice | Done when |
@@ -281,4 +282,60 @@ Measured 2026-10-02 on the Omarchy host (240 Hz 1440p monitor, scale 1, Mesa rad
 | **G3** | Live rendering | Strikethrough, clickable task checkboxes (a click is a one-byte source patch), autolinks styled as links |
 | **G4** | Live tables | Grid layout with alignment; typing in a cell patches that cell; Tab/Shift+Tab between cells; Enter in the last row adds a row; a typed `\|` is escaped. Re-padding columns to keep pipes aligned is out of scope |
 
-**GFM done 2026-10-02:** G1 `57ad8a8` · G2 `9114853` · G3 `9c9f01b` · G4 (this commit). All 672 GFM spec examples pass the byte-coverage test, autolinks match the spec's links, and the editing fuzzes run with a table, task list and strikethrough in the document. GFM full parse of 5.2 MB: 89 ms on the worker (61 ms for CommonMark; the autolink pass rebuilds the map when it finds links). Not done: re-padding table columns to keep pipes aligned, adding or removing columns, footnotes.
+**GFM done 2026-10-02:** G1 `57ad8a8` · G2 `9114853` · G3 `9c9f01b` · G4 `b5ca0ca`. All 672 GFM spec examples pass the byte-coverage test, autolinks match the spec's links, and the editing fuzzes run with a table, task list and strikethrough in the document. GFM full parse of 5.2 MB: 89 ms on the worker (61 ms for CommonMark; the autolink pass rebuilds the map when it finds links). Not done: re-padding table columns to keep pipes aligned, adding or removing columns, footnotes.
+
+## Review (2026-10-02)
+
+An outside review of `b5ca0ca` (Grok; `~/Projects/inkmark/REVIEW.md`, smoke tests in `~/Projects/inkmark/smoke`, both outside the repo) filed 21 issues, #1–#21. All are fixed with a regression test each, in `b8a50bb` (buffer), `1874a5f` (parse), `f4f7bb5` (live editing), `88bd259` (panes) and `4388bc5` (app). Testing #13 also turned up two scroll bugs, fixed in `88bd259`.
+
+One smoke test is intentionally left failing: it wants the space after a task marker to be visible text. pulldown-cmark's item text doesn't include that space, and every visible span must reproduce that text exactly, so the task-marker span owns the space instead (`[x] `). It can no longer be dropped, which was the problem raised.
+
+**Suggestions from the review not acted on yet:**
+
+- Detect on-disk changes that keep both length and mtime (compare content or inode generation).
+- If the directory fsync after the atomic rename fails, the save has in fact happened; don't report it as failed.
+- `Recent::add` should canonicalize paths that don't exist yet, so one file isn't listed twice.
+- Announce on-disk changes even while an error banner is showing.
+- Say why Shift+Enter does nothing in a table.
+- `Document` could implement `Debug`.
+
+## Roadmap
+
+### File browser (next)
+
+A sidebar on the left showing a folder's structure, for opening other Markdown files in it.
+
+**Decisions (2026-10-02)**
+
+| Question | Decision |
+|---|---|
+| Root folder | `inkmark notes.md` browses the file's parent folder. `inkmark ~/notes` browses that folder, with no file open. `inkmark` with no argument browses the current directory, with the recent-files list shown as today. Inside the app, **Open Folder…** (Ctrl+Shift+O, portal folder picker) and an **Up** button (parent folder) change the root. |
+| What's listed | Folders and Markdown files (`.md`, `.markdown`, `.mdown`, `.mkd`). Dot-files and other files are hidden; a "show all files" toggle lists them, with non-Markdown files greyed out and not openable. Empty folders are shown (hiding them would need a recursive scan). |
+| File operations | Browse, open, change root, refresh on disk changes, and **New file** in a folder. Rename, move and delete come later (delete needs a trash and undo story). |
+| Placement | A resizable left panel beside the panes in every mode. Ctrl+Shift+E shows/hides and focuses it (Ctrl+B is bold). Width and visibility persist in `$XDG_STATE_HOME/inkmark`. |
+| Opening a file | Same path as Ctrl+O: the unsaved-changes prompt first, then the file opens in the panes. The open file is highlighted and its folders expanded. |
+| Code layout | A new `inkmark-files` crate holds the tree model, listing and watching (no egui), so it can be tested on temp directories; the sidebar widget lives in `inkmark-view`. |
+
+**Slices**
+
+| # | Slice | Done when |
+|---|--------|-----------|
+| **F1** | Tree model + root selection | `inkmark-files` lists a folder lazily (a folder's children are read when it's first expanded), sorted folders-first with natural, case-insensitive order; filters as above; symlinks shown without following loops; unreadable folders marked, not fatal. The app takes a file, a folder or nothing on the command line and picks the root as decided. Unit tests on temp trees. |
+| **F2** | Sidebar UI | Left panel with the tree: expand/collapse, keyboard navigation (Up/Down, Left/Right to collapse/expand, Enter to open), click to open, current file highlighted and revealed. Header with root name, Up, Open Folder… and refresh. Show/hide and width persist. Headless egui tests like the panes'. |
+| **F3** | Live updates + New file | Expanded folders are watched (inotify via the `notify` crate), so files created, renamed or deleted elsewhere appear or disappear within a second; the open file's own disk banners keep working. **New file** (Ctrl+N, or from a folder) asks for a name, adds `.md` if missing, refuses existing names, creates the file and opens it. |
+
+**Targets:** listing a folder with 10,000 entries doesn't stall the UI (listing off the UI thread, rows virtualized, frames under 16 ms); an external change shows up in the tree within 1 s; the panes' editing and scrolling numbers in [Results](#results) are unchanged with the sidebar open.
+
+**Risks:** inotify watch limits on very large trees (only expanded folders are watched); slow or network filesystems (listing is off-thread and can be cancelled); symlink loops (not followed when expanding).
+
+**Out of scope for this milestone:** rename, move, delete; search across files; links between notes and backlinks; tabs or several open files; git status in the tree.
+
+### Later
+
+- Footnotes (pulldown-cmark supports them; not part of the GFM spec).
+- Tables: re-pad columns so pipes stay aligned as you type; add and remove columns.
+- File management in the browser: rename, move, delete to trash.
+- Code pane: snap fallback glyphs (box drawing, CJK) to whole monospace cells.
+- Images: SVG; remote images (needs a network policy).
+- The review suggestions above.
+- Still standing from the MVP: a link reference deleted by a local edit lingers until the next full parse.

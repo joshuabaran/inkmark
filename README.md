@@ -10,9 +10,14 @@ disk are the only source of truth: no accounts, sync or plugins.
   (the element you're in, block markers on your line) and hides elsewhere.
 - **Fast on big files**: rope buffer, background parsing, virtualized panes;
   responsive on 5–10 MB documents.
+- **GitHub Flavored Markdown**: tables edited as a grid, task lists with
+  clickable checkboxes, strikethrough, and bare URLs and emails linked
+  automatically. Parsed by [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark)
+  and checked against every example in the CommonMark and GFM specs.
 - **Per-pane minimaps**, images (PNG, JPEG, GIF, WebP, BMP), recent files.
-- CommonMark ([pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark));
-  GFM is planned. See [PLAN.md](PLAN.md) for the design.
+
+See [PLAN.md](PLAN.md) for the design, measurements and roadmap. Next up
+is a file browser for working through a folder of notes.
 
 ## Install
 
@@ -54,20 +59,28 @@ inkmark               # shows recent files
 | Keys | Action |
 |---|---|
 | Ctrl+E | Cycle split → code → live |
-| Ctrl+1 / Ctrl+2 | Focus the code / live pane |
+| Ctrl+1 / Ctrl+2 | Focus the code / live pane (switching to it when only one pane shows) |
 | Ctrl+M | Toggle the focused pane's minimap |
 | Ctrl+O, Ctrl+S, Ctrl+Shift+S | Open, save, save as |
 | Ctrl+R | Recent files |
 | Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y | Undo, redo (shared by both panes) |
 | Ctrl+B, Ctrl+I, Ctrl+\` | Toggle bold, italic, code |
+| Ctrl+Shift+X | Toggle strikethrough |
 | Ctrl+K | Insert a link |
+| Ctrl+Enter | Toggle the line's task checkbox (making it a task if needed) |
 | Ctrl+Alt+0…6 | Paragraph / heading level |
 | Enter (live) | Continue a list item or quote; on an empty one, leave it |
 | Shift+Enter (live) | Hard line break |
-| Tab / Shift+Tab | Indent / outdent list items (or selected lines in code) |
+| Tab / Shift+Tab | Indent / outdent list items (or selected lines in code); in a table, next / previous cell |
+| Enter (live table) | Cell below; in the last row, a new row |
+
+In the live pane, click a task's checkbox to tick it.
 
 inkmark keeps your line endings (LF/CRLF) and byte-order mark, saves
-atomically, and asks before overwriting changes made by other programs.
+atomically, and never overwrites changes made by other programs without
+asking: if the open file changes on disk, a banner offers **Reload** or
+**Keep mine**; if it's deleted, your text stays and saving recreates it.
+Opening another file or closing with unsaved changes asks first.
 
 ## Develop
 
@@ -81,10 +94,11 @@ FUZZ_ITERS=5000 cargo test --release -p inkmark-view --test live_edit fuzzed
 The workspace is split into `inkmark-buffer` (rope, edits, undo, file I/O),
 `inkmark-parse` (parser seam, block tree, source map), `inkmark-text`
 (cosmic-text layout and glyph atlas), `inkmark-view` (code and live panes),
-`inkmark-minimap`, and the `inkmark` app.
+`inkmark-minimap`, and the `inkmark` app. Large test documents are not in
+the repo; `scripts/measure.sh` takes any big `.md` file.
 
 ## License
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
-[MIT](LICENSE-MIT), at your option. The CommonMark spec examples in
-`fixtures/` are CC-BY-SA 4.0 (see `fixtures/commonmark/README.md`).
+[MIT](LICENSE-MIT), at your option. The CommonMark and GFM spec examples
+in `fixtures/` are CC-BY-SA 4.0 (see the README in each folder).

@@ -1,4 +1,5 @@
-//! `MarkdownParser` trait, pulldown-cmark impl, BlockTree, SourceMap, rebase.
+//! `MarkdownParser` trait, CommonMark (`PulldownParser`) and GFM
+//! (`GfmParser`) impls, BlockTree, SourceMap, rebase.
 
 mod autolinks;
 mod chunked;
