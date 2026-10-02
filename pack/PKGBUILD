@@ -11,16 +11,23 @@ pkgdesc="Fast local Markdown editor with split code and live views"
 arch=('x86_64' 'aarch64')
 url="https://github.com/joshuabaran/inkmark"
 license=('MIT OR Apache-2.0')
+# The binary links only libc; winit and wgpu dlopen the rest at runtime.
+# fontconfig provides the font configuration the font loader reads.
 depends=('gcc-libs' 'glibc' 'fontconfig' 'libxkbcommon' 'wayland' 'vulkan-icd-loader')
 makedepends=('cargo' 'git')
 optdepends=(
     'xdg-desktop-portal: open and save dialogs'
     'noto-fonts-cjk: CJK text'
     'noto-fonts-emoji: color emoji'
+    'libx11: X11 sessions'
+    'libxcursor: X11 sessions'
+    'libxi: X11 sessions'
 )
 provides=("$_pkgname")
 conflicts=("$_pkgname")
-source=("$_pkgname::git+$url.git")
+# The repository is private, so clone over SSH with your GitHub key. If it
+# goes public, "git+$url.git" works for anyone.
+source=("$_pkgname::git+ssh://git@github.com/joshuabaran/inkmark.git")
 sha256sums=('SKIP')
 
 pkgver() {
