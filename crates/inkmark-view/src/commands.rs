@@ -158,8 +158,12 @@ pub(crate) fn smart_enter(doc: &Document, sel: Selection, ctx: EnterContext) -> 
     let rest_empty = text[p.content_start()..].trim().is_empty();
     if let Some(marker) = &p.marker {
         if rest_empty && col >= p.content_start() {
-            // Enter on an empty item ends the list: drop its marker and leave
-            // a blank (quote) line, or the next text would continue the item.
+            // Enter on an empty item ends the list. Inside a quote, a blank
+            // quote line ends the item and the caret stays in the quote;
+            // otherwise the item's line becomes the blank line.
+            if quote.is_empty() {
+                return leave_to_blank_line(doc, line);
+            }
             let keep = format!("{}\n{quote}", quote.trim_end());
             let caret = line.start + keep.len();
             return caret_plan(vec![Edit::replace(line, keep)], caret, EditKind::Other);
@@ -182,15 +186,31 @@ pub(crate) fn smart_enter(doc: &Document, sel: Selection, ctx: EnterContext) -> 
     }
     if !p.quote.is_empty() && col >= p.quote.end {
         if rest_empty {
-            // An empty quote line leaves the quote, with a blank line so the
-            // next text doesn't continue the quoted paragraph.
-            let caret = line.start + 1;
-            return caret_plan(vec![Edit::replace(line, "\n")], caret, EditKind::Other);
+            // An empty quote line leaves the quote.
+            return leave_to_blank_line(doc, line);
         }
         // A new paragraph inside the quote needs a blank quote line between.
         return insert(format!("\n{}\n{quote}", quote.trim_end()));
     }
     insert("\n\n".to_owned())
+}
+
+/// Empties `line` (an empty item or quote line being left) so it becomes
+/// the blank line that ends the block, and puts the caret on the line after
+/// it: the existing next line if that's blank (or the end of the file), else
+/// a new one. Without the blank line, text typed next would lazily continue
+/// the item or quote.
+fn leave_to_blank_line(doc: &Document, line: Range<usize>) -> EditPlan {
+    let line_no = doc.byte_to_line(line.start);
+    let next_is_blank =
+        line.end < doc.len() && doc.slice(doc.line_range(line_no + 1)).trim().is_empty();
+    let replacement = if next_is_blank { "" } else { "\n" };
+    let caret = line.start + 1;
+    caret_plan(
+        vec![Edit::replace(line, replacement)],
+        caret,
+        EditKind::Other,
+    )
 }
 
 /// Shift+Enter: a hard line break within the paragraph.
@@ -280,7 +300,11 @@ fn heading_marker(s: &str) -> usize {
 pub(crate) fn indent_list(doc: &Document, sel: Selection, outdent: bool) -> Option<EditPlan> {
     let range = sel.range();
     let first = doc.byte_to_line(range.start);
-    let last = doc.byte_to_line(range.end);
+    let mut last = doc.byte_to_line(range.end);
+    // A selection ending at a line's first byte doesn't include that line.
+    if last > first && doc.line_to_byte(last) == range.end {
+        last -= 1;
+    }
     let mut edits = Vec::new();
     // How much an edit at `at` moves `offset`.
     let shift_before =
@@ -581,6 +605,27 @@ mod tests {
             apply(&text, sel, |d, s| toggle_wrap(d, s, "~~", &["~"])),
             "a ~~[struck]~~ c"
         );
+    }
+
+    #[test]
+    fn leaving_a_list_or_quote_adds_exactly_one_blank_line() {
+        // Regression for #1: real lines end in a newline.
+        assert_eq!(enter("- one\n- |\n"), "- one\n\n|");
+        assert_eq!(enter("> one\n> |\n"), "> one\n\n|");
+        // A following paragraph keeps its own line; the caret gets a new one.
+        assert_eq!(enter("- one\n- |\nmore\n"), "- one\n\n|\nmore\n");
+        // Already followed by a blank line: no extra one.
+        assert_eq!(enter("- one\n- |\n\nnext\n"), "- one\n\n|\nnext\n");
+    }
+
+    #[test]
+    fn tab_skips_a_line_the_selection_only_touches() {
+        // Regression for #8.
+        let mut doc = Document::from_text("- one\n- two\n");
+        let sel = Selection { anchor: 0, head: 6 };
+        let p = indent_list(&doc, sel, false).unwrap();
+        doc.apply(p.edits, sel, p.selection, p.kind).unwrap();
+        assert_eq!(doc.slice(0..doc.len()), "  - one\n- two\n");
     }
 
     #[test]

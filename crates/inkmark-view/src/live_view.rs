@@ -239,6 +239,8 @@ pub struct LiveView {
     preedit: String,
     /// Per-pane minimap toggle; survives mode switches with the view.
     pub show_minimap: bool,
+    /// The caret moved since the last edit: start a new undo step.
+    seal_undo: bool,
     /// Task checkboxes drawn last frame: hit area, source offset of the
     /// `[ ]` marker, checked.
     checkboxes: Vec<(Rect, usize, bool)>,
@@ -266,6 +268,7 @@ impl LiveView {
             dragging: false,
             preedit: String::new(),
             show_minimap: true,
+            seal_undo: false,
             checkboxes: Vec::new(),
             images: None,
             font_size: 16.0,
@@ -845,9 +848,26 @@ impl LiveView {
     /// state it would have there.
     fn is_visible(&self, doc: &Document, parse: &ParseOutput, offset: usize) -> bool {
         let line = doc.byte_to_line(offset);
-        let Some(leaf) = leaf_at_line(doc, parse, line) else {
+        let Some(mut leaf) = leaf_at_line(doc, parse, line) else {
             return true;
         };
+        if matches!(leaf.block.kind, BlockKind::Table { .. }) {
+            // In a table only places inside a cell's text are stops; pipes,
+            // padding and the delimiter row aren't.
+            let cell = parse
+                .blocks
+                .table_rows(&leaf.block)
+                .into_iter()
+                .flat_map(|(_, cells)| cells)
+                .find(|c| !c.range.is_empty() && c.range.start <= offset && offset <= c.range.end);
+            let Some(cell) = cell else {
+                return false;
+            };
+            leaf = Leaf {
+                block: cell,
+                containers: Vec::new(),
+            };
+        }
         let layout = live_layout::build(doc, &parse.map, &leaf, Some(reveal_at(doc, offset)));
         let (seg, d) = layout.display_pos(offset);
         layout.source_pos(seg, d) == offset
@@ -882,6 +902,9 @@ impl LiveView {
         }
         self.preferred_x = None;
         self.reveal_caret = REVEAL_FRAMES;
+        // Moving the caret ends the typing group, even if it comes back to
+        // the same spot (the code pane does the same).
+        self.seal_undo = true;
     }
 
     fn move_vertical(
@@ -948,15 +971,11 @@ impl LiveView {
                 }
                 Event::Paste(text) => {
                     let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                    let text = self.fit_to_cell(doc, parse, text);
                     self.replace_selection(doc, &text, EditKind::Other)
                 }
                 Event::Text(text) if self.preedit.is_empty() => {
-                    // A bare `|` would split a table cell.
-                    let text = if self.table_at_caret(doc, parse).is_some() {
-                        text.replace('|', "\\|")
-                    } else {
-                        text
-                    };
+                    let text = self.fit_to_cell(doc, parse, text);
                     self.replace_selection(doc, &text, EditKind::Typing)
                 }
                 Event::Ime(ImeEvent::Preedit { text, .. }) => {
@@ -968,6 +987,7 @@ impl LiveView {
                 }
                 Event::Ime(ImeEvent::Commit(text)) => {
                     self.preedit.clear();
+                    let text = self.fit_to_cell(doc, parse, text);
                     self.replace_selection(doc, &text, EditKind::Typing)
                 }
                 Event::Key {
@@ -993,6 +1013,9 @@ impl LiveView {
     }
 
     fn apply_plan(&mut self, doc: &mut Document, plan: EditPlan) -> bool {
+        if std::mem::take(&mut self.seal_undo) {
+            doc.seal_undo_step();
+        }
         if plan.edits.is_empty()
             || doc
                 .apply(plan.edits, self.selection, plan.selection, plan.kind)
@@ -1056,7 +1079,12 @@ impl LiveView {
         if !matches!(leaf.block.kind, BlockKind::Table { .. }) {
             return None;
         }
-        let rows = parse.blocks.table_rows(&leaf.block);
+        let mut rows = parse.blocks.table_rows(&leaf.block);
+        // pulldown-cmark pads short rows with zero-width cells at the next
+        // line's start; they have no text to visit.
+        for (_, cells) in &mut rows {
+            cells.retain(|c| !c.range.is_empty());
+        }
         let row = rows
             .iter()
             .position(|(r, _)| doc.byte_to_line(r.range.start) == line)?;
@@ -1066,6 +1094,26 @@ impl LiveView {
             .rposition(|c| c.range.start <= head)
             .unwrap_or(0);
         Some(TableAt { rows, row, col })
+    }
+
+    /// The editable text of the table cell holding the caret (its range
+    /// without padding), or `None` outside tables.
+    fn cell_text_range(&self, doc: &Document, parse: &ParseOutput) -> Option<Range<usize>> {
+        let t = self.table_at_caret(doc, parse)?;
+        let cell = t.rows[t.row].1.get(t.col)?;
+        let text = doc.slice(cell.range.clone());
+        let start = cell.range.start + (text.len() - text.trim_start().len());
+        let end = cell.range.end - (text.len() - text.trim_end().len());
+        Some(start..end.max(start))
+    }
+
+    /// Text going into a table cell can't split it: `|` is escaped and line
+    /// breaks become spaces. Elsewhere `text` is unchanged.
+    fn fit_to_cell(&self, doc: &Document, parse: &ParseOutput, text: String) -> String {
+        if self.table_at_caret(doc, parse).is_none() {
+            return text;
+        }
+        text.replace('|', "\\|").replace('\n', " ")
     }
 
     /// Tab / Shift+Tab / Enter inside a table. `None` when not in one.
@@ -1152,7 +1200,6 @@ impl LiveView {
         let range = sel.range();
         if !cmd
             && !alt
-            && range.is_empty()
             && matches!(key, Key::Tab | Key::Enter)
             && let Some(edited) = self.table_key(doc, parse, key, shift)
         {
@@ -1168,10 +1215,22 @@ impl LiveView {
                     return self.apply_plan(doc, plan);
                 }
                 let start = self.step(doc, parse, false, cmd);
+                // In a table, deleting stops at the cell's edge: past it are
+                // pipes, which would break the row.
+                if let Some(text) = self.cell_text_range(doc, parse)
+                    && start < text.start
+                {
+                    return false;
+                }
                 return self.delete(doc, start..sel.head, EditKind::Deleting);
             }
             Key::Delete => {
                 let end = self.step(doc, parse, true, cmd);
+                if let Some(text) = self.cell_text_range(doc, parse)
+                    && end > text.end
+                {
+                    return false;
+                }
                 return self.delete(doc, sel.head..end, EditKind::Deleting);
             }
             Key::Enter if cmd => return self.apply_plan(doc, commands::toggle_task(doc, sel)),

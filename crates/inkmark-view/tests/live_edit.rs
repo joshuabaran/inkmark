@@ -182,7 +182,9 @@ fn enter_continues_and_ends_lists() {
     s.press(Key::Enter);
     s.press(Key::Enter);
     s.type_text("after");
-    assert_eq!(s.text(), "- one\n- two\n\nafter\n");
+    // Exactly one blank line ends the list (#1); the file's final newline
+    // became it.
+    assert_eq!(s.text(), "- one\n- two\n\nafter");
 }
 
 #[test]
@@ -452,4 +454,75 @@ fn up_and_down_move_between_table_rows() {
         (src.find("right").unwrap()..=src.find("right").unwrap() + 5).contains(&head),
         "up reaches the header cell: {head}"
     );
+}
+
+#[test]
+fn pasted_or_committed_pipes_stay_inside_the_cell() {
+    // Regression for #4.
+    let src = "| a | b |\n|---|---|\n";
+    let mut s = Split::new(src);
+    s.caret(src.find('a').unwrap() + 1);
+    s.frame(vec![Event::Paste("x|y\nz".into())]);
+    assert_eq!(s.text(), "| ax\\|y z | b |\n|---|---|\n");
+    s.frame(vec![Event::Ime(ImeEvent::Commit("|".into()))]);
+    assert_eq!(s.text(), "| ax\\|y z\\| | b |\n|---|---|\n");
+}
+
+#[test]
+fn backspace_and_delete_stop_at_a_cells_edges() {
+    // Regression for #14.
+    let src = "| a | b |\n|---|---|\n| c | d |\n";
+    let mut s = Split::new(src);
+    s.caret(src.find('a').unwrap());
+    s.press(Key::Backspace);
+    assert_eq!(s.text(), src);
+    s.caret(src.find('b').unwrap() + 1);
+    s.press(Key::Delete);
+    assert_eq!(s.text(), src);
+    // Inside the text they still work.
+    s.press(Key::Backspace);
+    assert_eq!(s.text(), "| a |  |\n|---|---|\n| c | d |\n");
+}
+
+#[test]
+fn tab_on_a_short_row_skips_placeholder_cells() {
+    // Regression for #12.
+    let src = "| a | b | c |\n|---|---|---|\n| d | e |\n| f |\n";
+    let mut s = Split::new(src);
+    s.caret(src.find('e').unwrap() + 1);
+    s.press(Key::Tab);
+    s.type_text("Z");
+    assert_eq!(
+        s.text(),
+        "| a | b | c |\n|---|---|---|\n| d | e |\n| Zf |\n"
+    );
+}
+
+#[test]
+fn enter_with_a_selection_in_a_cell_keeps_the_table() {
+    // Regression for #10.
+    let src = "| a | b |\n|---|---|\n| c | d |\n";
+    let mut s = Split::new(src);
+    let a = src.find('a').unwrap();
+    s.live.set_selection(Selection {
+        anchor: a,
+        head: a + 1,
+    });
+    s.frame(vec![]);
+    s.press(Key::Enter);
+    assert_eq!(s.text(), src);
+    assert_eq!(s.live.selection(), Selection::caret(src.find('c').unwrap()));
+}
+
+#[test]
+fn a_caret_move_ends_the_undo_group() {
+    // Regression for #11.
+    let mut s = Split::new("hello");
+    s.caret(5);
+    s.type_text("ab");
+    s.press(Key::ArrowLeft);
+    s.press(Key::ArrowRight);
+    s.type_text("c");
+    s.key(Key::Z, Modifiers::COMMAND);
+    assert_eq!(s.text(), "helloab");
 }
