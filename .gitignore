@@ -1,1 +1,5 @@
 /target
+/pack/src/
+/pack/pkg/
+/pack/inkmark/
+/pack/*.pkg.tar.*

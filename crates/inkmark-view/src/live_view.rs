@@ -140,6 +140,11 @@ impl LiveView {
         self.preferred_x = None;
     }
 
+    /// Gives up keyboard focus (e.g. while a dialog is open).
+    pub fn release_focus(&self, ctx: &egui::Context) {
+        ctx.memory_mut(|m| m.surrender_focus(self.id));
+    }
+
     pub fn request_focus(&self, ctx: &egui::Context) {
         ctx.memory_mut(|m| m.request_focus(self.id));
     }

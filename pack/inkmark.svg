@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="#16161a"/>
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="none" stroke="#2f3a52" stroke-width="3"/>
+  <!-- An "M" with a down arrow: Markdown's own mark, in the editor's accent blue. -->
+  <path d="M28 88V40h12l12 16 12-16h12v48H64V60l-12 16-12-16v28z" fill="#82b4ff"/>
+  <path d="M88 40h12v28h10l-16 20-16-20h10z" fill="#82b4ff"/>
+</svg>

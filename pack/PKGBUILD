@@ -1,0 +1,58 @@
+# Maintainer: Joshua Baran <joshua.baran@gmail.com>
+#
+# Builds the latest commit from GitHub:
+#   cd pack && makepkg -si
+
+pkgname=inkmark-git
+_pkgname=inkmark
+pkgver=r0.0000000
+pkgrel=1
+pkgdesc="Fast local Markdown editor with split code and live views"
+arch=('x86_64' 'aarch64')
+url="https://github.com/joshuabaran/inkmark"
+license=('MIT OR Apache-2.0')
+depends=('gcc-libs' 'glibc' 'fontconfig' 'libxkbcommon' 'wayland' 'vulkan-icd-loader')
+makedepends=('cargo' 'git')
+optdepends=(
+    'xdg-desktop-portal: open and save dialogs'
+    'noto-fonts-cjk: CJK text'
+    'noto-fonts-emoji: color emoji'
+)
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+source=("$_pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$_pkgname"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+    cd "$_pkgname"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$_pkgname"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release --bin inkmark
+}
+
+check() {
+    cd "$_pkgname"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --frozen --release --workspace
+}
+
+package() {
+    cd "$_pkgname"
+    install -Dm755 target/release/inkmark "$pkgdir/usr/bin/inkmark"
+    install -Dm644 pack/inkmark.desktop "$pkgdir/usr/share/applications/inkmark.desktop"
+    install -Dm644 pack/inkmark.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/inkmark.svg"
+    install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+    install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

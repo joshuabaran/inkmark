@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=inkmark
+GenericName=Markdown Editor
+Comment=Fast local Markdown editor with code and live views
+Exec=inkmark %f
+Icon=inkmark
+Terminal=false
+Categories=Utility;TextEditor;
+MimeType=text/markdown;text/x-markdown;
+Keywords=markdown;md;editor;notes;
+StartupWMClass=inkmark

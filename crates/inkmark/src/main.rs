@@ -24,6 +24,7 @@ const CYCLE_MODE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, K
 const FOCUS_CODE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num1);
 const FOCUS_LIVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num2);
 const TOGGLE_MINIMAP: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::M);
+const RECENT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -39,6 +40,7 @@ enum Pane {
 }
 
 mod measure;
+mod recent;
 
 fn main() -> eframe::Result {
     let start = Instant::now();
@@ -49,6 +51,16 @@ fn main() -> eframe::Result {
             .with_app_id("inkmark")
             .with_inner_size([1200.0, 800.0]),
         ..Default::default()
+    };
+    // Built with `--features glow`, INKMARK_RENDERER=glow picks OpenGL over wgpu.
+    #[cfg(feature = "glow")]
+    let options = eframe::NativeOptions {
+        renderer: if std::env::var("INKMARK_RENDERER").as_deref() == Ok("glow") {
+            eframe::Renderer::Glow
+        } else {
+            eframe::Renderer::Wgpu
+        },
+        ..options
     };
     eframe::run_native(
         "inkmark",
@@ -70,9 +82,12 @@ enum Banner {
 }
 
 /// An action waiting on "discard unsaved changes?".
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Confirm {
+    /// Ctrl+O: show the open dialog.
     Open,
+    /// Open this file (from the recent list).
+    OpenPath(PathBuf),
     Close,
 }
 
@@ -97,6 +112,11 @@ struct App {
     next_disk_check: Instant,
     title: String,
     measure: Option<measure::Measure>,
+    recent: recent::Recent,
+    /// The recent-files list is open, with this entry selected.
+    recent_list: Option<usize>,
+    /// A dialog took keyboard focus from the panes last frame.
+    modal_was_open: bool,
 }
 
 impl App {
@@ -124,15 +144,31 @@ impl App {
             next_disk_check: Instant::now() + DISK_CHECK_INTERVAL,
             title: String::new(),
             measure: None,
+            recent: recent::Recent::load(),
+            recent_list: None,
+            modal_was_open: false,
         };
-        if let Some(path) = path {
-            app.open(path);
+        match path {
+            Some(path) => app.open(path),
+            // Nothing to open: offer the recent files.
+            None if !app.recent.entries().is_empty() => app.recent_list = Some(0),
+            None => {}
         }
         app.code.request_focus(ctx);
         app
     }
 
+    /// Opens `path`, asking first if there are unsaved changes.
+    fn request_open(&mut self, path: PathBuf) {
+        if self.doc.is_dirty() {
+            self.confirm = Some(Confirm::OpenPath(path));
+        } else {
+            self.open(path);
+        }
+    }
+
     fn open(&mut self, path: PathBuf) {
+        self.recent.add(&path);
         match Document::open(&path) {
             Ok(doc) => self.doc = doc,
             // A path that doesn't exist yet becomes a new file there.
@@ -177,7 +213,10 @@ impl App {
 
     fn save_as(&mut self, path: PathBuf) {
         match self.doc.save_as(&path) {
-            Ok(()) => self.saved(),
+            Ok(()) => {
+                self.recent.add(&path);
+                self.saved();
+            }
             Err(e) => {
                 self.banner = Some(Banner::Error(format!(
                     "Couldn't save {}: {e}",
@@ -310,7 +349,7 @@ impl App {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (cycle, code, live, minimap) = ctx.input_mut(|i| {
+        let (cycle, code, live, minimap, recent) = ctx.input_mut(|i| {
             // egui ignores extra Alt when matching; Ctrl+Alt+digit sets headings.
             let alt = i.modifiers.alt;
             (
@@ -318,8 +357,15 @@ impl App {
                 !alt && i.consume_shortcut(&FOCUS_CODE),
                 !alt && i.consume_shortcut(&FOCUS_LIVE),
                 i.consume_shortcut(&TOGGLE_MINIMAP),
+                i.consume_shortcut(&RECENT),
             )
         });
+        if recent {
+            self.recent_list = match self.recent_list {
+                Some(_) => None,
+                None => Some(0),
+            };
+        }
         if minimap {
             // Each pane keeps its own minimap setting.
             match self.focus {
@@ -453,8 +499,86 @@ impl App {
         });
     }
 
+    /// While a dialog is open the panes don't get keys (typing mustn't edit
+    /// the document behind it); focus returns when it closes.
+    fn hold_focus_for_dialogs(&mut self, ctx: &egui::Context) {
+        let open = self.recent_list.is_some() || self.confirm.is_some();
+        if open {
+            self.code.release_focus(ctx);
+            self.live.release_focus(ctx);
+        } else if self.modal_was_open {
+            match self.focus {
+                Pane::Code => self.code.request_focus(ctx),
+                Pane::Live => self.live.request_focus(ctx),
+            }
+        }
+        self.modal_was_open = open;
+    }
+
+    /// The recent-files list: arrows and Enter, or a click, open one.
+    fn recent_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut selected) = self.recent_list else {
+            return;
+        };
+        let entries = self.recent.entries().to_vec();
+        let (up, down, enter, escape) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                i.consume_key(Modifiers::NONE, Key::Enter),
+                i.consume_key(Modifiers::NONE, Key::Escape),
+            )
+        });
+        if entries.is_empty() || escape {
+            self.recent_list = None;
+            return;
+        }
+        if up {
+            selected = selected.saturating_sub(1);
+        }
+        if down {
+            selected = (selected + 1).min(entries.len() - 1);
+        }
+        let mut chosen = enter.then(|| entries[selected].clone());
+        egui::Modal::new(egui::Id::new("recent")).show(ctx, |ui| {
+            ui.set_min_width(480.0);
+            ui.heading("Recent files");
+            ui.add_space(6.0);
+            for (i, path) in entries.iter().enumerate() {
+                let name = path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                let dir = path
+                    .parent()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_default();
+                let missing = if path.exists() { "" } else { "  (missing)" };
+                let text = RichText::new(format!("{name}{missing}")).strong();
+                let row = ui.selectable_label(i == selected, text).on_hover_text(&dir);
+                ui.label(RichText::new(dir).small().weak());
+                if row.clicked() {
+                    chosen = Some(path.clone());
+                }
+            }
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Up/Down select · Enter open · Esc close")
+                    .small()
+                    .weak(),
+            );
+        });
+        self.recent_list = Some(selected);
+        if let Some(path) = chosen {
+            self.recent_list = None;
+            self.request_open(path);
+        }
+    }
+
     fn confirm_ui(&mut self, ctx: &egui::Context) {
-        let Some(confirm) = self.confirm else { return };
+        let Some(confirm) = self.confirm.clone() else {
+            return;
+        };
         let mut choice = None;
         egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
             ui.label(format!("{} has unsaved changes.", self.file_name()));
@@ -483,6 +607,13 @@ impl App {
                     self.spawn_dialog(true);
                 }
             }
+            ("save", Confirm::OpenPath(path)) => {
+                self.save();
+                if !self.doc.is_dirty() {
+                    self.open(path);
+                }
+            }
+            ("discard", Confirm::OpenPath(path)) => self.open(path),
             ("discard", Confirm::Close) => self.close_allowed = true,
             ("discard", Confirm::Open) => self.spawn_dialog(true),
             _ => {}
@@ -553,6 +684,9 @@ impl eframe::App for App {
         self.poll_dialog(&ctx);
         self.check_disk(&ctx);
         self.guard_close(&ctx);
+        // Dialogs take the keyboard before the panes see it.
+        self.recent_ui(&ctx);
+        self.hold_focus_for_dialogs(&ctx);
 
         if self.banner.is_some() {
             egui::Panel::top("banner").show(ui, |ui| self.banner_ui(ui));
