@@ -2,7 +2,7 @@
 
 **Name (working):** `inkmark` · Rust · egui/eframe · Linux/Wayland (Omarchy/Hyprland) first · no Electron/WebView
 
-**Status:** Signed off 2026-10-01. Changes to locked decisions require updating this doc first.
+**Status:** Signed off 2026-10-01. MVP (M1–M6) complete 2026-10-02; see [Results](#results). Changes to locked decisions require updating this doc first.
 
 ---
 
@@ -177,6 +177,8 @@ Performance is a requirement, not a polish pass.
 
 The live view comes after the SourceMap (M2 → M3), and the M2 spike tests the mapping before any live UI is built. Minimaps come last among features, so the scroll and layout code they depend on already exists.
 
+**Done:** M1 `812e4f9`–`81eb15e` · M2 `7edbcdf` · M3 `d75f765` · M4 `3e6b606` · live-view images `5dec137` (after M4, by choice) · M5 `a35bda7` · M6 `e769e58`–`6f9d693`.
+
 ---
 
 ## Testing
@@ -190,22 +192,23 @@ The live view comes after the SourceMap (M2 → M3), and the M2 spike tests the 
   - Scripted live edits must produce exactly the expected source.
   - Fuzzed live keystrokes must equal the same keystrokes applied at the mapped source offsets.
   - Patch size: a single character typed in live changes ≤ 1 inserted character plus any explicit smart-rule bytes.
-- **Benches:** criterion benches in each crate (open, full reparse, local reparse, rebase, layout of the visible window). End-to-end latency is recorded by an `instrument` feature in the app binary.
+- **Benches** (as built): `#[ignore]`d tests that print timings, run with `cargo test --release --workspace -- --ignored --nocapture` (full and local reparse, code and live keystroke→frame, live scrolling and random jumps, glyph-atlas spike). App-level numbers (startup, RSS, real-GPU scroll fps) come from `INKMARK_MEASURE=1` via `scripts/measure.sh`, instead of an `instrument` feature.
+- **Also built:** headless egui tests that drive both panes with synthetic keyboard, mouse, clipboard and IME input; a typing fuzz (random clicks + keystrokes, each must insert exactly the typed character) and a mixed-operation fuzz (map stays valid, undo-all restores the original), both clean at 5000 iterations.
 
 ---
 
 ## Risks
 
-| Risk | Why it hurts | Mitigation |
-|------|----------------|------------|
-| **Live → source mapping** | Wrong offsets corrupt the file | Reveal-at-cursor model (no re-emit); inline SourceMap with full byte coverage; spike in M2; fuzz tests |
-| **Glyph atlas / text rendering** | Custom text drawing in egui is new code on the critical path | Spike first in M1; `glow` fallback kept buildable |
-| **Local reparse misses non-local effects** | Live view briefly wrong after edits that open fences or define link references | Background reparse is authoritative and lands within the debounce plus parse time; test this specifically |
-| **Height estimation** | Scrollbar and minimap jitter as estimates turn into measured heights | Anchor scroll to the top visible block when heights change |
-| **Full reparse cost** | Multi-MB files would hitch if parsed on the UI thread | Always off-thread; debounce; rebase stale results |
-| **IME on Wayland** | Broken compose or CJK input under Hyprland | Test in M1; track egui/winit issues; degrade gracefully |
-| **Scroll sync drift** | Code and live have different line heights | Sync on block, not pixels |
-| **Portal / clipboard** | Missing portal means no file dialog; paste may be flaky | Document runtime deps; CLI path argument for open |
+| Risk | Why it hurts | Mitigation | Outcome |
+|------|----------------|------------|---------|
+| **Live → source mapping** | Wrong offsets corrupt the file | Reveal-at-cursor model (no re-emit); inline SourceMap with full byte coverage; spike in M2; fuzz tests | **Retired.** All 652 spec examples map every byte; fuzzing found two multi-byte slicing panics (fixed, with tests), no mapping errors. |
+| **Glyph atlas / text rendering** | Custom text drawing in egui is new code on the critical path | Spike first in M1; `glow` fallback kept buildable | **Retired.** 240 fps (monitor cap) on wgpu and glow; textures capped to the GPU limit after a crash found in testing. |
+| **Local reparse misses non-local effects** | Live view briefly wrong after edits that open fences or define link references | Background reparse is authoritative and lands within the debounce plus parse time; test this specifically | **Retired.** Tested (opening a fence); full parse lands in ~24 ms + parse time. |
+| **Height estimation** | Scrollbar and minimap jitter as estimates turn into measured heights | Anchor scroll to the top visible block when heights change | **Mitigated.** Line-anchored scrolling; small jitter possible while far-off blocks get measured. |
+| **Full reparse cost** | Multi-MB files would hitch if parsed on the UI thread | Always off-thread; debounce; rebase stale results | **Retired.** 64 ms for 5 MB on the worker; UI-thread catch-up 0.02 ms p95 after chunking spans. |
+| **IME on Wayland** | Broken compose or CJK input under Hyprland | Test in M1; track egui/winit issues; degrade gracefully | **Retired.** fcitx5 checked by hand on Omarchy; both panes handle preedit/commit. |
+| **Scroll sync drift** | Code and live have different line heights | Sync on block, not pixels | **Retired.** Sync is source line + fraction through the block. |
+| **Portal / clipboard** | Missing portal means no file dialog; paste may be flaky | Document runtime deps; CLI path argument for open | **Retired.** Dialogs and 5 MB paste checked by hand; deps documented in README and PKGBUILD. |
 
 ---
 
@@ -227,7 +230,7 @@ inkmark/
   PLAN.md                    # this document
 ```
 
-Benches live in each crate's own `benches/` folder. A later `inkmark-parse-gfm` crate implements the same parser trait with `comrak`.
+As built, benches are `#[ignore]`d tests inside each crate, `scripts/measure.sh` drives the app-level measurements, and `pack/` holds the PKGBUILD, desktop entry and icon. A later `inkmark-parse-gfm` crate implements the same parser trait with `comrak`.
 
 ---
 
@@ -239,3 +242,34 @@ Benches live in each crate's own `benches/` folder. A later `inkmark-parse-gfm` 
 - **Reparse latency:** full reparse (background, must not block input) and local reparse (UI thread, target < 1ms).
 - **Live patch size:** bytes changed per live edit (guards against rewriting whole blocks or files).
 - **Scroll FPS** in split mode with both minimaps on.
+
+---
+
+## Results
+
+Measured 2026-10-02 on the Omarchy host (240 Hz 1440p monitor, scale 1, Mesa radv Vulkan), release build. The 5 MB file is `War and Peace` + `Anna Karenina` as Markdown (5.3 MB, 102k lines); the 10 MB file is that twice.
+
+| Measure | Target | Result |
+|---|---|---|
+| Startup to first frame | — | empty 116 ms · 1 MB 121 ms · 5 MB 128 ms · 10 MB 143 ms |
+| Open 10 MB without freezing | parse off-thread | first frame 143 ms; full parse settled at 174 ms, off the UI thread |
+| Idle RSS | — | empty 116 MB · 1 MB 125 MB · 5 MB 145 MB · 10 MB 168 MB (an empty eframe/wgpu window alone is 109 MB) |
+| Edit latency, code pane, 5 MB mid-file | < 16 ms p95 | 0.34 ms p95 keystroke → frame (CPU), parsing included |
+| Edit latency, live pane, longest paragraph (6.9 KB) | < 16 ms p95 | 4.2 ms p95 |
+| Full reparse, 5 MB | off the UI thread | 64 ms on the worker |
+| Local reparse / catch-up | < 1 ms | 0.02 ms p95 |
+| Live patch size | = typed text | fuzzed: every keystroke inserts exactly its character |
+| Scroll, split mode, both minimaps | smooth | 240 fps (monitor cap), p95 frame interval 4.5 ms, at 1, 5 and 10 MB |
+| Live pane frame | — | scrolling 0.65 ms p95 · random jumps (all cold) 1.64 ms p95 |
+
+**Decisions taken from the numbers**
+
+- **Span size left at 48 bytes.** Prose produces few spans per paragraph, so halving them would save a few MB of 145; nearly all memory is the GPU stack.
+- **No shape-run cache.** cosmic-text caches whole same-script runs, and a Latin paragraph is one run that changes on every keystroke. 4.2 ms on the longest paragraph is well inside budget; incremental paragraph layout is the lever if it's ever needed.
+
+## Known issues and next steps
+
+- **GFM** (tables, task lists, strikethrough, autolinks) is the next feature: an `inkmark-parse-gfm` crate behind the same trait.
+- **Fallback glyphs in the code pane** (box drawing, CJK) don't snap to whole monospace cells, so ASCII-art alignment can be off.
+- **Images:** no SVG; remote URLs aren't fetched (MVP has no network); reference definitions deleted by a local edit linger until the next full parse.
+- **PKGBUILD** clones over SSH while the repository is private; switch `source` to `git+$url.git` if it goes public.
