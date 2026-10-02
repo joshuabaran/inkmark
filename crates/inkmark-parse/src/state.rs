@@ -22,6 +22,7 @@ impl ParseOutput {
         Self {
             blocks: Default::default(),
             map: SourceMap::unparsed(len),
+            link_defs: Default::default(),
         }
     }
 
@@ -117,6 +118,7 @@ impl ParseOutput {
                 b
             })
             .collect();
+        self.link_defs.extend(std::mem::take(&mut local.link_defs));
         self.map.splice(region.clone(), spans);
         self.blocks.splice(region, blocks);
     }

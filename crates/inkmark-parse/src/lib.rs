@@ -19,6 +19,20 @@ pub use tree::{Block, BlockKind, BlockTree, Leaf};
 pub struct ParseOutput {
     pub blocks: BlockTree,
     pub map: SourceMap,
+    /// Link reference definitions (`[label]: dest`), keyed by
+    /// [`normalize_label`]. Local reparses only add to these; the next
+    /// full parse drops ones that were deleted.
+    pub link_defs: std::collections::HashMap<String, String>,
+}
+
+/// A link label as CommonMark matches it: case-folded, with runs of
+/// whitespace collapsed.
+pub fn normalize_label(label: &str) -> String {
+    label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 pub trait MarkdownParser: Send + Sync {

@@ -175,6 +175,17 @@ impl BlockTree {
             })
     }
 
+    /// Zero-based position of the item starting at `item_start` among the
+    /// items of `list`.
+    pub fn item_index(&self, list: &Block, item_start: usize) -> usize {
+        self.blocks
+            .iter_from(list.range.start)
+            .skip_while(|b| b.range.start < list.range.start)
+            .take_while(|b| b.range.start < item_start)
+            .filter(|b| b.kind == BlockKind::Item && b.depth == list.depth + 1)
+            .count()
+    }
+
     pub(crate) fn rebase(&mut self, change: &Change) {
         let delta = change.new_end as isize - change.old_end as isize;
         self.blocks.rebase(

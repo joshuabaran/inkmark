@@ -18,7 +18,7 @@ use inkmark_text::{GlyphMeshes, LineGeometry, RichLine, SharedFonts, TextConfig,
 use crate::commands::{self, EditPlan, EnterContext};
 use crate::images::{ImageCache, ImageSlot};
 use crate::lines::{LineIndex, SCROLLBAR_WIDTH, ScrollPos, Synced};
-use crate::live_layout::{self, LeafLayout, LeafStyle};
+use crate::live_layout::{self, LeafLayout, LeafStyle, Reveal};
 use crate::motion;
 use crate::theme::{
     self, BACKGROUND, CARET, CODE_BACKGROUND, LIST_MARKER, MARKUP, QUOTE_BAR, RULE, SELECTION, TEXT,
@@ -331,20 +331,14 @@ impl LiveView {
         self.selection.head = self.selection.head.min(doc.len());
     }
 
-    /// Source line whose raw syntax is shown: the caret's, while focused.
-    fn reveal_range(&self, doc: &Document) -> Option<Range<usize>> {
-        self.focused
-            .then(|| doc.line_range(doc.byte_to_line(self.selection.head)))
+    /// What raw syntax to show: around the caret, while focused.
+    fn reveal(&self, doc: &Document) -> Option<Reveal> {
+        self.focused.then(|| reveal_at(doc, self.selection.head))
     }
 
-    fn place(
-        &mut self,
-        doc: &Document,
-        map: &inkmark_parse::SourceMap,
-        leaf: Leaf,
-        width: f32,
-    ) -> Placed {
-        let layout = live_layout::build(doc, map, &leaf, self.reveal_range(doc));
+    fn place(&mut self, doc: &Document, parse: &ParseOutput, leaf: Leaf, width: f32) -> Placed {
+        let (map, link_defs) = (&parse.map, &parse.link_defs);
+        let layout = live_layout::build(doc, map, &leaf, self.reveal(doc));
         let containers: f32 = leaf.containers.iter().map(container_indent).sum();
         let row = self.text.row_height();
         let (pad_top, pad_bottom, inner) = match layout.style {
@@ -394,7 +388,7 @@ impl LiveView {
         let mut images = Vec::new();
         if has_image && let Some(cache) = &self.images {
             let base = doc.path().and_then(|p| p.parent());
-            for image in inline_images(&doc.slice(range)) {
+            for image in inline_images(&doc.slice(range), link_defs) {
                 let slot = cache.get(&image.dest, base);
                 let size = match &slot {
                     ImageSlot::Ready { size, .. } if size.x > wrap => *size * (wrap / size.x),
@@ -436,7 +430,7 @@ impl LiveView {
         width: f32,
     ) -> Option<Placed> {
         let leaf = leaf_at_line(doc, parse, line)?;
-        Some(self.place(doc, &parse.map, leaf, width))
+        Some(self.place(doc, parse, leaf, width))
     }
 
     // ---- caret -----------------------------------------------------------------
@@ -495,7 +489,7 @@ impl LiveView {
         let Some(leaf) = leaf_at_line(doc, parse, line) else {
             return true;
         };
-        let layout = live_layout::build(doc, &parse.map, &leaf, Some(doc.line_range(line)));
+        let layout = live_layout::build(doc, &parse.map, &leaf, Some(reveal_at(doc, offset)));
         let (seg, d) = layout.display_pos(offset);
         layout.source_pos(seg, d) == offset
     }
@@ -917,7 +911,7 @@ impl LiveView {
                 continue;
             }
             let leaf = leaves.next().expect("peeked");
-            let p = self.place(doc, &parse.map, leaf, frame.width);
+            let p = self.place(doc, parse, leaf, frame.width);
             if p.first_line < line {
                 // Shares a line with the previous leaf: stack below it.
                 let prev = self.lines.heights.height(p.first_line);
@@ -930,7 +924,7 @@ impl LiveView {
             for l in p.first_line + 1..=p.last_line {
                 self.lines.heights.set_measured(l, 0.0);
             }
-            self.draw_leaf(painter, &mut meshes, doc, &p, frame, y, &selection);
+            self.draw_leaf(painter, &mut meshes, doc, parse, &p, frame, y, &selection);
             if (p.first_line..=p.last_line).contains(&caret_line) {
                 let (seg, d) = p.layout.display_pos(self.selection.head);
                 let r = p.geometry[seg].caret_rect(d, CARET_WIDTH);
@@ -1054,6 +1048,7 @@ impl LiveView {
         painter: &egui::Painter,
         meshes: &mut GlyphMeshes,
         doc: &Document,
+        parse: &ParseOutput,
         p: &Placed,
         frame: Frame,
         top: f32,
@@ -1069,7 +1064,7 @@ impl LiveView {
                     painter.rect_filled(bar, 1.0, QUOTE_BAR);
                 }
                 BlockKind::Item if doc.byte_to_line(c.range.start) == p.first_line => {
-                    let marker = list_marker(doc, c.range.start, &p.leaf.containers);
+                    let marker = list_marker(doc, parse, c, &p.leaf.containers);
                     let y = top + p.seg_tops.first().copied().unwrap_or(0.0);
                     self.text
                         .draw_line(meshes, &marker, pos2(x + 4.0, y), LIST_MARKER);
@@ -1166,6 +1161,13 @@ fn container_indent(c: &inkmark_parse::Block) -> f32 {
     }
 }
 
+fn reveal_at(doc: &Document, caret: usize) -> Reveal {
+    Reveal {
+        line: doc.line_range(doc.byte_to_line(caret)),
+        caret,
+    }
+}
+
 /// The leaf block shown on source `line`, if any.
 fn leaf_at_line(doc: &Document, parse: &ParseOutput, line: usize) -> Option<Leaf> {
     let leaf = parse.blocks.leaves_from(doc.line_to_byte(line)).next()?;
@@ -1182,20 +1184,71 @@ fn leaf_lines(doc: &Document, parse: &ParseOutput, line: usize) -> Option<(usize
     ))
 }
 
-/// "•" (by nesting depth) for bullet items; the source number for ordered ones.
-fn list_marker(doc: &Document, item_start: usize, containers: &[inkmark_parse::Block]) -> String {
-    let line_end = doc.line_range(doc.byte_to_line(item_start)).end;
-    let source = doc.slice(item_start..line_end);
-    let number: String = source
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ')')
-        .collect();
-    if number.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        return number;
+/// "•" (by nesting depth) for bullet items. Ordered items count up from
+/// the list's start number, as CommonMark renders them ("1. 1. 1." shows
+/// 1, 2, 3), keeping the source's "." or ")".
+fn list_marker(
+    doc: &Document,
+    parse: &ParseOutput,
+    item: &inkmark_parse::Block,
+    containers: &[inkmark_parse::Block],
+) -> String {
+    let list = containers
+        .iter()
+        .rev()
+        .find(|c| matches!(c.kind, BlockKind::List { .. }) && c.range.start <= item.range.start);
+    if let Some(
+        list @ inkmark_parse::Block {
+            kind:
+                BlockKind::List {
+                    ordered: true,
+                    start,
+                },
+            ..
+        },
+    ) = list
+    {
+        let line_end = doc.line_range(doc.byte_to_line(item.range.start)).end;
+        let source = doc.slice(item.range.start..line_end);
+        let delimiter = source
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .chars()
+            .next()
+            .filter(|c| *c == ')')
+            .unwrap_or('.');
+        let n = start + parse.blocks.item_index(list, item.range.start) as u64;
+        return format!("{n}{delimiter}");
     }
     let depth = containers
         .iter()
         .filter(|c| matches!(c.kind, BlockKind::List { .. }))
         .count();
     ["•", "◦", "▪"][depth.saturating_sub(1) % 3].to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use inkmark_parse::{MarkdownParser, PulldownParser};
+
+    use super::*;
+
+    fn markers(src: &str) -> Vec<String> {
+        let doc = Document::from_text(src);
+        let parse = PulldownParser.parse(src);
+        parse
+            .blocks
+            .leaves_from(0)
+            .map(|leaf| {
+                let item = leaf.containers.last().expect("in an item").clone();
+                list_marker(&doc, &parse, &item, &leaf.containers)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ordered_items_count_up_from_the_start_number() {
+        assert_eq!(markers("7. a\n7. b\n7. c\n"), vec!["7.", "8.", "9."]);
+        assert_eq!(markers("1) a\n1) b\n"), vec!["1)", "2)"]);
+        assert_eq!(markers("- a\n  - b\n"), vec!["•", "◦"]);
+    }
 }

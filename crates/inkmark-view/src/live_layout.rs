@@ -129,13 +129,58 @@ impl Builder<'_> {
     }
 }
 
-/// Lays out `leaf`. Source lines overlapping `reveal` show their raw text
-/// (syntax dimmed); everything else is rendered.
+/// What to show as raw Markdown around the caret.
+#[derive(Clone, Debug)]
+pub(crate) struct Reveal {
+    /// The caret's source line: block markers (`#`, fences, rules, hard
+    /// breaks) on it are shown.
+    pub line: Range<usize>,
+    /// Inline elements (emphasis, code, links, images) the caret is in or
+    /// touching show their delimiters; escapes and entities next to it
+    /// show their source.
+    pub caret: usize,
+}
+
+/// Inline style flags whose delimiters reveal per element.
+const INLINE: [Style; 5] = [
+    Style::EMPHASIS,
+    Style::STRONG,
+    Style::CODE,
+    Style::LINK,
+    Style::IMAGE,
+];
+
+/// Byte ranges of the inline elements touching `caret`: for each inline
+/// flag on a span at the caret, the contiguous run of spans with that flag.
+fn elements_at(spans: &[inkmark_parse::Span], caret: usize) -> Vec<Range<usize>> {
+    let touches = |s: &inkmark_parse::Span| s.range.start <= caret && caret <= s.range.end;
+    let mut runs = Vec::new();
+    for flag in INLINE {
+        let Some(i) = spans
+            .iter()
+            .position(|s| touches(s) && s.style.contains(flag))
+        else {
+            continue;
+        };
+        let (mut a, mut b) = (i, i);
+        while a > 0 && spans[a - 1].style.contains(flag) {
+            a -= 1;
+        }
+        while b + 1 < spans.len() && spans[b + 1].style.contains(flag) {
+            b += 1;
+        }
+        runs.push(spans[a].range.start..spans[b].range.end);
+    }
+    runs
+}
+
+/// Lays out `leaf`, rendered except for the syntax `reveal` picks out
+/// (shown dimmed).
 pub(crate) fn build(
     doc: &Document,
     map: &SourceMap,
     leaf: &Leaf,
-    reveal: Option<Range<usize>>,
+    reveal: Option<Reveal>,
 ) -> LeafLayout {
     let range = leaf.block.range.clone();
     let style = match leaf.block.kind {
@@ -153,18 +198,36 @@ pub(crate) fn build(
             ..Segment::default()
         }],
     };
-    let revealed = |r: &Range<usize>| {
+    let spans = map.spans_in(range.clone());
+    let elements = reveal
+        .as_ref()
+        .map_or_else(Vec::new, |v| elements_at(&spans, v.caret));
+    let on_line = |r: &Range<usize>| {
+        reveal.as_ref().is_some_and(|v| {
+            r.start <= v.line.end && (r.end > v.line.start || r.start == v.line.start)
+        })
+    };
+    let touching = |r: &Range<usize>| {
         reveal
             .as_ref()
-            .is_some_and(|v| r.start <= v.end && (r.end > v.start || r.start == v.start))
+            .is_some_and(|v| r.start <= v.caret && v.caret <= r.end)
     };
-    for span in map.spans_in(range.clone()) {
+    let in_element = |r: &Range<usize>| {
+        elements
+            .iter()
+            .any(|e| e.start <= r.start && r.end <= e.end)
+    };
+    for span in spans.iter().cloned() {
         let r = span.range.start.max(range.start)..span.range.end.min(range.end);
         if r.is_empty() {
             continue;
         }
         let font = b.font(&span);
-        let raw = revealed(&r);
+        let raw = match span.kind {
+            SpanKind::Syntax(Syntax::Delimiter | Syntax::LinkMarkup) => in_element(&r),
+            SpanKind::Syntax(Syntax::Escape) | SpanKind::Replaced(_) => touching(&r),
+            _ => on_line(&r),
+        };
         match &span.kind {
             SpanKind::Text => b.exact(r, font, theme::live_color(&span)),
             SpanKind::Replaced(text) if !raw && r == span.range => {
@@ -266,7 +329,10 @@ mod tests {
     fn layouts(src: &str, reveal_line: Option<usize>) -> (Document, Vec<LeafLayout>) {
         let doc = Document::from_text(src);
         let out = PulldownParser.parse(src);
-        let reveal = reveal_line.map(|l| doc.line_range(l));
+        let reveal = reveal_line.map(|l| Reveal {
+            line: doc.line_range(l),
+            caret: doc.line_range(l).start,
+        });
         let leaves = out
             .blocks
             .leaves_from(0)
@@ -290,10 +356,38 @@ mod tests {
         assert_eq!(texts(&l[1]), vec!["Some bold & code next * line"]);
     }
 
+    fn layout_at(src: &str, caret: usize) -> LeafLayout {
+        let doc = Document::from_text(src);
+        let out = PulldownParser.parse(src);
+        let line = doc.line_range(doc.byte_to_line(caret));
+        let leaf = out.blocks.leaves_from(caret).next().unwrap();
+        build(&doc, &out.map, &leaf, Some(Reveal { line, caret }))
+    }
+
     #[test]
-    fn reveals_raw_source_on_the_caret_line() {
-        let (_, l) = layouts("Some **bold** text\nnext *line*\n", Some(0));
-        assert_eq!(texts(&l[0]), vec!["Some **bold** text next line"]);
+    fn reveals_only_the_element_at_the_caret() {
+        let src = "Some **bold** and *em* with `code` &amp; \\* [a](u)\n";
+        // Caret inside "bold": only its delimiters show.
+        let l = layout_at(src, src.find("old").unwrap());
+        assert_eq!(texts(&l), vec!["Some **bold** and em with code & * a"]);
+        // Touching the start of the code span reveals its backticks.
+        let l = layout_at(src, src.find('`').unwrap());
+        assert_eq!(texts(&l), vec!["Some bold and em with `code` & * a"]);
+        // Next to the entity and the escape: their source.
+        let l = layout_at(src, src.find("&amp;").unwrap() + 2);
+        assert_eq!(texts(&l), vec!["Some bold and em with code &amp; * a"]);
+        let l = layout_at(src, src.find("\\*").unwrap());
+        assert_eq!(texts(&l), vec!["Some bold and em with code & \\* a"]);
+        // Inside the link text: brackets and destination.
+        let l = layout_at(src, src.find("[a").unwrap() + 1);
+        assert_eq!(texts(&l), vec!["Some bold and em with code & * [a](u)"]);
+    }
+
+    #[test]
+    fn block_markers_reveal_on_the_caret_line() {
+        let src = "## Title *x*\n";
+        let l = layout_at(src, src.find("Ti").unwrap());
+        assert_eq!(texts(&l), vec!["## Title x"]);
     }
 
     #[test]
@@ -311,9 +405,10 @@ mod tests {
     fn list_and_quote_prefixes_are_hidden() {
         let (_, l) = layouts("> - one\n>   *two*\n", None);
         assert_eq!(texts(&l[0]), vec!["one two"]);
-        // Even on the caret line, only inline syntax is revealed.
-        let (_, l) = layouts("> - one\n>   *two*\n", Some(1));
-        assert_eq!(texts(&l[0]), vec!["one *two*"]);
+        // Even on the caret line (in the emphasis), prefixes stay hidden.
+        let src = "> - one\n>   *two*\n";
+        let l = layout_at(src, src.find("two").unwrap());
+        assert_eq!(texts(&l), vec!["one *two*"]);
     }
 
     #[test]

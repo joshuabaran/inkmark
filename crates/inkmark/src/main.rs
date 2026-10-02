@@ -38,7 +38,10 @@ enum Pane {
     Live,
 }
 
+mod measure;
+
 fn main() -> eframe::Result {
+    let start = Instant::now();
     let path = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -52,7 +55,9 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
-            Ok(Box::new(App::new(&cc.egui_ctx, path)))
+            let mut app = App::new(&cc.egui_ctx, path);
+            app.measure = measure::Measure::from_env(start);
+            Ok(Box::new(app))
         }),
     )
 }
@@ -91,6 +96,7 @@ struct App {
     close_allowed: bool,
     next_disk_check: Instant,
     title: String,
+    measure: Option<measure::Measure>,
 }
 
 impl App {
@@ -117,6 +123,7 @@ impl App {
             close_allowed: false,
             next_disk_check: Instant::now() + DISK_CHECK_INTERVAL,
             title: String::new(),
+            measure: None,
         };
         if let Some(path) = path {
             app.open(path);
@@ -556,5 +563,25 @@ impl eframe::App for App {
             .show(ui, |ui| self.panes(ui));
         self.confirm_ui(&ctx);
         self.update_title(&ctx);
+        self.measure_step(&ctx);
+    }
+}
+
+impl App {
+    fn measure_step(&mut self, ctx: &egui::Context) {
+        let Some(m) = &mut self.measure else { return };
+        match m.frame(ctx, self.parse.is_settled(), self.doc.line_count()) {
+            measure::Step::Idle => {}
+            measure::Step::ScrollTo(line) => {
+                let pos = inkmark_view::ScrollPos { line, frac: 0.0 };
+                self.code.set_scroll_pos(pos);
+                self.live
+                    .set_scroll_pos(&self.doc, self.parse.output(), pos);
+            }
+            measure::Step::Quit => {
+                self.close_allowed = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+        }
     }
 }

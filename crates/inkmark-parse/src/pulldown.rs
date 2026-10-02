@@ -67,7 +67,8 @@ impl<'a> Builder<'a> {
     }
 
     fn run(mut self) -> ParseOutput {
-        for (event, range) in Parser::new(self.src).into_offset_iter() {
+        let mut events = Parser::new(self.src).into_offset_iter();
+        for (event, range) in events.by_ref() {
             self.track_tight_item(&event, &range);
             match event {
                 Event::Start(tag) => {
@@ -113,9 +114,15 @@ impl<'a> Builder<'a> {
             }
         }
         self.fill_to(self.src.len());
+        let link_defs = events
+            .reference_definitions()
+            .iter()
+            .map(|(label, def)| (crate::normalize_label(label), def.dest.to_string()))
+            .collect();
         ParseOutput {
             blocks: BlockTree::from_blocks(self.blocks),
             map: SourceMap::from_spans(self.spans),
+            link_defs,
         }
     }
 
@@ -537,6 +544,20 @@ mod tests {
         assert_eq!(walk(mid)[0], ("one\n>   two".into(), quote_item));
         // Starting in a gap gives the next leaf.
         assert_eq!(walk(src.find("\n\nend").unwrap() + 1)[0].0, "end");
+    }
+
+    #[test]
+    fn item_index_counts_siblings_only() {
+        let src = "3. a\n3. b\n   - x\n   - y\n3. c\n";
+        let tree = PulldownParser.parse(src).blocks;
+        let blocks: Vec<_> = tree.iter().collect();
+        let list = &blocks[0];
+        let items: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::Item && b.depth == 1)
+            .map(|b| tree.item_index(list, b.range.start))
+            .collect();
+        assert_eq!(items, vec![0, 1, 2]);
     }
 
     #[test]
