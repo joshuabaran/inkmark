@@ -165,6 +165,50 @@ fn up_open_folder_and_refresh_are_in_the_header() {
 }
 
 #[test]
+fn keyboard_scroll_keeps_the_selected_row_in_view() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..80 {
+        fs::write(dir.path().join(format!("note{i:02}.md")), "").unwrap();
+    }
+    let mut h = Harness::new(dir.path());
+    h.wait_until(|browser| browser.row_count() == 80);
+    let names = h.browser.row_names();
+    h.browser.request_focus();
+    for _ in 0..40 {
+        h.press(Key::ArrowDown);
+    }
+    let selected = dir.path().join(&names[39]);
+    let before = h
+        .browser
+        .row_rect(&selected)
+        .expect("the selected row should be on screen");
+    assert!(
+        h.browser.row_rect(&dir.path().join(&names[0])).is_none(),
+        "the list never left the top"
+    );
+
+    let next = dir.path().join(&names[40]);
+    h.press(Key::ArrowDown);
+    let after = h
+        .browser
+        .row_rect(&next)
+        .expect("the next row should be on screen");
+    assert!(
+        (after.top() - before.top()).abs() < 40.0,
+        "one row down jumped from {} to {}",
+        before.top(),
+        after.top()
+    );
+
+    h.browser.set_current(Some(dir.path().join(&names[0])));
+    h.frame(vec![]);
+    assert!(
+        h.browser.row_rect(&dir.path().join(&names[0])).is_some(),
+        "a file above the window was not scrolled back into view"
+    );
+}
+
+#[test]
 fn only_visible_rows_are_painted() {
     let dir = tempfile::tempdir().unwrap();
     for i in 0..400 {

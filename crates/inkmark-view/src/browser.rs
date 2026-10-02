@@ -485,23 +485,30 @@ impl FileBrowser {
         let scroll_to = self.scroll_to.take();
         self.row_rects.clear();
         self.painted = 0;
-        let viewport = ui.available_height();
         let mut area = ScrollArea::vertical()
             .auto_shrink([false, false])
             .id_salt(self.id);
-        // Aligning an already-visible row to the top hides the rows above it
-        // under the header, where clicks miss. A zero-height first frame
-        // keeps the request for the next one.
-        if let Some(offset) = scroll_to {
-            if viewport <= ROW_H {
-                self.scroll_to = Some(offset);
-            } else if offset + ROW_H > viewport {
-                area = area.vertical_scroll_offset(offset);
-            }
-        }
         let mut clicked = None;
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
+            // Compare the row with the range on screen, not with the height
+            // alone. A row above the window has a small absolute offset, and
+            // a row one past the bottom should move by one row.
+            if let Some(row_y) = scroll_to {
+                let viewport = ui.available_height();
+                if viewport <= ROW_H {
+                    self.scroll_to = Some(row_y);
+                } else {
+                    // ScrollArea salts the id again, so load the same `IdSalt`.
+                    let scroll_id = ui.make_persistent_id(egui::IdSalt::new(self.id));
+                    let current = egui::containers::scroll_area::State::load(ui.ctx(), scroll_id)
+                        .map(|state| state.offset.y)
+                        .unwrap_or(0.0);
+                    if let Some(offset) = offset_to_reveal(row_y, current, viewport) {
+                        area = area.vertical_scroll_offset(offset);
+                    }
+                }
+            }
             area.show_rows(ui, ROW_H, rows.len(), |ui, range| {
                 self.painted = range.len();
                 for index in range {
@@ -528,7 +535,9 @@ impl FileBrowser {
         if !width.is_finite() {
             return None;
         }
-        let (rect, response) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
+        // Not focusable: arrow keys move egui focus to the next focusable
+        // widget, which would take the tree's keys after one press.
+        let (rect, response) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::CLICK);
         let selected = self.selected.as_deref() == Some(row.path.as_path());
         let current = self.current.as_deref() == Some(row.path.as_path());
         if selected {
@@ -582,6 +591,21 @@ impl FileBrowser {
 impl Drop for FileBrowser {
     fn drop(&mut self) {
         let _ = self.tx.send(Job::Stop);
+    }
+}
+
+/// Smallest offset that puts `[row_y, row_y + ROW_H]` inside the window.
+/// `None` when it is already fully visible, so a visible row is not pinned
+/// to the top (that scrolls the rows above it under the header).
+fn offset_to_reveal(row_y: f32, current: f32, viewport: f32) -> Option<f32> {
+    let row_bottom = row_y + ROW_H;
+    let view_bottom = current + viewport;
+    if row_y + 0.5 < current {
+        Some(row_y.max(0.0))
+    } else if row_bottom > view_bottom + 0.5 {
+        Some((row_bottom - viewport).max(0.0))
+    } else {
+        None
     }
 }
 
