@@ -32,24 +32,181 @@ const CARET_WIDTH: f32 = 2.0;
 const NEWLINE_WIDTH: f32 = 6.0;
 /// Space between a paragraph's text and an image below it.
 const IMAGE_GAP: f32 = 6.0;
+/// Table cell padding and the space above and below a table.
+const CELL_PAD_X: f32 = 10.0;
+const CELL_PAD_Y: f32 = 5.0;
+const TABLE_PAD: f32 = 6.0;
+/// Narrowest a table column gets before its text wraps.
+const MIN_COLUMN: f32 = 48.0;
 const REVEAL_FRAMES: u8 = 3;
 /// Height of a blank source line, in rows.
 const BLANK_LINE: f32 = 0.6;
 
+/// Laid-out text: a leaf's (or a table cell's) display segments.
+struct Body {
+    layout: LeafLayout,
+    seg_tops: Vec<f32>,
+    geometry: Vec<LineGeometry>,
+    /// The source bytes it shows.
+    range: Range<usize>,
+    /// Width it was wrapped at: drawing must use the same layout.
+    wrap: f32,
+}
+
+impl Body {
+    /// The segment at height `y` (from the body's top).
+    fn segment_at(&self, y: f32) -> usize {
+        self.seg_tops.iter().rposition(|&t| t <= y).unwrap_or(0)
+    }
+
+    /// Caret rect for source offset `at`, from the body's top-left.
+    fn caret_rect(&self, at: usize) -> Rect {
+        let (seg, d) = self.layout.display_pos(at);
+        self.geometry[seg]
+            .caret_rect(d, CARET_WIDTH)
+            .translate(vec2(0.0, self.seg_tops[seg]))
+    }
+
+    /// Source offset at `local` (from the body's top-left).
+    fn hit(&self, local: Vec2) -> usize {
+        let seg = self.segment_at(local.y);
+        let d = self.geometry[seg].hit(vec2(local.x, local.y - self.seg_tops[seg]));
+        self.layout.source_pos(seg, d)
+    }
+
+    /// Start or end of the visual row holding `at`.
+    fn row_edge(&self, at: usize, end: bool) -> usize {
+        let (seg, d) = self.layout.display_pos(at);
+        let g = &self.geometry[seg];
+        let row = g.row_of(d);
+        let d = if end {
+            g.hit_row(row, f32::INFINITY)
+        } else {
+            g.rows[row].start
+        };
+        self.layout.source_pos(seg, d)
+    }
+
+    /// Widest visual row, for table column sizing and alignment.
+    fn width(&self) -> f32 {
+        self.geometry
+            .iter()
+            .flat_map(|g| g.rows.iter())
+            .filter_map(|r| r.clusters.last().map(|c| c.x + c.w))
+            .fold(0.0, f32::max)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+/// A GFM table laid out as a grid. Coordinates are from the table's
+/// top-left (the leaf's text origin).
+struct Grid {
+    cells: Vec<GridCell>,
+    col_x: Vec<f32>,
+    col_w: Vec<f32>,
+    row_y: Vec<f32>,
+    row_h: Vec<f32>,
+    has_head: bool,
+}
+
+struct GridCell {
+    body: Body,
+    /// Where the cell's text starts.
+    origin: Vec2,
+}
+
+impl Grid {
+    fn width(&self) -> f32 {
+        self.col_x
+            .last()
+            .zip(self.col_w.last())
+            .map_or(0.0, |(x, w)| x + w)
+    }
+
+    fn height(&self) -> f32 {
+        self.row_y
+            .last()
+            .zip(self.row_h.last())
+            .map_or(0.0, |(y, h)| y + h)
+    }
+
+    /// The cell showing source offset `at` (or the nearest one after it).
+    fn cell_for(&self, at: usize) -> Option<&GridCell> {
+        self.cells
+            .iter()
+            .find(|c| c.body.range.start <= at && at <= c.body.range.end)
+            .or_else(|| self.cells.iter().find(|c| c.body.range.start >= at))
+            .or_else(|| self.cells.last())
+    }
+
+    /// The cell under `local`: by row, then by column.
+    fn cell_at(&self, local: Vec2) -> Option<&GridCell> {
+        let row = self.row_y.iter().rposition(|&y| y <= local.y).unwrap_or(0);
+        let col = self.col_x.iter().rposition(|&x| x <= local.x).unwrap_or(0);
+        let top = self.row_y.get(row).copied().unwrap_or(0.0);
+        let left = self.col_x.get(col).copied().unwrap_or(0.0);
+        self.cells
+            .iter()
+            .filter(|c| (c.origin.y - top).abs() < self.row_h[row] && c.origin.y >= top)
+            .min_by(|a, b| {
+                (a.origin.x - left)
+                    .abs()
+                    .total_cmp(&(b.origin.x - left).abs())
+            })
+            .filter(|_| !self.cells.is_empty())
+            .or_else(|| self.cells.last())
+    }
+}
+
 /// A leaf block laid out for this frame.
 struct Placed {
     leaf: Leaf,
-    layout: LeafLayout,
+    body: Body,
+    /// Set for tables: the grid replaces `body` for drawing and hit-testing.
+    table: Option<Grid>,
     first_line: usize,
     last_line: usize,
     /// Text left edge, from the pane's content left.
     indent: f32,
-    seg_tops: Vec<f32>,
-    geometry: Vec<LineGeometry>,
     /// An image-only paragraph away from the caret shows just its images.
     text_hidden: bool,
     images: Vec<PlacedImage>,
     height: f32,
+}
+
+impl Placed {
+    /// Caret rect for `at`, from the leaf's text origin.
+    fn caret_rect(&self, at: usize) -> Rect {
+        match self.table.as_ref().and_then(|g| g.cell_for(at)) {
+            Some(cell) => cell
+                .body
+                .caret_rect(at)
+                .translate(cell.origin + vec2(0.0, TABLE_PAD)),
+            None => self.body.caret_rect(at),
+        }
+    }
+
+    /// Source offset at `local`, from the leaf's text origin.
+    fn hit(&self, local: Vec2) -> usize {
+        let local_in_table = local - vec2(0.0, TABLE_PAD);
+        match self.table.as_ref().and_then(|g| g.cell_at(local_in_table)) {
+            Some(cell) => cell.body.hit(local_in_table - cell.origin),
+            None => self.body.hit(local),
+        }
+    }
+
+    fn row_edge(&self, at: usize, end: bool) -> usize {
+        match self.table.as_ref().and_then(|g| g.cell_for(at)) {
+            Some(cell) => cell.body.row_edge(at, end),
+            None => self.body.row_edge(at, end),
+        }
+    }
 }
 
 /// An image below a leaf's text, in leaf coordinates.
@@ -58,13 +215,6 @@ struct PlacedImage {
     size: Vec2,
     slot: ImageSlot,
     dest: String,
-}
-
-impl Placed {
-    /// The segment at height `y` (from the leaf top).
-    fn segment_at(&self, y: f32) -> usize {
-        self.seg_tops.iter().rposition(|&t| t <= y).unwrap_or(0)
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -429,7 +579,7 @@ impl LiveView {
         let mut images = Vec::new();
         if has_image && let Some(cache) = &self.images {
             let base = doc.path().and_then(|p| p.parent());
-            for image in inline_images(&doc.slice(range), link_defs) {
+            for image in inline_images(&doc.slice(range.clone()), link_defs) {
                 let slot = cache.get(&image.dest, base);
                 let size = match &slot {
                     ImageSlot::Ready { size, .. } if size.x > wrap => *size * (wrap / size.x),
@@ -449,17 +599,189 @@ impl LiveView {
                 y += size.y;
             }
         }
+        let body = Body {
+            layout,
+            seg_tops,
+            geometry,
+            range: range.clone(),
+            wrap,
+        };
+        let (table, height) = if matches!(leaf.block.kind, BlockKind::Table { .. }) {
+            let grid = self.place_table(doc, parse, &leaf.block, width - containers);
+            let h = grid.height() + 2.0 * TABLE_PAD;
+            (Some(grid), h)
+        } else {
+            (None, y + pad_bottom)
+        };
         Placed {
             first_line,
             last_line,
             indent: containers + inner,
-            height: y + pad_bottom,
+            height,
             leaf,
-            layout,
-            seg_tops,
-            geometry,
+            body,
+            table,
             text_hidden,
             images,
+        }
+    }
+
+    /// Lays a GFM table out as a grid: each cell like a small paragraph,
+    /// columns at their natural width, shrunk (and wrapped) to fit `avail`.
+    fn place_table(
+        &mut self,
+        doc: &Document,
+        parse: &ParseOutput,
+        table: &inkmark_parse::Block,
+        avail: f32,
+    ) -> Grid {
+        let rows = parse.blocks.table_rows(table);
+        let declared = match table.kind {
+            BlockKind::Table { columns } => usize::from(columns),
+            _ => 0,
+        };
+        let columns = rows
+            .iter()
+            .map(|r| r.1.len())
+            .max()
+            .unwrap_or(0)
+            .max(declared)
+            .max(1);
+        let aligns = table_alignments(doc, &rows, columns);
+        let reveal = self.reveal(doc);
+        let layouts: Vec<Vec<(inkmark_parse::Block, LeafLayout)>> = rows
+            .iter()
+            .map(|(_, cells)| {
+                cells
+                    .iter()
+                    .take(columns)
+                    .map(|cell| {
+                        let leaf = Leaf {
+                            block: cell.clone(),
+                            containers: Vec::new(),
+                        };
+                        (
+                            cell.clone(),
+                            live_layout::build(doc, &parse.map, &leaf, reveal.clone()),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let measure = |text: &mut TextRenderer, layout: &LeafLayout, wrap: f32| -> Body {
+            let mut y = 0.0;
+            let mut seg_tops = Vec::new();
+            let mut geometry = Vec::new();
+            for seg in &layout.segments {
+                let g = text.rich_geometry(RichLine {
+                    text: &seg.text,
+                    runs: &seg.runs,
+                    wrap_width: Some(wrap),
+                });
+                seg_tops.push(y);
+                y += g.height();
+                geometry.push(g);
+            }
+            Body {
+                layout: layout.clone(),
+                seg_tops,
+                geometry,
+                range: 0..0,
+                wrap,
+            }
+        };
+        // Each column's widest cell unwrapped (max) and its longest word
+        // (min). Columns get their max if everything fits; otherwise the
+        // space above the minimums is shared in proportion, so short
+        // columns aren't broken mid-word to make room for long ones.
+        let mut max_w = vec![MIN_COLUMN; columns];
+        let mut min_w = vec![MIN_COLUMN; columns];
+        for row in &layouts {
+            for (c, (_, layout)) in row.iter().enumerate() {
+                // A little slack: wrapping at exactly the measured width can
+                // still break the line after pixel rounding.
+                let natural = measure(&mut self.text, layout, 100_000.0).width() + 2.0;
+                max_w[c] = max_w[c].max(natural + 2.0 * CELL_PAD_X);
+                let word = layout
+                    .segments
+                    .iter()
+                    .flat_map(|seg| seg.text.split_whitespace())
+                    .map(|w| {
+                        self.text.geometry(w).rows[0]
+                            .clusters
+                            .last()
+                            .map_or(0.0, |c| c.x + c.w)
+                    })
+                    .fold(0.0, f32::max);
+                // Bold header text is a bit wider than the plain measure.
+                min_w[c] = min_w[c]
+                    .max(word * 1.1 + 2.0 + 2.0 * CELL_PAD_X)
+                    .min(max_w[c]);
+            }
+        }
+        let (sum_max, sum_min): (f32, f32) = (max_w.iter().sum(), min_w.iter().sum());
+        let col_w: Vec<f32> = if sum_max <= avail {
+            max_w
+        } else if sum_min >= avail {
+            min_w
+        } else {
+            let share = (avail - sum_min) / (sum_max - sum_min);
+            min_w
+                .iter()
+                .zip(&max_w)
+                .map(|(lo, hi)| lo + (hi - lo) * share)
+                .collect()
+        };
+        let col_x: Vec<f32> = col_w
+            .iter()
+            .scan(0.0, |x, w| {
+                let at = *x;
+                *x += w;
+                Some(at)
+            })
+            .collect();
+        let row_min = self.text.row_height() + 2.0 * CELL_PAD_Y;
+        let mut cells = Vec::new();
+        let mut row_y = Vec::new();
+        let mut row_h = Vec::new();
+        let mut y = 0.0;
+        for row in &layouts {
+            let mut h = row_min;
+            let start = cells.len();
+            for (c, (block, layout)) in row.iter().enumerate() {
+                let inner = col_w[c] - 2.0 * CELL_PAD_X;
+                let mut body = measure(&mut self.text, layout, inner.max(8.0));
+                body.range = block.range.clone();
+                let text_h = body.seg_tops.last().copied().unwrap_or(0.0)
+                    + body.geometry.last().map_or(0.0, |g| g.height());
+                h = h.max(text_h + 2.0 * CELL_PAD_Y);
+                let slack = (inner - body.width()).max(0.0);
+                let dx = match aligns[c] {
+                    Align::Left => 0.0,
+                    Align::Center => slack / 2.0,
+                    Align::Right => slack,
+                };
+                cells.push(GridCell {
+                    body,
+                    origin: vec2(col_x[c] + CELL_PAD_X + dx, y + CELL_PAD_Y),
+                });
+            }
+            for cell in &mut cells[start..] {
+                cell.origin.y = y + CELL_PAD_Y;
+            }
+            row_y.push(y);
+            row_h.push(h);
+            y += h;
+        }
+        Grid {
+            cells,
+            col_x,
+            col_w,
+            row_y,
+            row_h,
+            has_head: rows
+                .first()
+                .is_some_and(|r| r.0.kind == BlockKind::TableHead),
         }
     }
 
@@ -482,10 +804,8 @@ impl LiveView {
         let line = doc.byte_to_line(head);
         match self.place_line(doc, parse, line, frame.width) {
             Some(p) => {
-                let (seg, d) = p.layout.display_pos(head);
-                let r = p.geometry[seg].caret_rect(d, CARET_WIDTH);
-                let top = self.lines.heights.offset_of(p.first_line)
-                    + f64::from(p.seg_tops[seg] + r.top());
+                let r = p.caret_rect(head);
+                let top = self.lines.heights.offset_of(p.first_line) + f64::from(r.top());
                 (top, p.indent + r.left(), r.height())
             }
             None => (
@@ -509,9 +829,7 @@ impl LiveView {
         match self.place_line(doc, parse, at.line, frame.width) {
             Some(p) => {
                 let local = (y - self.lines.heights.offset_of(p.first_line)) as f32;
-                let seg = p.segment_at(local);
-                let d = p.geometry[seg].hit(vec2(x - p.indent, local - p.seg_tops[seg]));
-                p.layout.source_pos(seg, d)
+                p.hit(vec2(x - p.indent, local))
             }
             None => doc.line_to_byte(at.line),
         }
@@ -607,15 +925,7 @@ impl LiveView {
         let Some(p) = self.place_line(doc, parse, line, frame.width) else {
             return doc.line_to_byte(line);
         };
-        let (seg, d) = p.layout.display_pos(head);
-        let g = &p.geometry[seg];
-        let row = g.row_of(d);
-        let d = if end {
-            g.hit_row(row, f32::INFINITY)
-        } else {
-            g.rows[row].start
-        };
-        p.layout.source_pos(seg, d)
+        p.row_edge(head, end)
     }
 
     // ---- input ---------------------------------------------------------------
@@ -641,6 +951,12 @@ impl LiveView {
                     self.replace_selection(doc, &text, EditKind::Other)
                 }
                 Event::Text(text) if self.preedit.is_empty() => {
+                    // A bare `|` would split a table cell.
+                    let text = if self.table_at_caret(doc, parse).is_some() {
+                        text.replace('|', "\\|")
+                    } else {
+                        text
+                    };
                     self.replace_selection(doc, &text, EditKind::Typing)
                 }
                 Event::Ime(ImeEvent::Preedit { text, .. }) => {
@@ -731,6 +1047,86 @@ impl LiveView {
         true
     }
 
+    /// The table around the caret: its rows (with cells), and the caret's
+    /// row and column. `None` outside tables and on the delimiter row.
+    fn table_at_caret(&self, doc: &Document, parse: &ParseOutput) -> Option<TableAt> {
+        let head = self.selection.head;
+        let line = doc.byte_to_line(head);
+        let leaf = leaf_at_line(doc, parse, line)?;
+        if !matches!(leaf.block.kind, BlockKind::Table { .. }) {
+            return None;
+        }
+        let rows = parse.blocks.table_rows(&leaf.block);
+        let row = rows
+            .iter()
+            .position(|(r, _)| doc.byte_to_line(r.range.start) == line)?;
+        let col = rows[row]
+            .1
+            .iter()
+            .rposition(|c| c.range.start <= head)
+            .unwrap_or(0);
+        Some(TableAt { rows, row, col })
+    }
+
+    /// Tab / Shift+Tab / Enter inside a table. `None` when not in one.
+    fn table_key(
+        &mut self,
+        doc: &mut Document,
+        parse: &ParseOutput,
+        key: Key,
+        shift: bool,
+    ) -> Option<bool> {
+        let t = self.table_at_caret(doc, parse)?;
+        let cells: Vec<(usize, usize)> = t
+            .rows
+            .iter()
+            .enumerate()
+            .flat_map(|(r, (_, cells))| (0..cells.len()).map(move |c| (r, c)))
+            .collect();
+        let here = cells.iter().position(|&rc| rc == (t.row, t.col))?;
+        let goto = |this: &mut Self, (r, c): (usize, usize)| {
+            let at = cell_text_start(doc, &t.rows[r].1[c]);
+            this.move_to(at, false);
+            false
+        };
+        Some(match key {
+            Key::Tab if shift => here.checked_sub(1).is_some_and(|k| goto(self, cells[k])),
+            Key::Tab if here + 1 < cells.len() => goto(self, cells[here + 1]),
+            Key::Tab => self.add_table_row(doc, &t),
+            // A line break would end the row; Shift+Enter does nothing here.
+            Key::Enter if shift => false,
+            Key::Enter if t.row + 1 < t.rows.len() => {
+                let below = &t.rows[t.row + 1].1;
+                if below.is_empty() {
+                    false
+                } else {
+                    goto(self, (t.row + 1, t.col.min(below.len() - 1)))
+                }
+            }
+            Key::Enter => self.add_table_row(doc, &t),
+            _ => return None,
+        })
+    }
+
+    /// Adds an empty row below the caret's and puts the caret in its first cell.
+    fn add_table_row(&mut self, doc: &mut Document, t: &TableAt) -> bool {
+        let columns = t.rows.iter().map(|r| r.1.len()).max().unwrap_or(1).max(1);
+        let row = &t.rows[t.row].0;
+        let line = doc.byte_to_line(row.range.end.saturating_sub(1).max(row.range.start));
+        let end = doc.line_range(line).end;
+        let text = format!("\n|{}", "  |".repeat(columns));
+        // After "\n| ", between the first cell's two spaces.
+        let caret = end + 3;
+        self.apply_plan(
+            doc,
+            EditPlan {
+                edits: vec![Edit::insert(end, text)],
+                selection: Selection::caret(caret),
+                kind: EditKind::Other,
+            },
+        )
+    }
+
     /// Whether the caret is in a code or HTML block, where Enter keeps
     /// indentation instead of starting a paragraph.
     fn in_code(&self, doc: &Document, parse: &ParseOutput) -> bool {
@@ -754,6 +1150,14 @@ impl LiveView {
         let (cmd, shift, alt) = (modifiers.command, modifiers.shift, modifiers.alt);
         let sel = self.selection;
         let range = sel.range();
+        if !cmd
+            && !alt
+            && range.is_empty()
+            && matches!(key, Key::Tab | Key::Enter)
+            && let Some(edited) = self.table_key(doc, parse, key, shift)
+        {
+            return edited;
+        }
         match key {
             // Editing.
             Key::Backspace | Key::Delete if !range.is_empty() => {
@@ -972,9 +1376,8 @@ impl LiveView {
             }
             self.draw_leaf(painter, &mut meshes, doc, parse, &p, frame, y, &selection);
             if (p.first_line..=p.last_line).contains(&caret_line) {
-                let (seg, d) = p.layout.display_pos(self.selection.head);
-                let r = p.geometry[seg].caret_rect(d, CARET_WIDTH);
-                caret = Some(r.translate(vec2(frame.left + p.indent, y + p.seg_tops[seg])));
+                let r = p.caret_rect(self.selection.head);
+                caret = Some(r.translate(vec2(frame.left + p.indent, y)));
             }
             y += p.height;
             line = p.last_line + 1;
@@ -1088,6 +1491,66 @@ impl LiveView {
         m.paint_viewport(painter, ui.rect_contains_pointer(rect));
     }
 
+    /// Draws `body`'s segments at `origin`, with selection highlights and
+    /// strikethrough lines. `hidden` draws only the selection.
+    fn draw_body(
+        &mut self,
+        painter: &egui::Painter,
+        meshes: &mut GlyphMeshes,
+        body: &Body,
+        origin: Pos2,
+        selection: &Range<usize>,
+        hidden: bool,
+    ) {
+        let range = body.range.clone();
+        let sel = selection.start.max(range.start)..selection.end.min(range.end);
+        let (s_seg, s_d) = body.layout.display_pos(sel.start);
+        let (e_seg, e_d) = body.layout.display_pos(sel.end);
+        for (i, seg) in body.layout.segments.iter().enumerate() {
+            let o = pos2(origin.x, origin.y + body.seg_tops[i]);
+            if !selection.is_empty() && sel.start < sel.end && (s_seg..=e_seg).contains(&i) {
+                let start = if i == s_seg { s_d } else { 0 };
+                let end = if i == e_seg { e_d } else { seg.text.len() };
+                let mut rects = Vec::new();
+                body.geometry[i].selection_rects(
+                    start..end,
+                    i < e_seg || selection.end > range.end,
+                    NEWLINE_WIDTH,
+                    &mut rects,
+                );
+                for r in rects {
+                    painter.rect_filled(r.translate(o.to_vec2()), 0.0, SELECTION);
+                }
+            }
+            if hidden || (body.layout.style == LeafStyle::Rule && seg.text.is_empty()) {
+                continue;
+            }
+            self.text.draw_rich(
+                meshes,
+                RichLine {
+                    text: &seg.text,
+                    runs: &seg.runs,
+                    wrap_width: Some(body.wrap),
+                },
+                o,
+                TEXT,
+                &seg.colors,
+            );
+            for strike in &seg.strikes {
+                let mut rects = Vec::new();
+                body.geometry[i].selection_rects(strike.clone(), false, 0.0, &mut rects);
+                for r in rects {
+                    let r = r.translate(o.to_vec2());
+                    painter.hline(
+                        r.x_range(),
+                        r.top() + r.height() * 0.55,
+                        Stroke::new(1.3, theme::STRUCK),
+                    );
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn draw_leaf(
         &mut self,
@@ -1110,8 +1573,9 @@ impl LiveView {
                     painter.rect_filled(bar, 1.0, QUOTE_BAR);
                 }
                 BlockKind::Item if doc.byte_to_line(c.range.start) == p.first_line => {
-                    let y = top + p.seg_tops.first().copied().unwrap_or(0.0);
+                    let y = top + p.body.seg_tops.first().copied().unwrap_or(0.0);
                     let row = p
+                        .body
                         .geometry
                         .first()
                         .and_then(|g| g.rows.first())
@@ -1152,67 +1616,53 @@ impl LiveView {
             }
             x += container_indent(c);
         }
-        match p.layout.style {
+        match p.body.layout.style {
             LeafStyle::Code | LeafStyle::Html => {
                 let bg = Rect::from_min_max(pos2(x, top + 2.0), pos2(right, top + p.height - 2.0));
                 painter.rect_filled(bg, 4.0, CODE_BACKGROUND);
             }
-            LeafStyle::Rule if p.layout.segments.iter().all(|s| s.text.is_empty()) => {
+            LeafStyle::Rule if p.body.layout.segments.iter().all(|s| s.text.is_empty()) => {
                 let y = top + p.height / 2.0;
                 painter.line_segment([pos2(x, y), pos2(right, y)], Stroke::new(1.5, RULE));
             }
             _ => {}
         }
         let text_left = frame.left + p.indent;
-        let leaf_range = p.leaf.block.range.clone();
-        let sel_in_leaf = selection.start.max(leaf_range.start)..selection.end.min(leaf_range.end);
-        let (s_seg, s_d) = p.layout.display_pos(sel_in_leaf.start);
-        let (e_seg, e_d) = p.layout.display_pos(sel_in_leaf.end);
-        for (i, seg) in p.layout.segments.iter().enumerate() {
-            let origin = pos2(text_left, top + p.seg_tops[i]);
-            if !selection.is_empty()
-                && sel_in_leaf.start < sel_in_leaf.end
-                && (s_seg..=e_seg).contains(&i)
-            {
-                let start = if i == s_seg { s_d } else { 0 };
-                let end = if i == e_seg { e_d } else { seg.text.len() };
-                let mut rects = Vec::new();
-                p.geometry[i].selection_rects(
-                    start..end,
-                    i < e_seg || selection.end > leaf_range.end,
-                    NEWLINE_WIDTH,
-                    &mut rects,
+        if let Some(grid) = &p.table {
+            let origin = pos2(text_left, top + TABLE_PAD);
+            let r = Rect::from_min_size(origin, vec2(grid.width(), grid.height()));
+            if grid.has_head && !grid.row_h.is_empty() {
+                let head = Rect::from_min_size(origin, vec2(grid.width(), grid.row_h[0]));
+                painter.rect_filled(head, 0.0, CODE_BACKGROUND);
+            }
+            let line = Stroke::new(1.0, QUOTE_BAR);
+            for y in grid.row_y.iter().skip(1) {
+                painter.hline(r.x_range(), origin.y + y, line);
+            }
+            for x in grid.col_x.iter().skip(1) {
+                painter.vline(origin.x + x, r.y_range(), line);
+            }
+            painter.rect_stroke(r, 3.0, line, StrokeKind::Inside);
+            for cell in &grid.cells {
+                self.draw_body(
+                    painter,
+                    meshes,
+                    &cell.body,
+                    origin + cell.origin,
+                    selection,
+                    false,
                 );
-                for r in rects {
-                    painter.rect_filled(r.translate(origin.to_vec2()), 0.0, SELECTION);
-                }
             }
-            if p.text_hidden || (p.layout.style == LeafStyle::Rule && seg.text.is_empty()) {
-                continue;
-            }
-            self.text.draw_rich(
+        } else {
+            let hidden = p.text_hidden;
+            self.draw_body(
+                painter,
                 meshes,
-                RichLine {
-                    text: &seg.text,
-                    runs: &seg.runs,
-                    wrap_width: Some(frame.width - p.indent),
-                },
-                origin,
-                TEXT,
-                &seg.colors,
+                &p.body,
+                pos2(text_left, top),
+                selection,
+                hidden,
             );
-            for strike in &seg.strikes {
-                let mut rects = Vec::new();
-                p.geometry[i].selection_rects(strike.clone(), false, 0.0, &mut rects);
-                for r in rects {
-                    let r = r.translate(origin.to_vec2());
-                    painter.hline(
-                        r.x_range(),
-                        r.top() + r.height() * 0.55,
-                        Stroke::new(1.3, theme::STRUCK),
-                    );
-                }
-            }
         }
         for image in &p.images {
             let r = Rect::from_min_size(pos2(text_left, top + image.top), image.size);
@@ -1232,6 +1682,53 @@ impl LiveView {
             self.text.draw_line(meshes, &label, label_pos, MARKUP);
         }
     }
+}
+
+/// The caret's place in a table (see `LiveView::table_at_caret`).
+struct TableAt {
+    rows: Vec<(inkmark_parse::Block, Vec<inkmark_parse::Block>)>,
+    row: usize,
+    col: usize,
+}
+
+/// Where typing in `cell` should start: its first non-space byte, or just
+/// inside the padding of an empty cell.
+fn cell_text_start(doc: &Document, cell: &inkmark_parse::Block) -> usize {
+    let text = doc.slice(cell.range.clone());
+    let lead = text.len() - text.trim_start().len();
+    if lead == text.len() {
+        cell.range.start + text.len().min(1)
+    } else {
+        cell.range.start + lead
+    }
+}
+
+/// Column alignments from a table's delimiter row (`:--`, `:-:`, `--:`),
+/// the line after the header.
+fn table_alignments(
+    doc: &Document,
+    rows: &[(inkmark_parse::Block, Vec<inkmark_parse::Block>)],
+    columns: usize,
+) -> Vec<Align> {
+    let mut aligns = vec![Align::Left; columns];
+    let Some((head, _)) = rows.first() else {
+        return aligns;
+    };
+    let line = doc.byte_to_line(head.range.end.saturating_sub(1).max(head.range.start)) + 1;
+    if line >= doc.line_count() {
+        return aligns;
+    }
+    let text = doc.slice(doc.line_range(line)).into_owned();
+    let trimmed = text.trim().trim_start_matches('|').trim_end_matches('|');
+    for (i, part) in trimmed.split('|').take(columns).enumerate() {
+        let part = part.trim();
+        aligns[i] = match (part.starts_with(':'), part.ends_with(':')) {
+            (true, true) => Align::Center,
+            (false, true) => Align::Right,
+            _ => Align::Left,
+        };
+    }
+    aligns
 }
 
 /// The GFM task marker of the item starting at `item_start`, if any:

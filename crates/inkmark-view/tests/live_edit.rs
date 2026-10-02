@@ -262,7 +262,8 @@ fn ime_commits_into_the_source() {
 #[test]
 fn fuzzed_mixed_editing_keeps_invariants() {
     let src = "# Title *em*\n\nSome **bold** text, `code` and a [link](http://x).\n\n\
-               > quote with *emphasis*\n> - nested item\n\n1. one\n2. two\n\n```\ncode\n```\n\nEnd\n";
+               > quote with *emphasis*\n> - nested item\n\n1. one\n2. two\n\n```\ncode\n```\n\n\
+               | a | b |\n|:--|--:|\n| c | ~~d~~ |\n\n- [ ] task www.x.com\n\nEnd\n";
     let mut s = Split::new(src);
     let mut seed = 0xfeed_u64;
     let mut rand = move |n: u64| {
@@ -388,4 +389,67 @@ fn clicking_a_checkbox_toggles_the_task() {
     );
     s.click(pos2(LIVE_X + 38.0, 13.0));
     assert_eq!(s.text(), "- [ ] write tests\n- [x] ship\n");
+}
+
+#[test]
+fn table_cells_edit_and_tab_between() {
+    let src = "| a | b |\n|---|---|\n| c | d |\n";
+    let mut s = Split::new(src);
+    s.caret(src.find('a').unwrap() + 1);
+    s.type_text("X");
+    assert_eq!(s.text(), "| aX | b |\n|---|---|\n| c | d |\n");
+    // A typed pipe can't split the cell.
+    s.type_text("|");
+    assert_eq!(s.text(), "| aX\\| | b |\n|---|---|\n| c | d |\n");
+    s.press(Key::Tab);
+    s.type_text("Y");
+    assert_eq!(s.text(), "| aX\\| | Yb |\n|---|---|\n| c | d |\n");
+    s.key(Key::Tab, Modifiers::SHIFT);
+    assert_eq!(
+        s.live.selection(),
+        Selection::caret(2),
+        "back to the first cell's text"
+    );
+    // Tab through to the last cell, then once more adds a row.
+    for _ in 0..3 {
+        s.press(Key::Tab);
+    }
+    s.press(Key::Tab);
+    s.type_text("e");
+    assert_eq!(s.text(), "| aX\\| | Yb |\n|---|---|\n| c | d |\n| e |  |\n");
+}
+
+#[test]
+fn enter_moves_down_a_column_and_adds_rows() {
+    let src = "| h1 | h2 |\n|:---|---:|\n| a  | b  |\n";
+    let mut s = Split::new(src);
+    s.caret(src.find("h2").unwrap());
+    s.press(Key::Enter);
+    assert_eq!(
+        s.live.selection(),
+        Selection::caret(src.find(" b").unwrap() + 1)
+    );
+    s.press(Key::Enter);
+    s.type_text("z");
+    assert_eq!(s.text(), format!("{src}| z |  |\n"));
+}
+
+#[test]
+fn up_and_down_move_between_table_rows() {
+    let src = "| left | right |\n|------|-------|\n| one  | two   |\n| three | four |\n";
+    let mut s = Split::new(src);
+    s.caret(src.find("two").unwrap() + 1);
+    s.press(Key::ArrowDown);
+    let head = s.live.selection().head;
+    assert!(
+        (src.find("four").unwrap()..=src.find("four").unwrap() + 4).contains(&head),
+        "down stays in the right-hand column: {head}"
+    );
+    s.press(Key::ArrowUp);
+    s.press(Key::ArrowUp);
+    let head = s.live.selection().head;
+    assert!(
+        (src.find("right").unwrap()..=src.find("right").unwrap() + 5).contains(&head),
+        "up reaches the header cell: {head}"
+    );
 }

@@ -157,6 +157,15 @@ fn bench_parse_5mb() {
     let start = Instant::now();
     let mut out = PulldownParser.parse(&text);
     let full = start.elapsed();
+    let gfm_text = format!("{text}{}", GFM_SAMPLE.repeat(1000));
+    let start = Instant::now();
+    let gfm = GfmParser.parse(&gfm_text);
+    println!(
+        "GFM: {:.1} MB with 1000 tables/task lists: full parse {:.0} ms, {} spans",
+        gfm_text.len() as f64 / 1e6,
+        start.elapsed().as_secs_f64() * 1000.0,
+        gfm.map.span_count()
+    );
 
     let mut doc = Document::from_text(&text);
     let mid = doc.line_to_byte(doc.line_count() / 2);

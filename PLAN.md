@@ -269,7 +269,6 @@ Measured 2026-10-02 on the Omarchy host (240 Hz 1440p monitor, scale 1, Mesa rad
 
 ## Known issues and next steps
 
-- **GFM** (tables, task lists, strikethrough, autolinks) is in progress: see the GFM milestone below.
 - **Fallback glyphs in the code pane** (box drawing, CJK) don't snap to whole monospace cells, so ASCII-art alignment can be off.
 - **Images:** no SVG; remote URLs aren't fetched (MVP has no network); reference definitions deleted by a local edit linger until the next full parse.
 
@@ -281,3 +280,5 @@ Measured 2026-10-02 on the Omarchy host (240 Hz 1440p monitor, scale 1, Mesa rad
 | **G2** | Code pane + commands | Code pane colors the new syntax; the app parses GFM; Ctrl+Shift+X toggles strikethrough, Ctrl+Enter toggles a task, Enter continues task items |
 | **G3** | Live rendering | Strikethrough, clickable task checkboxes (a click is a one-byte source patch), autolinks styled as links |
 | **G4** | Live tables | Grid layout with alignment; typing in a cell patches that cell; Tab/Shift+Tab between cells; Enter in the last row adds a row; a typed `\|` is escaped. Re-padding columns to keep pipes aligned is out of scope |
+
+**GFM done 2026-10-02:** G1 `57ad8a8` · G2 `9114853` · G3 `9c9f01b` · G4 (this commit). All 672 GFM spec examples pass the byte-coverage test, autolinks match the spec's links, and the editing fuzzes run with a table, task list and strikethrough in the document. GFM full parse of 5.2 MB: 89 ms on the worker (61 ms for CommonMark; the autolink pass rebuilds the map when it finds links). Not done: re-padding table columns to keep pipes aligned, adding or removing columns, footnotes.
