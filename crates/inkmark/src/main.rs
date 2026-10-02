@@ -878,12 +878,12 @@ impl App {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
         if handle_resp.dragged() {
-            let next = (self.sidebar.width + handle_resp.drag_delta().x)
+            self.sidebar.width = (self.sidebar.width + handle_resp.drag_delta().x)
                 .clamp(sidebar::MIN_WIDTH, sidebar::MAX_WIDTH);
-            if next != self.sidebar.width {
-                self.sidebar.width = next;
-                self.sidebar.save();
-            }
+        }
+        // The pointer can move for many frames. Store the width once, on release.
+        if handle_resp.drag_stopped() {
+            self.sidebar.save();
         }
         ui.painter().vline(
             handle.center().x,
@@ -1287,6 +1287,8 @@ mod tests {
             vec![shortcut(egui::Key::E, shift)],
         );
         assert!(app.sidebar.visible);
+        let stored = dir.path().join("sidebar");
+        let before = fs::read_to_string(&stored).unwrap();
         let start = egui::pos2(242.0, 80.0);
         let end = egui::pos2(320.0, 80.0);
         drive(
@@ -1309,6 +1311,8 @@ mod tests {
             &mut time,
             vec![egui::Event::PointerMoved(end)],
         );
+        let during = fs::read_to_string(&stored).unwrap();
+        assert_eq!(during, before, "the width was written during the drag");
         drive(
             &ctx,
             &mut app,
@@ -1325,6 +1329,8 @@ mod tests {
             "width stayed {}",
             app.sidebar.width
         );
+        let after = fs::read_to_string(&stored).unwrap();
+        assert_ne!(after, before, "releasing the drag did not store the width");
         let ctx = egui::Context::default();
         let reloaded = App::with_recent(
             &ctx,
