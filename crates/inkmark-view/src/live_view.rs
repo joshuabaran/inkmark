@@ -4,14 +4,16 @@
 
 use std::ops::Range;
 
+use egui::output::IMEOutput;
 use egui::{
-    CursorIcon, Event, EventFilter, Id, Key, Modifiers, Pos2, Rect, Response, Sense, Stroke, Ui,
-    pos2, vec2,
+    CursorIcon, Event, EventFilter, IMEPurpose, Id, ImeEvent, Key, Modifiers, Pos2, Rect, Response,
+    Sense, Stroke, Ui, pos2, vec2,
 };
-use inkmark_buffer::{Bias, Document, Selection};
+use inkmark_buffer::{Bias, Document, Edit, EditKind, Selection};
 use inkmark_parse::{BlockKind, Leaf, ParseOutput, ParseState};
 use inkmark_text::{GlyphMeshes, LineGeometry, RichLine, SharedFonts, TextConfig, TextRenderer};
 
+use crate::commands::{self, EditPlan, EnterContext};
 use crate::lines::{LineIndex, SCROLLBAR_WIDTH, ScrollPos, Synced};
 use crate::live_layout::{self, LeafLayout, LeafStyle};
 use crate::motion;
@@ -67,6 +69,8 @@ pub struct LiveView {
     scrolled: bool,
     focused: bool,
     dragging: bool,
+    /// IME composition shown at the caret until committed.
+    preedit: String,
     pub font_size: f32,
     pub line_height: f32,
 }
@@ -87,6 +91,7 @@ impl LiveView {
             scrolled: false,
             focused: false,
             dragging: false,
+            preedit: String::new(),
             font_size: 16.0,
             line_height: 26.0,
         }
@@ -218,15 +223,17 @@ impl LiveView {
         if let Some(wait) = state.update(doc) {
             ui.ctx().request_repaint_after(wait);
         }
-        let parse = state.output();
-        if parse.map.len() != doc.len() {
+        if state.output().map.len() != doc.len() {
             return response;
         }
-        self.sync(doc);
+        self.sync(doc, true);
 
         if self.focused {
-            self.handle_events(ui, doc, parse, frame);
+            self.handle_events(ui, doc, state, frame);
+        } else {
+            self.preedit.clear();
         }
+        let parse = state.output();
         self.handle_pointer(ui, &response, doc, parse, frame);
         if self
             .lines
@@ -237,14 +244,32 @@ impl LiveView {
         if self.reveal_caret > 0 {
             self.scroll_caret_into_view(ui, doc, parse, frame);
         }
-        self.paint(&painter, doc, parse, frame);
+        let caret = self.paint(&painter, doc, parse, frame);
         self.lines.paint_scrollbar(&painter, bar);
+        if self.focused {
+            let to_global = ui
+                .ctx()
+                .layer_transform_to_global(ui.layer_id())
+                .unwrap_or_default();
+            let cursor = caret.unwrap_or(Rect::from_min_size(rect.min, vec2(1.0, 1.0)));
+            ui.output_mut(|o| {
+                o.ime = Some(IMEOutput {
+                    purpose: IMEPurpose::Normal,
+                    rect: to_global * rect,
+                    cursor_rect: to_global * cursor,
+                    should_interrupt_composition: false,
+                })
+            });
+        }
         response
     }
 
-    fn sync(&mut self, doc: &Document) {
+    /// Brings heights (and, for edits made elsewhere, the selection) up to
+    /// date with `doc`.
+    fn sync(&mut self, doc: &Document, map_selection: bool) {
         let text = &self.text;
         if let Synced::Changed(changes) = self.lines.sync(doc, |chars| text.estimate_height(chars))
+            && map_selection
         {
             for c in &changes {
                 self.selection.anchor = c.map(self.selection.anchor, Bias::Left);
@@ -462,38 +487,186 @@ impl LiveView {
 
     // ---- input ---------------------------------------------------------------
 
-    fn handle_events(&mut self, ui: &Ui, doc: &Document, parse: &ParseOutput, frame: Frame) {
+    /// Keyboard, clipboard and IME input. Each edit is re-parsed before
+    /// the next event, so navigation never reads a stale map.
+    fn handle_events(&mut self, ui: &Ui, doc: &mut Document, state: &mut ParseState, frame: Frame) {
         let events = ui.input(|i| i.events.clone());
         for event in events {
-            match event {
-                Event::Copy => {
+            let parse = state.output();
+            let edited = match event {
+                Event::Copy | Event::Cut => {
                     let range = self.selection.range();
-                    if !range.is_empty() {
-                        ui.ctx().copy_text(doc.slice(range).into_owned());
+                    if range.is_empty() {
+                        false
+                    } else {
+                        ui.ctx().copy_text(doc.slice(range.clone()).into_owned());
+                        matches!(event, Event::Cut) && self.delete(doc, range, EditKind::Other)
                     }
+                }
+                Event::Paste(text) => {
+                    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                    self.replace_selection(doc, &text, EditKind::Other)
+                }
+                Event::Text(text) if self.preedit.is_empty() => {
+                    self.replace_selection(doc, &text, EditKind::Typing)
+                }
+                Event::Ime(ImeEvent::Preedit { text, .. }) => {
+                    let starting = self.preedit.is_empty() && !text.is_empty();
+                    self.preedit = text;
+                    self.reveal_caret = REVEAL_FRAMES;
+                    let range = self.selection.range();
+                    starting && self.delete(doc, range, EditKind::Other)
+                }
+                Event::Ime(ImeEvent::Commit(text)) => {
+                    self.preedit.clear();
+                    self.replace_selection(doc, &text, EditKind::Typing)
                 }
                 Event::Key {
                     key,
                     pressed: true,
                     modifiers,
                     ..
-                } => self.handle_key(doc, parse, frame, key, modifiers),
-                _ => {}
+                } if self.preedit.is_empty() => self.handle_key(doc, parse, frame, key, modifiers),
+                _ => false,
+            };
+            if edited && let Some(wait) = state.update(doc) {
+                ui.ctx().request_repaint_after(wait);
             }
         }
     }
 
+    // ---- editing --------------------------------------------------------------
+
+    fn after_edit(&mut self, doc: &Document) {
+        self.sync(doc, false);
+        self.preferred_x = None;
+        self.reveal_caret = REVEAL_FRAMES;
+    }
+
+    fn apply_plan(&mut self, doc: &mut Document, plan: EditPlan) -> bool {
+        if plan.edits.is_empty()
+            || doc
+                .apply(plan.edits, self.selection, plan.selection, plan.kind)
+                .is_err()
+        {
+            return false;
+        }
+        self.selection = plan.selection;
+        self.after_edit(doc);
+        true
+    }
+
+    /// Replaces the selection with `text` (a source patch of exactly that).
+    fn replace_selection(&mut self, doc: &mut Document, text: &str, kind: EditKind) -> bool {
+        let range = self.selection.range();
+        if range.is_empty() && text.is_empty() {
+            return false;
+        }
+        let caret = range.start + text.len();
+        self.apply_plan(
+            doc,
+            EditPlan {
+                edits: vec![Edit::replace(range, text)],
+                selection: Selection::caret(caret),
+                kind,
+            },
+        )
+    }
+
+    fn delete(&mut self, doc: &mut Document, range: Range<usize>, kind: EditKind) -> bool {
+        if range.is_empty() {
+            return false;
+        }
+        let caret = range.start;
+        self.apply_plan(
+            doc,
+            EditPlan {
+                edits: vec![Edit::delete(range)],
+                selection: Selection::caret(caret),
+                kind,
+            },
+        )
+    }
+
+    fn undo(&mut self, doc: &mut Document, redo: bool) -> bool {
+        let selection = if redo { doc.redo() } else { doc.undo() };
+        let Some(selection) = selection else {
+            return false;
+        };
+        self.selection = selection;
+        self.after_edit(doc);
+        true
+    }
+
+    /// Whether the caret is in a code or HTML block, where Enter keeps
+    /// indentation instead of starting a paragraph.
+    fn in_code(&self, doc: &Document, parse: &ParseOutput) -> bool {
+        leaf_at_line(doc, parse, doc.byte_to_line(self.selection.head)).is_some_and(|l| {
+            matches!(
+                l.block.kind,
+                BlockKind::CodeBlock { .. } | BlockKind::HtmlBlock
+            )
+        })
+    }
+
+    /// Returns whether the key edited the document.
     fn handle_key(
         &mut self,
-        doc: &Document,
+        doc: &mut Document,
         parse: &ParseOutput,
         frame: Frame,
         key: Key,
         modifiers: Modifiers,
-    ) {
-        let (cmd, shift) = (modifiers.command, modifiers.shift);
-        let range = self.selection.range();
+    ) -> bool {
+        let (cmd, shift, alt) = (modifiers.command, modifiers.shift, modifiers.alt);
+        let sel = self.selection;
+        let range = sel.range();
         match key {
+            // Editing.
+            Key::Backspace | Key::Delete if !range.is_empty() => {
+                return self.delete(doc, range, EditKind::Deleting);
+            }
+            Key::Backspace => {
+                if !cmd && let Some(plan) = commands::smart_backspace(doc, sel) {
+                    return self.apply_plan(doc, plan);
+                }
+                let start = self.step(doc, parse, false, cmd);
+                return self.delete(doc, start..sel.head, EditKind::Deleting);
+            }
+            Key::Delete => {
+                let end = self.step(doc, parse, true, cmd);
+                return self.delete(doc, sel.head..end, EditKind::Deleting);
+            }
+            Key::Enter if shift => return self.apply_plan(doc, commands::hard_break(doc, sel)),
+            Key::Enter => {
+                let ctx = EnterContext {
+                    in_code: self.in_code(doc, parse),
+                };
+                return self.apply_plan(doc, commands::smart_enter(doc, sel, ctx));
+            }
+            Key::Tab => {
+                if let Some(plan) = commands::indent_list(doc, sel, shift) {
+                    return self.apply_plan(doc, plan);
+                }
+                return !shift && self.replace_selection(doc, "    ", EditKind::Typing);
+            }
+            Key::B if cmd => {
+                return self.apply_plan(doc, commands::toggle_wrap(doc, sel, "**", &["__"]));
+            }
+            Key::I if cmd => {
+                return self.apply_plan(doc, commands::toggle_wrap(doc, sel, "*", &["_"]));
+            }
+            Key::Backtick if cmd => {
+                return self.apply_plan(doc, commands::toggle_wrap(doc, sel, "`", &[]));
+            }
+            Key::K if cmd => return self.apply_plan(doc, commands::insert_link(doc, sel)),
+            _ if cmd && alt && commands::heading_level(key).is_some() => {
+                let level = commands::heading_level(key).expect("checked");
+                return self.apply_plan(doc, commands::set_heading(doc, sel, level));
+            }
+            Key::Z if cmd => return self.undo(doc, shift),
+            Key::Y if cmd => return self.undo(doc, true),
+            // Navigation.
             Key::ArrowLeft if !shift && !range.is_empty() => self.move_to(range.start, false),
             Key::ArrowRight if !shift && !range.is_empty() => self.move_to(range.end, false),
             Key::ArrowLeft | Key::ArrowRight => {
@@ -520,9 +693,10 @@ impl LiveView {
                     head: doc.len(),
                 };
             }
-            Key::Escape if !range.is_empty() => self.move_to(self.selection.head, false),
+            Key::Escape if !range.is_empty() => self.move_to(sel.head, false),
             _ => {}
         }
+        false
     }
 
     fn handle_pointer(
@@ -591,17 +765,18 @@ impl LiveView {
 
     // ---- painting ----------------------------------------------------------------
 
+    /// Paints the visible blocks; returns the caret rect if it is on screen.
     fn paint(
         &mut self,
         painter: &egui::Painter,
         doc: &Document,
         parse: &ParseOutput,
         frame: Frame,
-    ) {
+    ) -> Option<Rect> {
         let rect = frame.rect;
         let heights_len = self.lines.heights.len();
         if heights_len == 0 {
-            return;
+            return None;
         }
         // Normalize the anchor so it never sits on a zero-height line.
         let view_top = self.lines.heights.anchor_y(self.lines.anchor);
@@ -666,12 +841,27 @@ impl LiveView {
             y += p.height;
             line = p.last_line + 1;
         }
+        if let Some(c) = caret
+            && !self.preedit.is_empty()
+        {
+            // Composition text sits over the line, underlined, until committed.
+            let preedit = self.preedit.clone();
+            let width = self.text.geometry(&preedit).rows[0]
+                .clusters
+                .last()
+                .map_or(0.0, |c| c.x + c.w);
+            let bg = Rect::from_min_size(c.min, vec2(width, c.height()));
+            painter.rect_filled(bg, 0.0, BACKGROUND);
+            self.text.draw_line(&mut meshes, &preedit, c.min, TEXT);
+            painter.hline(bg.x_range(), bg.bottom() - 1.0, (1.0, CARET));
+        }
         self.text.end_frame(meshes, painter);
         if self.focused
             && let Some(c) = caret
         {
             painter.rect_filled(c, 0.0, CARET);
         }
+        caret.filter(|c| rect.intersects(*c))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -783,7 +973,8 @@ fn leaf_lines(doc: &Document, parse: &ParseOutput, line: usize) -> Option<(usize
 
 /// "•" (by nesting depth) for bullet items; the source number for ordered ones.
 fn list_marker(doc: &Document, item_start: usize, containers: &[inkmark_parse::Block]) -> String {
-    let source = doc.slice(item_start..(item_start + 12).min(doc.len()));
+    let line_end = doc.line_range(doc.byte_to_line(item_start)).end;
+    let source = doc.slice(item_start..line_end);
     let number: String = source
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ')')

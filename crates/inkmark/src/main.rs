@@ -303,10 +303,12 @@ impl App {
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let (cycle, code, live) = ctx.input_mut(|i| {
+            // egui ignores extra Alt when matching; Ctrl+Alt+digit sets headings.
+            let alt = i.modifiers.alt;
             (
                 i.consume_shortcut(&CYCLE_MODE),
-                i.consume_shortcut(&FOCUS_CODE),
-                i.consume_shortcut(&FOCUS_LIVE),
+                !alt && i.consume_shortcut(&FOCUS_CODE),
+                !alt && i.consume_shortcut(&FOCUS_LIVE),
             )
         });
         if cycle {

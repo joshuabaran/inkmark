@@ -1,6 +1,7 @@
 //! CodeView, LiveView, reveal rules, smart edit rules, hit-test, scroll sync.
 
 mod code_view;
+mod commands;
 mod lines;
 mod live_layout;
 mod live_view;

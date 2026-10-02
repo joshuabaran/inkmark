@@ -14,6 +14,7 @@ use inkmark_buffer::{Bias, Change, Document, Edit, EditKind, Selection};
 use inkmark_parse::{ParseOutput, ParseState};
 use inkmark_text::{GlyphMeshes, ScrollAnchor, SharedFonts, TextConfig, TextRenderer};
 
+use crate::commands::{self, EditPlan};
 use crate::lines::SCROLLBAR_WIDTH;
 use crate::lines::{LineIndex, ScrollPos, Synced};
 use crate::motion;
@@ -384,6 +385,17 @@ impl CodeView {
         self.apply_line_edits(doc, edits);
     }
 
+    fn apply_plan(&mut self, doc: &mut Document, plan: EditPlan) {
+        if !plan.edits.is_empty()
+            && doc
+                .apply(plan.edits, self.selection, plan.selection, plan.kind)
+                .is_ok()
+        {
+            self.selection = plan.selection;
+            self.after_edit(doc);
+        }
+    }
+
     fn undo(&mut self, doc: &mut Document) {
         if let Some(selection) = doc.undo() {
             self.selection = selection;
@@ -594,6 +606,21 @@ impl CodeView {
                     head: doc.len(),
                 };
                 doc.seal_undo_step();
+            }
+            Key::B if cmd => self.apply_plan(
+                doc,
+                commands::toggle_wrap(doc, self.selection, "**", &["__"]),
+            ),
+            Key::I if cmd => {
+                self.apply_plan(doc, commands::toggle_wrap(doc, self.selection, "*", &["_"]))
+            }
+            Key::Backtick if cmd => {
+                self.apply_plan(doc, commands::toggle_wrap(doc, self.selection, "`", &[]))
+            }
+            Key::K if cmd => self.apply_plan(doc, commands::insert_link(doc, self.selection)),
+            _ if cmd && modifiers.alt && commands::heading_level(key).is_some() => {
+                let level = commands::heading_level(key).expect("checked");
+                self.apply_plan(doc, commands::set_heading(doc, self.selection, level));
             }
             Key::Z if cmd && shift => self.redo(doc),
             Key::Z if cmd => self.undo(doc),
