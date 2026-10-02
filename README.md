@@ -11,8 +11,8 @@ disk are the only source of truth: no accounts, sync or plugins.
 - **Fast on big files**: rope buffer, background parsing, virtualized panes;
   responsive on 5–10 MB documents.
 - **GitHub Flavored Markdown**: tables edited as a grid, task lists with
-  clickable checkboxes, strikethrough, and bare URLs and emails linked
-  automatically. Parsed by [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark)
+  clickable checkboxes, strikethrough, footnotes, and bare URLs and emails
+  linked automatically. Parsed by [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark)
   and checked against every example in the CommonMark and GFM specs.
 - **Per-pane minimaps**, images (PNG, JPEG, GIF, WebP, BMP), recent files.
 - **Folder sidebar**: browse a directory of notes, open one, and add a
