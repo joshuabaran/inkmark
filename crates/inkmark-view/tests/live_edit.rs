@@ -165,7 +165,8 @@ fn typing_patches_the_source_at_the_caret() {
 #[test]
 fn fuzzed_typing_only_ever_inserts_the_typed_text() {
     let src = "# Title *em*\n\nSome **bold** text, `code` and a [link](http://x).\nSecond line &amp; more.\n\n\
-               > quote with *emphasis*\n> - nested item\n\n- one\n- two\n\n```\ncode block\n```\n\nLast para\n";
+               > quote with *emphasis*\n> - nested item\n\n- one\n- two\n\n```\ncode block\n```\n\n\
+               A note[^1] here.\n\n[^1]: The *note*\n    goes on.\n\nLast para\n";
     let mut s = Split::new(src);
     let mut seed = 0x5eed_u64;
     let mut rand = move |n: u64| {
@@ -296,7 +297,7 @@ fn ime_commits_into_the_source() {
 fn fuzzed_mixed_editing_keeps_invariants() {
     let src = "# Title *em*\n\nSome **bold** text, `code` and a [link](http://x).\n\n\
                > quote with *emphasis*\n> - nested item\n\n1. one\n2. two\n\n```\ncode\n```\n\n\
-               | a | b |\n|:--|--:|\n| c | ~~d~~ |\n\n- [ ] task www.x.com\n\nEnd\n";
+               | a | b |\n|:--|--:|\n| c | ~~d~~ |\n\n- [ ] task www.x.com\n\nSee[^n].\n\n[^n]: A note.\n\nEnd\n";
     let mut s = Split::new(src);
     let mut seed = 0xfeed_u64;
     let mut rand = move |n: u64| {
@@ -635,4 +636,23 @@ fn shift_enter_in_a_table_explains_why_it_does_nothing() {
     assert_eq!(s.text(), src);
     assert!(s.live.take_hint().is_some());
     assert_eq!(s.live.take_hint(), None, "shown once");
+}
+
+#[test]
+fn typing_around_footnotes_patches_the_source() {
+    let src = "Text[^1] more.\n\n[^1]: The note.\n";
+    let mut s = Split::new(src);
+    // Just before and just after the reference.
+    s.caret(4);
+    s.type_text("A");
+    assert_eq!(s.text(), "TextA[^1] more.\n\n[^1]: The note.\n");
+    let after = s.text().find(" more").unwrap();
+    s.caret(after);
+    s.type_text("B");
+    assert_eq!(s.text(), "TextA[^1]B more.\n\n[^1]: The note.\n");
+    // Inside the definition's text.
+    let note = s.text().find("note.").unwrap();
+    s.caret(note);
+    s.type_text("good ");
+    assert_eq!(s.text(), "TextA[^1]B more.\n\n[^1]: The good note.\n");
 }

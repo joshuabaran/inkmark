@@ -23,6 +23,7 @@ impl ParseOutput {
             blocks: Default::default(),
             map: SourceMap::unparsed(len),
             link_defs: Default::default(),
+            footnotes: Default::default(),
         }
     }
 
@@ -100,25 +101,39 @@ impl ParseOutput {
         if region.is_empty() || region.len() > LOCAL_REPARSE_LIMIT {
             return;
         }
-        let text = doc.slice(region.clone());
+        let mut text = doc.slice(region.clone()).into_owned();
+        let len = text.len();
+        // A footnote reference only parses as one if its definition exists,
+        // and that's usually elsewhere in the file. Stand-in definitions
+        // after the region keep `[^1]` a footnote while its paragraph is
+        // typed in; everything they produce is past `len` and dropped.
+        if !self.footnotes.is_empty() {
+            text.push_str("\n\n");
+            for label in &self.footnotes {
+                text.push_str(&format!("[^{label}]: x\n"));
+            }
+        }
         let mut local = parser.parse(&text);
         let offset = region.start;
         let spans = local
             .map
             .iter()
+            .filter(|s| s.range.start < len)
             .map(|mut s| {
-                s.range = s.range.start + offset..s.range.end + offset;
+                s.range = s.range.start + offset..s.range.end.min(len) + offset;
                 s
             })
             .collect();
         let blocks = std::mem::take(&mut local.blocks)
             .iter()
+            .filter(|b| b.range.start < len || (b.range.is_empty() && b.range.start == len))
             .map(|mut b| {
-                b.range = b.range.start + offset..b.range.end + offset;
+                b.range = b.range.start + offset..b.range.end.min(len) + offset;
                 b
             })
             .collect();
         self.link_defs.extend(std::mem::take(&mut local.link_defs));
+        self.footnotes.extend(std::mem::take(&mut local.footnotes));
         self.map.splice(region.clone(), spans);
         self.blocks.splice(region, blocks);
     }

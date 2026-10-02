@@ -29,6 +29,8 @@ use crate::theme::{
 const PADDING: f32 = 28.0;
 const QUOTE_INDENT: f32 = 22.0;
 const ITEM_INDENT: f32 = 28.0;
+/// Room for a footnote definition's `[label]` in the margin.
+const FOOTNOTE_INDENT: f32 = 44.0;
 const CODE_PAD: f32 = 10.0;
 const CARET_WIDTH: f32 = 2.0;
 const NEWLINE_WIDTH: f32 = 6.0;
@@ -582,6 +584,25 @@ impl LiveView {
     /// What raw syntax to show: around the caret, while focused.
     fn reveal(&self, doc: &Document) -> Option<Reveal> {
         self.focused.then(|| reveal_at(doc, self.selection.head))
+    }
+
+    /// `[label]`, or as much of the label as fits in `width` followed by
+    /// an ellipsis.
+    fn fit_marker(&mut self, label: &str, width: f32) -> String {
+        let fits =
+            |this: &mut Self, text: &str| this.text.geometry(text).caret_x(0, text.len()) <= width;
+        let full = format!("[{label}]");
+        if fits(self, &full) {
+            return full;
+        }
+        let chars: Vec<char> = label.chars().collect();
+        for n in (1..chars.len()).rev() {
+            let short = format!("[{}…]", chars[..n].iter().collect::<String>());
+            if fits(self, &short) {
+                return short;
+            }
+        }
+        "[…]".into()
     }
 
     fn place(&mut self, doc: &Document, parse: &ParseOutput, leaf: Leaf, width: f32) -> Placed {
@@ -1728,6 +1749,14 @@ impl LiveView {
                         }
                     }
                 }
+                BlockKind::FootnoteDefinition => {
+                    if let Some(label) = footnote_label(doc, c, &p.leaf.block) {
+                        let y = top + p.body.seg_tops.first().copied().unwrap_or(0.0);
+                        let marker = self.fit_marker(&label, FOOTNOTE_INDENT - 6.0);
+                        self.text
+                            .draw_line(meshes, &marker, pos2(x + 2.0, y), LIST_MARKER);
+                    }
+                }
                 _ => {}
             }
             x += container_indent(c);
@@ -1874,6 +1903,7 @@ fn container_indent(c: &inkmark_parse::Block) -> f32 {
     match c.kind {
         BlockKind::BlockQuote => QUOTE_INDENT,
         BlockKind::Item => ITEM_INDENT,
+        BlockKind::FootnoteDefinition => FOOTNOTE_INDENT,
         _ => 0.0,
     }
 }
@@ -1904,6 +1934,18 @@ fn leaf_lines(doc: &Document, parse: &ParseOutput, line: usize) -> Option<(usize
 /// "•" (by nesting depth) for bullet items. Ordered items count up from
 /// the list's start number, as CommonMark renders them ("1. 1. 1." shows
 /// 1, 2, 3), keeping the source's "." or ")".
+/// A footnote definition's label, when `leaf` is its first block (the
+/// margin marker goes beside that one only).
+fn footnote_label(
+    doc: &Document,
+    def: &inkmark_parse::Block,
+    leaf: &inkmark_parse::Block,
+) -> Option<String> {
+    let before = doc.slice(def.range.start..leaf.range.start.max(def.range.start));
+    let label = before.trim_end().strip_prefix("[^")?.strip_suffix("]:")?;
+    (!label.contains(['[', ']'])).then(|| label.to_owned())
+}
+
 fn list_marker(
     doc: &Document,
     parse: &ParseOutput,

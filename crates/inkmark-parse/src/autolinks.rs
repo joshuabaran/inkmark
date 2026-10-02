@@ -8,7 +8,8 @@ use std::ops::Range;
 use crate::map::{SourceMap, Span, SpanKind, Style, Syntax};
 
 /// Text inside these is never autolinked.
-const EXCLUDED: [Style; 5] = [
+const EXCLUDED: [Style; 6] = [
+    Style::FOOTNOTE,
     Style::LINK,
     Style::IMAGE,
     Style::CODE,

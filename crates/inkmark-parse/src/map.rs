@@ -23,6 +23,8 @@ impl Style {
     pub const STRIKE: Self = Self(1 << 10);
     /// Inside a GFM table's header row.
     pub const TABLE_HEAD: Self = Self(1 << 11);
+    /// A footnote reference, `[^label]`.
+    pub const FOOTNOTE: Self = Self(1 << 12);
 
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -61,6 +63,10 @@ pub enum Syntax {
     /// A GFM task list marker, `[ ] ` (false) or `[x] ` (true), including
     /// the space after it.
     TaskMarker(bool),
+    /// A footnote definition's `[^label]:` and the space after it (with any
+    /// container prefix on the same line). Drawn in the margin like a list
+    /// marker.
+    FootnoteLabel,
     /// Anything else the parser consumed without output, e.g. link reference
     /// definitions.
     Other,

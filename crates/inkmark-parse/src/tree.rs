@@ -28,13 +28,18 @@ pub enum BlockKind {
     TableHead,
     TableRow,
     TableCell,
+    /// `[^label]: ...`: a container, like a list item, for the note's blocks.
+    FootnoteDefinition,
 }
 
 impl BlockKind {
     /// Leaf blocks hold inline content (or none); the rest contain blocks.
     /// A table counts as one leaf: its rows and cells are laid out with it.
     pub fn is_leaf(self) -> bool {
-        !matches!(self, Self::BlockQuote | Self::List { .. } | Self::Item)
+        !matches!(
+            self,
+            Self::BlockQuote | Self::List { .. } | Self::Item | Self::FootnoteDefinition
+        )
     }
 
     /// Rows and cells live inside a table leaf.

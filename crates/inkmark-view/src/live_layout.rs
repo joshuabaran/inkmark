@@ -471,4 +471,34 @@ mod tests {
             assert_eq!(l.display_pos(s).0, 0);
         }
     }
+
+    #[test]
+    fn a_footnote_reference_shows_its_label_until_the_caret_touches_it() {
+        use inkmark_parse::GfmParser;
+
+        let src = "Text[^1] more.\n\n[^1]: Note.\n";
+        let doc = Document::from_text(src);
+        let out = GfmParser.parse(src);
+        let leaf = out.blocks.leaves_from(0).next().unwrap();
+        let at = |caret: usize| {
+            let line = doc.line_range(doc.byte_to_line(caret));
+            build(&doc, &out.map, &leaf, Some(Reveal { line, caret }))
+        };
+        assert_eq!(texts(&at(0)), vec!["Text[1] more."]);
+        assert_eq!(texts(&at(4)), vec!["Text[^1] more."]);
+        assert_eq!(texts(&at(8)), vec!["Text[^1] more."]);
+        assert_eq!(texts(&at(10)), vec!["Text[1] more."]);
+        // The definition's label is a margin marker: never in the text.
+        let note = out.blocks.leaves_from(16).next().unwrap();
+        let l = build(
+            &doc,
+            &out.map,
+            &note,
+            Some(Reveal {
+                line: doc.line_range(2),
+                caret: 16,
+            }),
+        );
+        assert_eq!(texts(&l), vec!["Note."]);
+    }
 }
