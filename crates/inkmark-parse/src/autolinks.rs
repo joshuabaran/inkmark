@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use crate::map::{SourceMap, Span, SpanKind, Style};
+use crate::map::{SourceMap, Span, SpanKind, Style, Syntax};
 
 /// Text inside these is never autolinked.
 const EXCLUDED: [Style; 5] = [
@@ -18,10 +18,18 @@ const EXCLUDED: [Style; 5] = [
 
 pub(crate) fn mark(src: &str, map: &mut SourceMap) {
     let spans: Vec<Span> = map.iter().collect();
-    let eligible =
-        |s: &Span| s.kind == SpanKind::Text && !EXCLUDED.iter().any(|x| s.style.contains(*x));
-    // pulldown-cmark splits text at `_`, `*` and `~`, so scan runs of
-    // adjacent plain-text spans as one piece of text.
+    // GFM recognizes autolinks on the raw text, before emphasis or entities
+    // are resolved (cmark-gfm matches them as it scans), so `a*b*c` and
+    // `&amp;` inside a URL stay in it. Scan runs of adjacent inline text,
+    // delimiters, escapes and entities as one piece of source.
+    let eligible = |s: &Span| {
+        matches!(
+            s.kind,
+            SpanKind::Text
+                | SpanKind::Replaced(_)
+                | SpanKind::Syntax(Syntax::Delimiter | Syntax::Escape)
+        ) && !EXCLUDED.iter().any(|x| s.style.contains(*x))
+    };
     let mut links: Vec<Range<usize>> = Vec::new();
     let mut i = 0;
     while i < spans.len() {
@@ -52,7 +60,15 @@ pub(crate) fn mark(src: &str, map: &mut SourceMap) {
             out.push(span);
             continue;
         }
-        // Split the span at every link boundary inside it.
+        // Split the span at every link boundary inside it. Inside a link,
+        // everything shows as typed: delimiters, escapes and entities too.
+        // An entity cut by a link boundary shows its source as well.
+        let outside = match span.kind {
+            SpanKind::Replaced(_) => SpanKind::Text,
+            ref k => k.clone(),
+        };
+        let cut = links[next].start > span.range.start || links[next].end < span.range.end;
+        let outside = if cut { outside } else { span.kind.clone() };
         let mut at = span.range.start;
         let mut k = next;
         while k < links.len() && links[k].start < span.range.end {
@@ -60,22 +76,41 @@ pub(crate) fn mark(src: &str, map: &mut SourceMap) {
             if at < link.start {
                 out.push(Span {
                     range: at..link.start,
+                    kind: outside.clone(),
                     ..span.clone()
                 });
             }
+            // A link shows its text literally: no emphasis inside it.
             let mut style = span.style;
+            for inline in [Style::EMPHASIS, Style::STRONG, Style::STRIKE] {
+                style.remove(inline);
+            }
             style.insert(Style::LINK);
-            out.push(Span {
+            let piece = Span {
                 range: link.clone(),
+                kind: SpanKind::Text,
                 style,
                 ..span.clone()
-            });
+            };
+            // Pieces of one link (from text split at `*`, entities, ...) merge.
+            match out.last_mut() {
+                Some(prev)
+                    if prev.kind == SpanKind::Text
+                        && prev.style == piece.style
+                        && prev.heading == piece.heading
+                        && prev.range.end == piece.range.start =>
+                {
+                    prev.range.end = piece.range.end;
+                }
+                _ => out.push(piece),
+            }
             at = link.end;
             k += 1;
         }
         if at < span.range.end {
             out.push(Span {
                 range: at..span.range.end,
+                kind: outside,
                 ..span
             });
         }
@@ -96,7 +131,8 @@ pub(crate) fn find(src: &str, range: Range<usize>) -> Vec<Range<usize>> {
     let mut floor = 0;
     while i < b.len() {
         let abs = range.start + i;
-        let found = if (starts_with_ci(&b[i..], b"www.")) && preceded_ok(src, abs) {
+        // `www.` is literal; only URL schemes are case-insensitive.
+        let found = if b[i..].starts_with(b"www.") && preceded_ok(src, abs) {
             domain_end(b, i).map(|end| path_end(b, end))
         } else if let Some(scheme) = [&b"https://"[..], b"http://", b"ftp://"]
             .into_iter()
@@ -262,6 +298,26 @@ fn email(b: &[u8], at: usize, floor: usize) -> Option<(usize, usize)> {
     if dots == 0 || end == at + 1 || matches!(b[end - 1], b'-' | b'_') {
         return None;
     }
+    // `mailto:` and `xmpp:` belong to the link; xmpp may add one resource.
+    let before = &b[floor..start];
+    if before.len() >= 7 && before[before.len() - 7..].eq_ignore_ascii_case(b"mailto:") {
+        start -= 7;
+    } else if before.len() >= 5 && before[before.len() - 5..].eq_ignore_ascii_case(b"xmpp:") {
+        start -= 5;
+        if end < b.len() && b[end] == b'/' {
+            let resource = b[end + 1..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'@' | b'.'))
+                .count();
+            if resource > 0 {
+                end += 1 + resource;
+                // A trailing period ends the sentence, not the resource.
+                while b[end - 1] == b'.' {
+                    end -= 1;
+                }
+            }
+        }
+    }
     Some((start, end))
 }
 
@@ -311,6 +367,9 @@ mod tests {
         assert_eq!(links("www.a_b.cd.com"), vec!["www.a_b.cd.com"]);
         assert_eq!(links("www.a_b.c_d.com"), Vec::<&str>::new());
         assert_eq!(links("www.a.b_c.d"), Vec::<&str>::new());
+        // Regression for #16: www. is lowercase-only; schemes aren't.
+        assert_eq!(links("WWW.example.com"), Vec::<&str>::new());
+        assert_eq!(links("HTTPS://example.com"), vec!["HTTPS://example.com"]);
     }
 
     #[test]
@@ -324,5 +383,45 @@ mod tests {
         assert_eq!(links("a.b-c_d@a.b."), vec!["a.b-c_d@a.b"]);
         assert_eq!(links("a.b-c_d@a.b-"), Vec::<&str>::new());
         assert_eq!(links("a.b-c_d@a.b_"), Vec::<&str>::new());
+        // Regression for #16: the scheme is part of the link.
+        assert_eq!(links("mailto:foo@bar.baz"), vec!["mailto:foo@bar.baz"]);
+        assert_eq!(links("xmpp:foo@bar.baz/txt"), vec!["xmpp:foo@bar.baz/txt"]);
+        assert_eq!(
+            links("xmpp:foo@bar.baz/txt@bin.com."),
+            vec!["xmpp:foo@bar.baz/txt@bin.com"]
+        );
+    }
+
+    #[test]
+    fn urls_keep_emphasis_and_entities_inside_them() {
+        // Regression for #16: scanned on raw text, as cmark-gfm does.
+        use crate::{GfmParser, MarkdownParser};
+        let linked = |src: &str| -> Vec<String> {
+            let out = GfmParser.parse(src);
+            let mut runs: Vec<String> = Vec::new();
+            let mut prev = false;
+            for s in out.map.iter() {
+                let link = s.kind == SpanKind::Text && s.style.contains(Style::LINK);
+                if link && prev {
+                    runs.last_mut().unwrap().push_str(&src[s.range]);
+                } else if link {
+                    runs.push(src[s.range].to_owned());
+                }
+                prev = link;
+            }
+            runs
+        };
+        assert_eq!(
+            linked("https://example.com/a*b*c\n"),
+            vec!["https://example.com/a*b*c"]
+        );
+        assert_eq!(
+            linked("https://example.com?a=1&amp;b=2\n"),
+            vec!["https://example.com?a=1&amp;b=2"]
+        );
+        // Emphasis around a URL stays emphasis.
+        let out = GfmParser.parse("*see www.x.com*\n");
+        out.map.validate(16).unwrap();
+        assert_eq!(linked("*see www.x.com*\n"), vec!["www.x.com"]);
     }
 }

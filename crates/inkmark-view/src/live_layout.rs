@@ -258,10 +258,15 @@ pub(crate) fn build(
                     });
                 }
             }
-            // Container prefixes and indentation are drawn as bars, bullets
-            // and margins, so they stay hidden even on the caret line.
+            // Container prefixes, indentation and table markup are drawn as
+            // bars, bullets, margins and grid lines, so they stay hidden even
+            // on the caret line.
             SpanKind::Syntax(k)
-                if raw && !matches!(k, Syntax::QuotePrefix | Syntax::ListMarker) =>
+                if raw
+                    && !matches!(
+                        k,
+                        Syntax::QuotePrefix | Syntax::ListMarker | Syntax::TableMarkup
+                    ) =>
             {
                 let font = FontStyle {
                     bold: false,

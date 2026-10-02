@@ -31,6 +31,10 @@ impl Style {
     pub fn insert(&mut self, other: Self) {
         self.0 |= other.0;
     }
+
+    pub fn remove(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
 }
 
 /// Markdown syntax: present in the source, hidden in the live view unless
@@ -54,7 +58,8 @@ pub enum Syntax {
     ThematicBreak,
     /// GFM table pipes, the delimiter row (`|:--|--:|`) and cell padding.
     TableMarkup,
-    /// A GFM task list marker, `[ ]` (false) or `[x]` (true).
+    /// A GFM task list marker, `[ ] ` (false) or `[x] ` (true), including
+    /// the space after it.
     TaskMarker(bool),
     /// Anything else the parser consumed without output, e.g. link reference
     /// definitions.

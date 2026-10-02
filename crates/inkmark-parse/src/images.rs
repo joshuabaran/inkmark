@@ -39,9 +39,14 @@ pub fn inline_images(src: &str, link_defs: &HashMap<String, String>) -> Vec<Inli
                 depth += 1;
             }
             Event::End(pulldown_cmark::TagEnd::Image) => depth -= 1,
-            Event::Text(text) | Event::Code(text) if depth > 0 => {
+            Event::Text(text) | Event::Code(text) | Event::InlineHtml(text) if depth > 0 => {
                 if let Some(image) = images.last_mut() {
                     image.alt.push_str(&text);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak if depth > 0 => {
+                if let Some(image) = images.last_mut() {
+                    image.alt.push(' ');
                 }
             }
             _ => {}
@@ -69,6 +74,19 @@ mod tests {
         assert_eq!(images[1].dest, "my dog.jpg");
         assert_eq!(images[2].alt, "]");
         assert!(inline_images("no images, just a [link](x.png)", &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn alt_text_keeps_breaks_and_inline_html() {
+        // Regression for #18.
+        assert_eq!(
+            inline_images("![foo\nbar](u.png)", &HashMap::new())[0].alt,
+            "foo bar"
+        );
+        assert_eq!(
+            inline_images("![a <b> c](u.png)", &HashMap::new())[0].alt,
+            "a <b> c"
+        );
     }
 
     #[test]

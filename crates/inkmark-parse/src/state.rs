@@ -124,6 +124,12 @@ impl ParseOutput {
     }
 }
 
+struct Job {
+    generation: u64,
+    epoch: u64,
+    text: String,
+}
+
 /// Keeps a document's parse current: a local reparse on every edit for
 /// immediate feedback, and a debounced full parse on a worker thread that
 /// replaces it once it arrives.
@@ -136,8 +142,11 @@ pub struct ParseState {
     full_epoch: Option<u64>,
     requested: Option<u64>,
     last_change: Instant,
-    jobs: Sender<(u64, String)>,
-    results: Receiver<(u64, ParseOutput)>,
+    /// Bumped by `reset`; jobs and results carry it so a parse of the
+    /// previous document still in flight can't land on the new one.
+    generation: u64,
+    jobs: Sender<Job>,
+    results: Receiver<(u64, u64, ParseOutput)>,
 }
 
 impl ParseState {
@@ -148,7 +157,7 @@ impl ParseState {
         doc: &Document,
         on_result: impl Fn() + Send + 'static,
     ) -> Self {
-        let (jobs, job_rx) = mpsc::channel::<(u64, String)>();
+        let (jobs, job_rx) = mpsc::channel::<Job>();
         let (result_tx, results) = mpsc::channel();
         let worker_parser = Arc::clone(&parser);
         std::thread::Builder::new()
@@ -159,8 +168,8 @@ impl ParseState {
                     while let Ok(newer) = job_rx.try_recv() {
                         job = newer;
                     }
-                    let output = worker_parser.parse(&job.1);
-                    if result_tx.send((job.0, output)).is_err() {
+                    let output = worker_parser.parse(&job.text);
+                    if result_tx.send((job.generation, job.epoch, output)).is_err() {
                         break;
                     }
                     on_result();
@@ -174,6 +183,7 @@ impl ParseState {
             full_epoch: None,
             requested: None,
             last_change: Instant::now(),
+            generation: 0,
             jobs,
             results,
         };
@@ -189,8 +199,9 @@ impl ParseState {
         self.requested = None;
         // No debounce for the first parse.
         self.last_change = Instant::now() - DEBOUNCE;
-        // Drop results for the previous document.
-        while self.results.try_recv().is_ok() {}
+        // Results for the previous document, queued or still being
+        // computed, carry the old generation and are ignored.
+        self.generation += 1;
     }
 
     pub fn output(&self) -> &ParseOutput {
@@ -207,8 +218,10 @@ impl ParseState {
     /// pending debounce), if anything is pending.
     pub fn update(&mut self, doc: &Document) -> Option<Duration> {
         let now = Instant::now();
-        while let Ok((epoch, output)) = self.results.try_recv() {
-            self.accept(doc, epoch, output);
+        while let Ok((generation, epoch, output)) = self.results.try_recv() {
+            if generation == self.generation {
+                self.accept(doc, epoch, output);
+            }
         }
         if doc.epoch() != self.epoch {
             if !self.output.catch_up(self.parser.as_ref(), doc, self.epoch) {
@@ -224,7 +237,11 @@ impl ParseState {
         if quiet < DEBOUNCE {
             return Some(DEBOUNCE - quiet);
         }
-        let _ = self.jobs.send((self.epoch, String::from(doc.rope())));
+        let _ = self.jobs.send(Job {
+            generation: self.generation,
+            epoch: self.epoch,
+            text: String::from(doc.rope()),
+        });
         self.requested = Some(self.epoch);
         None
     }

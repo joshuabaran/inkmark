@@ -276,3 +276,53 @@ fn autolinks_survive_underscore_splits() {
         .collect();
     assert_eq!(link, "www.example.com/a_b_c");
 }
+
+/// Holds the worker inside its first parse until released.
+struct Gate {
+    calls: std::sync::atomic::AtomicUsize,
+    entered: std::sync::Mutex<bool>,
+    released: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl MarkdownParser for Gate {
+    fn parse(&self, src: &str) -> ParseOutput {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            *self.entered.lock().unwrap() = true;
+            self.cv.notify_all();
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.cv.wait(released).unwrap();
+            }
+        }
+        GfmParser.parse(src)
+    }
+}
+
+#[test]
+fn a_parse_in_flight_at_reset_is_not_used_for_the_new_document() {
+    // Regression for #15.
+    let gate = Arc::new(Gate {
+        calls: Default::default(),
+        entered: std::sync::Mutex::new(false),
+        released: std::sync::Mutex::new(false),
+        cv: std::sync::Condvar::new(),
+    });
+    let old = Document::from_text("the old document, still being parsed\n");
+    let mut state = ParseState::new(gate.clone(), &old, || {});
+    state.update(&old);
+    {
+        let mut entered = gate.entered.lock().unwrap();
+        while !*entered {
+            entered = gate.cv.wait(entered).unwrap();
+        }
+    }
+    let new = Document::from_text("# new\n");
+    state.reset(&new);
+    state.update(&new);
+    *gate.released.lock().unwrap() = true;
+    gate.cv.notify_all();
+    settle(&mut state, &new);
+    assert_eq!(state.output().map.len(), new.len());
+    assert_eq!(state.output(), &GfmParser.parse("# new\n"));
+}

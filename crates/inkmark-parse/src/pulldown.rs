@@ -124,6 +124,12 @@ impl<'a> Builder<'a> {
                 }
                 Event::TaskListMarker(checked) => {
                     self.fill_to(range.start);
+                    // The marker owns the space after it, so `[x] done`
+                    // never shows as `[x]done`.
+                    let mut range = range;
+                    if self.src.as_bytes().get(range.end) == Some(&b' ') {
+                        range.end += 1;
+                    }
                     self.push(range, SpanKind::Syntax(Syntax::TaskMarker(checked)));
                 }
                 Event::Rule => {
@@ -413,7 +419,17 @@ impl<'a> Builder<'a> {
         }
         let gap = self.cursor..to;
         let text = &self.src[gap.clone()];
-        let kind = if text.trim().is_empty() {
+        let in_table = self.stack.iter().any(|o| {
+            matches!(
+                o.tag,
+                OpenTag::Table | OpenTag::TableHead | OpenTag::TableRow | OpenTag::TableCell
+            )
+        });
+        let kind = if in_table && !text.contains('\n') {
+            // Cell padding is part of the row's markup, not droppable
+            // whitespace: a revealed or edited row keeps its spacing.
+            SpanKind::Syntax(Syntax::TableMarkup)
+        } else if text.trim().is_empty() {
             SpanKind::Whitespace
         } else {
             SpanKind::Syntax(self.classify_gap(gap.start, text))
@@ -605,6 +621,28 @@ mod tests {
             .map(|b| tree.item_index(list, b.range.start))
             .collect();
         assert_eq!(items, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn table_padding_and_task_spaces_are_not_hidden() {
+        // Regression for #21.
+        use crate::GfmParser;
+        let src = "|  a  |\n| --- |\n|  b  |\n";
+        let pad = GfmParser
+            .parse(src)
+            .map
+            .iter()
+            .find(|s| s.range == (1..3))
+            .unwrap();
+        assert_eq!(pad.kind, SpanKind::Syntax(Syntax::TableMarkup));
+        let src = "- [x] done\n";
+        let marker = GfmParser
+            .parse(src)
+            .map
+            .iter()
+            .find(|s| matches!(s.kind, SpanKind::Syntax(Syntax::TaskMarker(_))))
+            .unwrap();
+        assert_eq!(&src[marker.range], "[x] ");
     }
 
     #[test]
