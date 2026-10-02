@@ -1705,6 +1705,7 @@ dependencies = [
  "inkmark-parse",
  "inkmark-text",
  "inkmark-view",
+ "percent-encoding",
  "rfd",
  "tempfile",
 ]

@@ -12,6 +12,7 @@ inkmark-files.workspace = true
 inkmark-minimap.workspace = true
 inkmark-parse.workspace = true
 inkmark-text.workspace = true
+percent-encoding.workspace = true
 inkmark-view.workspace = true
 rfd.workspace = true
 

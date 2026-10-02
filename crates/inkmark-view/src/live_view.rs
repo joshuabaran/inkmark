@@ -247,6 +247,8 @@ pub struct LiveView {
     seal_undo: bool,
     /// A short explanation for a key that did nothing, for the status bar.
     hint: Option<&'static str>,
+    /// A link was Ctrl+clicked at this offset; the app follows it.
+    follow: Option<usize>,
     /// The selection was set from outside in current offsets: don't map it
     /// through edits on the next sync.
     selection_current: bool,
@@ -281,6 +283,7 @@ impl LiveView {
             show_minimap: true,
             seal_undo: false,
             hint: None,
+            follow: None,
             selection_current: false,
             pending_scroll: None,
             checkboxes: Vec::new(),
@@ -288,6 +291,11 @@ impl LiveView {
             font_size: 16.0,
             line_height: 26.0,
         }
+    }
+
+    /// The offset of a link Ctrl+clicked since the last call.
+    pub fn take_follow(&mut self) -> Option<usize> {
+        self.follow.take()
     }
 
     /// Why the last key did nothing, if it's not obvious. Taken once.
@@ -522,8 +530,19 @@ impl LiveView {
             self.preedit.clear();
         }
         let parse = state.output();
-        if !box_clicked {
-            self.handle_pointer(ui, &response, doc, parse, frame);
+        let link = crate::link_under_pointer(ui, &response, Some(parse), |pos| {
+            self.offset_at(doc, parse, frame, pos)
+        });
+        // Over a link with Ctrl held, clicks follow it and nothing else
+        // (not even the release half of a double click).
+        match link {
+            Some((at, pressed)) => {
+                if pressed {
+                    self.follow = Some(at);
+                }
+            }
+            None if !box_clicked => self.handle_pointer(ui, &response, doc, parse, frame),
+            None => {}
         }
         let mut minimap_hovered = false;
         if let Some(r) = minimap {
@@ -1950,19 +1969,7 @@ fn footnote_label(
         .end
         .min(def.range.end);
     let head = doc.slice(def.range.start..line_end);
-    let rest = head.strip_prefix("[^")?;
-    let mut escaped = false;
-    for (i, c) in rest.char_indices() {
-        match c {
-            _ if escaped => escaped = false,
-            '\\' => escaped = true,
-            ']' => return rest[i + 1..].starts_with(':').then(|| rest[..i].to_owned()),
-            // An unescaped `[` can't be in a label: not a definition marker.
-            '[' => return None,
-            _ => {}
-        }
-    }
-    None
+    inkmark_parse::definition_label(&head).map(str::to_owned)
 }
 
 /// "•" (by nesting depth) for bullet items. Ordered items count up from

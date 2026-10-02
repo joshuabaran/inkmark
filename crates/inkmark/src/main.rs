@@ -36,6 +36,7 @@ const OPEN_FOLDER: KeyboardShortcut =
 const TOGGLE_BROWSER: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::E);
 const NEW_FILE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
+const BACK: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowLeft);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -50,6 +51,7 @@ enum Pane {
     Live,
 }
 
+mod links;
 mod measure;
 mod recent;
 mod sidebar;
@@ -120,6 +122,20 @@ enum DialogResult {
     MoveTo(PathBuf, Option<PathBuf>),
 }
 
+/// A place in a document to come back to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Place {
+    path: Option<PathBuf>,
+    offset: usize,
+}
+
+/// What to do once a file opened by following a link is parsed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Jump {
+    Anchor(String),
+    Offset(usize),
+}
+
 #[derive(Clone)]
 struct RenamePrompt {
     path: PathBuf,
@@ -146,7 +162,14 @@ struct App {
     /// The last thing that failed (open, save, a dialog), until dismissed.
     error: Option<String>,
     /// A pane's explanation for a key that did nothing, shown for a moment.
-    hint: Option<(&'static str, Instant)>,
+    hint: Option<(String, Instant)>,
+    /// Where followed links were clicked, most recent last (Alt+Left).
+    back: Vec<Place>,
+    /// Where to put the caret once the file being opened has been parsed.
+    pending_jump: Option<(PathBuf, Jump)>,
+    /// Tests record URLs here instead of starting a browser.
+    #[cfg(test)]
+    opened_urls: Vec<String>,
     dialog: Option<Receiver<DialogResult>>,
     confirm: Option<Confirm>,
     close_after_save: bool,
@@ -206,6 +229,10 @@ impl App {
             banner: None,
             error: None,
             hint: None,
+            back: Vec::new(),
+            pending_jump: None,
+            #[cfg(test)]
+            opened_urls: Vec::new(),
             dialog: None,
             confirm: None,
             close_after_save: false,
@@ -526,7 +553,7 @@ impl App {
         } else if live {
             self.focus_pane(ctx, Pane::Live);
         }
-        let (open_folder, save_as, save, open, new_file) = ctx.input_mut(|i| {
+        let (open_folder, save_as, save, open, new_file, back) = ctx.input_mut(|i| {
             (
                 // Ctrl+Shift+O before Ctrl+O: extra Shift still matches Open.
                 i.consume_shortcut(&OPEN_FOLDER),
@@ -534,8 +561,12 @@ impl App {
                 i.consume_shortcut(&SAVE),
                 i.consume_shortcut(&OPEN),
                 i.consume_shortcut(&NEW_FILE),
+                i.consume_shortcut(&BACK),
             )
         });
+        if back {
+            self.go_back();
+        }
         if open_folder {
             self.spawn_dialog(DialogKind::Folder);
         } else if save_as {
@@ -649,7 +680,7 @@ impl App {
             if self.doc.is_dirty() {
                 ui.label("●");
             }
-            if let Some((hint, _)) = self.hint {
+            if let Some((hint, _)) = &self.hint {
                 ui.label(RichText::new(hint).color(Color32::from_rgb(230, 200, 120)));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1088,12 +1119,147 @@ impl App {
         }
     }
 
+    fn show_hint(&mut self, hint: impl Into<String>) {
+        self.hint = Some((hint.into(), Instant::now()));
+    }
+
+    /// Follows the link at `at` in the open document (Ctrl+click).
+    fn follow(&mut self, at: usize) {
+        let Some(link) = inkmark_parse::link_at(&self.doc, self.parse.output(), at) else {
+            return;
+        };
+        let here = Place {
+            path: self.doc.path().map(Path::to_path_buf),
+            offset: self.selection().head,
+        };
+        let dest = match link {
+            inkmark_parse::Link::Footnote(label) => {
+                match inkmark_parse::footnote_offset(&self.doc, self.parse.output(), &label) {
+                    Some(offset) => {
+                        self.back.push(here);
+                        self.jump_to(offset);
+                    }
+                    None => self.show_hint(format!("No note [^{label}] in this file")),
+                }
+                return;
+            }
+            inkmark_parse::Link::Dest(dest) => dest,
+        };
+        let base = self
+            .doc
+            .path()
+            .and_then(Path::parent)
+            .map_or_else(|| self.browser.root().to_path_buf(), Path::to_path_buf);
+        match links::resolve(&dest, &base) {
+            links::Target::External(url) => self.open_external(url),
+            links::Target::Anchor(anchor) => {
+                if self.jump_to_anchor(&anchor) {
+                    self.back.push(here);
+                }
+            }
+            links::Target::File { path, anchor } if Some(path.as_path()) == self.doc.path() => {
+                if anchor.is_none_or(|a| self.jump_to_anchor(&a)) {
+                    self.back.push(here);
+                }
+            }
+            links::Target::File { path, anchor } => {
+                self.back.push(here);
+                self.pending_jump = anchor.map(|a| (path.clone(), Jump::Anchor(a)));
+                self.request_open(path);
+            }
+            links::Target::Refused(reason) => self.show_hint(reason),
+        }
+    }
+
+    /// Alt+Left: back to where the last followed link was clicked.
+    fn go_back(&mut self) {
+        let Some(place) = self.back.pop() else {
+            return;
+        };
+        match place.path {
+            Some(path) if Some(path.as_path()) != self.doc.path() => {
+                self.pending_jump = Some((path.clone(), Jump::Offset(place.offset)));
+                self.request_open(path);
+            }
+            _ => self.jump_to(place.offset.min(self.doc.len())),
+        }
+    }
+
+    fn jump_to_anchor(&mut self, anchor: &str) -> bool {
+        match inkmark_parse::heading_offset(&self.doc, self.parse.output(), anchor) {
+            Some(offset) => {
+                self.jump_to(offset);
+                true
+            }
+            None => {
+                self.show_hint(format!("No heading #{anchor} in this file"));
+                false
+            }
+        }
+    }
+
+    /// Puts the caret at `offset` in the focused pane, scrolled into view.
+    fn jump_to(&mut self, offset: usize) {
+        let caret = inkmark_buffer::Selection::caret(offset);
+        match self.focus {
+            Pane::Code => self.code.set_selection(caret),
+            Pane::Live => self.live.set_selection(caret),
+        }
+    }
+
+    /// Applies a jump waiting on a file opened from a link, once that file
+    /// is open and parsed. Dropped if another file ended up open instead
+    /// (the open failed, or the unsaved-changes prompt was cancelled).
+    fn apply_pending_jump(&mut self) {
+        let Some((path, jump)) = self.pending_jump.clone() else {
+            return;
+        };
+        if self.doc.path() != Some(path.as_path()) {
+            if self.confirm.is_none() {
+                self.pending_jump = None;
+            }
+            return;
+        }
+        if !self.parse.is_settled() {
+            return;
+        }
+        self.pending_jump = None;
+        match jump {
+            Jump::Anchor(anchor) => {
+                self.jump_to_anchor(&anchor);
+            }
+            Jump::Offset(offset) => self.jump_to(offset.min(self.doc.len())),
+        }
+    }
+
+    /// Opens an `http(s)` or `mailto` link in the default app.
+    fn open_external(&mut self, url: String) {
+        #[cfg(test)]
+        {
+            self.opened_urls.push(url);
+        }
+        #[cfg(not(test))]
+        match std::process::Command::new("xdg-open").arg(&url).spawn() {
+            // Reaped on a thread so it doesn't linger as a zombie.
+            Ok(mut child) => {
+                std::thread::spawn(move || child.wait());
+            }
+            Err(e) => self.error = Some(format!("Couldn't open {url}: {e}")),
+        }
+    }
+
     fn panes(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if let Some(hint) = self.live.take_hint() {
-            self.hint = Some((hint, Instant::now()));
+            self.show_hint(hint);
         }
-        if let Some((_, shown)) = self.hint {
+        // Ctrl+clicks from the last frame, now that the click is over.
+        if let Some(at) = self.live.take_follow().or(self.code.take_follow()) {
+            self.follow(at);
+        }
+        self.apply_pending_jump();
+        if let Some((_, shown)) = &self.hint {
+            let shown = *shown;
             if shown.elapsed() >= HINT_TIME {
                 self.hint = None;
             } else {
@@ -2072,5 +2238,129 @@ mod tests {
         assert!(bin.path().join("a.md").exists());
         assert_eq!(text(&app), "a\n");
         assert!(matches!(app.banner, Some(Banner::DiskMissing)));
+    }
+
+    /// Frames until the parse is in and any jump from a followed link is done.
+    fn settle(ctx: &egui::Context, app: &mut App, time: &mut f64) {
+        let start = Instant::now();
+        while !app.parse.is_settled() || app.pending_jump.is_some() {
+            drive(ctx, app, time, vec![]);
+            assert!(start.elapsed() < Duration::from_secs(5), "never settled");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drive(ctx, app, time, vec![]);
+    }
+
+    fn offset_of(app: &App, needle: &str) -> usize {
+        text(app).find(needle).unwrap()
+    }
+
+    #[test]
+    fn following_a_link_to_another_note_and_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "Intro.\n\nSee [the second part](b.md#second-part).\n").unwrap();
+        fs::write(&b, "# First\n\ntext\n\n## Second part\n\nend\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        let clicked_from = offset_of(&app, "Intro") + 2;
+        app.jump_to(clicked_from);
+        drive(&ctx, &mut app, &mut time, vec![]);
+        app.follow(offset_of(&app, "second part"));
+        settle(&ctx, &mut app, &mut time);
+        assert_eq!(app.doc.path(), Some(b.as_path()));
+        assert_eq!(app.selection().head, offset_of(&app, "Second part"));
+        // Alt+Left: back to a.md, where the caret was.
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::ArrowLeft, egui::Modifiers::ALT)],
+        );
+        settle(&ctx, &mut app, &mut time);
+        assert_eq!(app.doc.path(), Some(a.as_path()));
+        assert_eq!(app.selection().head, clicked_from);
+        assert!(app.back.is_empty());
+    }
+
+    #[test]
+    fn following_a_link_asks_before_dropping_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "[next](b.md)\n").unwrap();
+        fs::write(dir.path().join("b.md"), "# B\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        type_into(&mut app, "draft");
+        drive(&ctx, &mut app, &mut time, vec![]);
+        app.follow(1);
+        assert_eq!(
+            app.confirm,
+            Some(Confirm::OpenPath(dir.path().join("b.md")))
+        );
+        assert_eq!(app.doc.path(), Some(a.as_path()));
+        assert!(text(&app).ends_with("draft"));
+    }
+
+    #[test]
+    fn web_links_open_outside_and_other_targets_explain_themselves() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(
+            &a,
+            "[site](https://example.org/x) [pic](photo.png) [js](javascript:x) [gone](#nowhere)\n",
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        app.follow(offset_of(&app, "site"));
+        assert_eq!(app.opened_urls, vec!["https://example.org/x".to_owned()]);
+        for (needle, says) in [
+            ("pic", "photo.png"),
+            ("js]", "javascript"),
+            ("gone", "#nowhere"),
+        ] {
+            app.hint = None;
+            app.follow(offset_of(&app, needle));
+            let hint = app
+                .hint
+                .as_ref()
+                .map(|(h, _)| h.clone())
+                .unwrap_or_default();
+            assert!(hint.contains(says), "{needle}: {hint:?}");
+        }
+        assert_eq!(app.doc.path(), Some(a.as_path()));
+        assert!(
+            app.back.is_empty(),
+            "nothing followed, nothing to go back to"
+        );
+    }
+
+    #[test]
+    fn a_footnote_reference_jumps_to_its_note_and_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "Claim[^1] here.\n\nMore.\n\n[^1]: The source.\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a));
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        app.jump_to(2);
+        app.follow(offset_of(&app, "[^1]"));
+        assert_eq!(app.selection().head, offset_of(&app, "The source"));
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::ArrowLeft, egui::Modifiers::ALT)],
+        );
+        assert_eq!(app.selection().head, 2);
     }
 }
