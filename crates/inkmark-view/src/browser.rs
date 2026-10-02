@@ -29,6 +29,25 @@ pub struct BrowserOutput {
     pub open_folder: bool,
     /// New file, in the selected folder or the root.
     pub new_file: bool,
+    /// Rename… (F2 or the context menu). The app asks for the new name.
+    pub rename: Option<PathBuf>,
+    /// Move to Trash (Delete or the context menu). The app confirms first.
+    pub trash: Option<PathBuf>,
+    /// Move to… The app shows the portal folder picker.
+    pub move_to: Option<PathBuf>,
+    /// A row dropped onto a folder: (what, into which folder).
+    pub dropped: Option<(PathBuf, PathBuf)>,
+}
+
+/// A row being dragged, as egui's drag-and-drop payload.
+struct Dragged(PathBuf);
+
+/// A context-menu choice, applied after the rows are drawn.
+enum MenuAction {
+    Rename(PathBuf),
+    MoveTo(PathBuf),
+    Trash(PathBuf),
+    NewFileIn(PathBuf),
 }
 
 struct Listed {
@@ -186,6 +205,19 @@ impl FileBrowser {
         self.tree.root().to_path_buf()
     }
 
+    /// Selects `path` (e.g. after a rename), once its row is listed.
+    pub fn select(&mut self, path: &Path) {
+        self.selected = Some(path.to_path_buf());
+    }
+
+    /// Something in `dir` was created, renamed, moved or removed by the
+    /// app: re-read it now rather than waiting for the watcher.
+    pub fn refresh_dir(&mut self, dir: &Path) {
+        for index in self.tree.dirs_at(dir) {
+            self.tree.invalidate(index);
+        }
+    }
+
     /// The file was just created here: re-read its folder and reveal it.
     pub fn note_created(&mut self, path: &Path) {
         if let Some(parent) = path.parent() {
@@ -237,6 +269,11 @@ impl FileBrowser {
         self.header(ui, &mut output);
         self.keys(ui, &mut output);
         self.rows_ui(ui, &mut output);
+        // Dropped on empty space below the rows: into the root. A row
+        // under the pointer has already taken the payload.
+        if let Some(dragged) = background.dnd_release_payload::<Dragged>() {
+            output.dropped = Some((dragged.0.clone(), self.tree.root().to_path_buf()));
+        }
         output
     }
 
@@ -367,15 +404,25 @@ impl FileBrowser {
         if !ui.memory(|m| m.has_focus(self.id)) {
             return;
         }
-        let (up, down, left, right, enter) = ui.input_mut(|input| {
+        let (up, down, left, right, enter, rename, delete) = ui.input_mut(|input| {
             (
                 input.consume_key(Modifiers::NONE, Key::ArrowUp),
                 input.consume_key(Modifiers::NONE, Key::ArrowDown),
                 input.consume_key(Modifiers::NONE, Key::ArrowLeft),
                 input.consume_key(Modifiers::NONE, Key::ArrowRight),
                 input.consume_key(Modifiers::NONE, Key::Enter),
+                input.consume_key(Modifiers::NONE, Key::F2),
+                input.consume_key(Modifiers::NONE, Key::Delete),
             )
         });
+        if let Some(path) = self.selected_path() {
+            if rename {
+                output.rename = Some(path.clone());
+            }
+            if delete {
+                output.trash = Some(path);
+            }
+        }
         if up {
             self.move_by(-1);
         }
@@ -390,6 +437,22 @@ impl FileBrowser {
         }
         if enter {
             self.activate(output);
+        }
+    }
+
+    /// The selected row's path, if it's still in the tree.
+    fn selected_path(&mut self) -> Option<PathBuf> {
+        let pos = self.selected_pos()?;
+        Some(self.tree.rows()[pos].path.clone())
+    }
+
+    /// The folder a row dropped on `row` goes into: the row itself if it's
+    /// a folder, else the folder it's in.
+    fn drop_dir(row: &Row) -> Option<PathBuf> {
+        if row.kind.is_dir() && !row.kind.looped() {
+            Some(row.path.clone())
+        } else {
+            row.path.parent().map(Path::to_path_buf)
         }
     }
 
@@ -489,6 +552,8 @@ impl FileBrowser {
             .auto_shrink([false, false])
             .id_salt(self.id);
         let mut clicked = None;
+        let mut menu = None;
+        let mut dropped = None;
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             // Compare the row with the range on screen, not with the height
@@ -513,11 +578,56 @@ impl FileBrowser {
                 self.painted = range.len();
                 for index in range {
                     let row = &rows[index];
-                    if let Some(rect) = self.paint_row(ui, row) {
-                        self.row_rects.insert(row.path.clone(), rect.rect);
-                        if rect.clicked() {
+                    if let Some(response) = self.paint_row(ui, row) {
+                        self.row_rects.insert(row.path.clone(), response.rect);
+                        if response.clicked() {
                             clicked = Some(index);
                         }
+                        response.dnd_set_drag_payload(Dragged(row.path.clone()));
+                        let target = Self::drop_dir(row);
+                        // A row can't go into itself or where it already is.
+                        let accepts = |dragged: &Dragged| {
+                            target.as_ref().is_some_and(|dir| {
+                                !dir.starts_with(&dragged.0) && dragged.0.parent() != Some(dir)
+                            })
+                        };
+                        if let Some(dragged) = response.dnd_hover_payload::<Dragged>()
+                            && accepts(&dragged)
+                        {
+                            ui.painter().rect_stroke(
+                                response.rect.shrink(1.0),
+                                2.0,
+                                egui::Stroke::new(1.5, theme::CARET),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        if let Some(dragged) = response.dnd_release_payload::<Dragged>()
+                            && accepts(&dragged)
+                            && let Some(dir) = target.clone()
+                        {
+                            dropped = Some((dragged.0.clone(), dir));
+                        }
+                        response.context_menu(|ui| {
+                            let path = row.path.clone();
+                            if ui.button("Rename…").clicked() {
+                                menu = Some(MenuAction::Rename(path.clone()));
+                                ui.close();
+                            }
+                            if ui.button("Move to…").clicked() {
+                                menu = Some(MenuAction::MoveTo(path.clone()));
+                                ui.close();
+                            }
+                            if ui.button("Move to Trash").clicked() {
+                                menu = Some(MenuAction::Trash(path.clone()));
+                                ui.close();
+                            }
+                            if let Some(dir) = Self::drop_dir(row)
+                                && ui.button("New file here…").clicked()
+                            {
+                                menu = Some(MenuAction::NewFileIn(dir));
+                                ui.close();
+                            }
+                        });
                     }
                 }
             });
@@ -528,6 +638,18 @@ impl FileBrowser {
             ui.memory_mut(|m| m.request_focus(self.id));
             self.activate_row(&row, output);
         }
+        output.dropped = output.dropped.take().or(dropped);
+        match menu {
+            Some(MenuAction::Rename(path)) => output.rename = Some(path),
+            Some(MenuAction::MoveTo(path)) => output.move_to = Some(path),
+            Some(MenuAction::Trash(path)) => output.trash = Some(path),
+            Some(MenuAction::NewFileIn(dir)) => {
+                // New file goes into the selected folder.
+                self.selected = Some(dir);
+                output.new_file = true;
+            }
+            None => {}
+        }
     }
 
     fn paint_row(&self, ui: &mut Ui, row: &Row) -> Option<Response> {
@@ -537,7 +659,8 @@ impl FileBrowser {
         }
         // Not focusable: arrow keys move egui focus to the next focusable
         // widget, which would take the tree's keys after one press.
-        let (rect, response) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::CLICK);
+        let (rect, response) =
+            ui.allocate_exact_size(vec2(width, ROW_H), Sense::CLICK | Sense::DRAG);
         let selected = self.selected.as_deref() == Some(row.path.as_path());
         let current = self.current.as_deref() == Some(row.path.as_path());
         if selected {

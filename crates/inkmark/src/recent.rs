@@ -51,6 +51,10 @@ impl Recent {
         self.entries.retain(|p| *p != path);
         self.entries.insert(0, path);
         self.entries.truncate(MAX_ENTRIES);
+        self.save();
+    }
+
+    fn save(&self) {
         let Some(store) = &self.store else { return };
         if let Some(dir) = store.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -63,6 +67,26 @@ impl Recent {
             .join("\n");
         text.push('\n');
         let _ = std::fs::write(store, text);
+    }
+
+    /// `old` (a file or a folder) was renamed or moved to `new`: entries
+    /// at or below it follow.
+    pub fn moved(&mut self, old: &Path, new: &Path) {
+        let (old, new) = (canonical(old), canonical(new));
+        let mut changed = false;
+        for entry in &mut self.entries {
+            if let Ok(rest) = entry.strip_prefix(&old) {
+                *entry = if rest.as_os_str().is_empty() {
+                    new.clone()
+                } else {
+                    new.join(rest)
+                };
+                changed = true;
+            }
+        }
+        if changed {
+            self.save();
+        }
     }
 }
 

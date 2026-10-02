@@ -15,8 +15,10 @@ disk are the only source of truth: no accounts, sync or plugins.
   linked automatically. Parsed by [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark)
   and checked against every example in the CommonMark and GFM specs.
 - **Per-pane minimaps**, images (PNG, JPEG, GIF, WebP, BMP), recent files.
-- **Folder sidebar**: browse a directory of notes, open one, and add a
-  new Markdown file. Rename, move and delete are not in yet.
+- **Folder sidebar**: browse a directory of notes; open, create, rename
+  and move them (drag and drop works), or move them to the trash.
+- **Links you can follow**: Ctrl+click a link to open another note, jump
+  to a heading or footnote, or open a web page; Alt+Left goes back.
 
 See [PLAN.md](PLAN.md) for the design, measurements and roadmap.
 
@@ -67,6 +69,9 @@ inkmark               # browses the current directory and shows recent files
 | Ctrl+Shift+O | Open a folder in the sidebar |
 | Ctrl+Shift+E | Show or hide the sidebar |
 | Ctrl+N | New Markdown file in the selected folder, or the folder you have open |
+| F2, Delete (sidebar) | Rename, or move to the trash, the selected file or folder |
+| Ctrl+click | Follow a link: a note, `#heading`, footnote, or web page |
+| Alt+Left | Back to where you followed the last link from |
 | Ctrl+R | Recent files |
 | Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y | Undo, redo (shared by both panes) |
 | Ctrl+B, Ctrl+I, Ctrl+\` | Toggle bold, italic, code |
@@ -85,8 +90,18 @@ The sidebar sits to the left of the panes. Up moves to the parent folder,
 Open Folder… picks a new root, and Refresh re-reads the folders that are
 expanded. Arrow keys move through the tree, Left and Right collapse and
 expand a folder, and Enter opens a Markdown file. A name without a
-Markdown extension gets `.md`. Width and whether the sidebar is showing
-are remembered under `$XDG_STATE_HOME/inkmark`.
+Markdown extension gets `.md`. Right-click an entry to rename it, move it
+(or drag it onto a folder), move it to the trash, or create a file next
+to it. Nothing is ever overwritten: a name that's taken is refused. If
+the open file is renamed or moved, it stays open with your unsaved
+edits. Width and whether the sidebar is showing are remembered under
+`$XDG_STATE_HOME/inkmark`.
+
+Ctrl+click follows a link in either pane. Links to other Markdown files
+(relative to the open file) open them, through the usual unsaved-changes
+prompt; `#heading` jumps by GitHub's anchor rules; a footnote reference
+jumps to its note; `http`, `https` and `mailto` links open in your
+default app. Other links aren't opened; the status bar says why.
 
 inkmark keeps your line endings (LF/CRLF) and byte-order mark, saves
 atomically, and never overwrites changes made by other programs without

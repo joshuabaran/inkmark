@@ -22,8 +22,13 @@ egui = "0.36.2"
 # Live-view images; formats limited to keep the build lean (no SVG).
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 notify = "8.2.0"
+percent-encoding = "2.3.2"
 pulldown-cmark = "0.13.4"
+# Renames that never overwrite (renameat2 RENAME_NOREPLACE).
+rustix = { version = "1.1.5", features = ["fs"] }
 rfd = "0.17.2"
+# The freedesktop trash for Delete in the file browser.
+trash = "5.2.9"
 # LF-only line breaks: files are normalized to LF on load (PLAN.md §1).
 ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
 unicode-segmentation = "1.13.3"

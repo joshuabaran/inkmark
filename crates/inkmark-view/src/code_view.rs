@@ -65,6 +65,8 @@ pub struct CodeView {
     selection_current: bool,
     /// A scroll position set from outside, applied after the next sync.
     pending_scroll: Option<ScrollPos>,
+    /// A link was Ctrl+clicked at this offset; the app follows it.
+    follow: Option<usize>,
     pub font_size: f32,
     pub line_height: f32,
 }
@@ -102,6 +104,7 @@ impl CodeView {
             show_minimap: true,
             selection_current: false,
             pending_scroll: None,
+            follow: None,
             font_size: 14.0,
             line_height: 21.0,
         }
@@ -117,6 +120,11 @@ impl CodeView {
         self.selection_current = true;
         self.preferred_x = None;
         self.reveal_caret = REVEAL_FRAMES;
+    }
+
+    /// The offset of a link Ctrl+clicked since the last call.
+    pub fn take_follow(&mut self) -> Option<usize> {
+        self.follow.take()
     }
 
     /// Shows `selection` without scrolling to it (mirroring the other pane).
@@ -258,7 +266,22 @@ impl CodeView {
         } else {
             self.preedit.clear();
         }
-        self.handle_pointer(ui, &response, doc, frame);
+        let current = parse
+            .as_deref()
+            .map(ParseState::output)
+            .filter(|p| p.map.len() == doc.len());
+        let link = crate::link_under_pointer(ui, &response, current, |pos| {
+            self.offset_at(doc, frame, pos)
+        });
+        // Over a link with Ctrl held, clicks follow it and nothing else.
+        match link {
+            Some((at, pressed)) => {
+                if pressed {
+                    self.follow = Some(at);
+                }
+            }
+            None => self.handle_pointer(ui, &response, doc, frame),
+        }
         let bar = Rect::from_min_max(pos2(frame.bar_left, rect.top()), rect.max);
         let mut minimap_hovered = false;
         if let Some(r) = frame.minimap {

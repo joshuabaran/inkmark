@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
@@ -8,7 +8,9 @@ use eframe::egui::{
     ViewportCommand, pos2,
 };
 use inkmark_buffer::{DiskStatus, Document, LineEnding, OpenError};
-use inkmark_files::{Launch, NewFileError, choose_root, create_new_file};
+use inkmark_files::{
+    Launch, NewFileError, SystemTrash, Trash, choose_root, create_new_file, move_into, rename,
+};
 use inkmark_parse::{GfmParser, ParseState};
 use inkmark_text::Fonts;
 use inkmark_view::{BrowserOutput, CodeView, FileBrowser, LiveView};
@@ -34,6 +36,7 @@ const OPEN_FOLDER: KeyboardShortcut =
 const TOGGLE_BROWSER: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::E);
 const NEW_FILE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
+const BACK: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowLeft);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -48,6 +51,7 @@ enum Pane {
     Live,
 }
 
+mod links;
 mod measure;
 mod recent;
 mod sidebar;
@@ -102,17 +106,43 @@ enum Confirm {
     Close,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum DialogKind {
     Open,
     SaveAs,
     Folder,
+    /// Pick the folder to move this file or folder into.
+    MoveTo(PathBuf),
 }
 
 enum DialogResult {
     Open(Option<PathBuf>),
     SaveAs(Option<PathBuf>),
     Folder(Option<PathBuf>),
+    MoveTo(PathBuf, Option<PathBuf>),
+}
+
+/// A place in a document to come back to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Place {
+    path: Option<PathBuf>,
+    offset: usize,
+}
+
+/// What to do once a file opened by following a link is parsed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Jump {
+    Anchor(String),
+    Offset(usize),
+}
+
+#[derive(Clone)]
+struct RenamePrompt {
+    path: PathBuf,
+    name: String,
+    error: Option<String>,
+    /// Select this many leading chars when the prompt first shows.
+    select: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -134,7 +164,14 @@ struct App {
     /// The last thing that failed (open, save, a dialog), until dismissed.
     error: Option<String>,
     /// A pane's explanation for a key that did nothing, shown for a moment.
-    hint: Option<(&'static str, Instant)>,
+    hint: Option<(String, Instant)>,
+    /// Where followed links were clicked, most recent last (Alt+Left).
+    back: Vec<Place>,
+    /// Where to put the caret once the file being opened has been parsed.
+    pending_jump: Option<(PathBuf, Jump)>,
+    /// Tests record URLs here instead of starting a browser.
+    #[cfg(test)]
+    opened_urls: Vec<String>,
     dialog: Option<Receiver<DialogResult>>,
     confirm: Option<Confirm>,
     close_after_save: bool,
@@ -149,6 +186,12 @@ struct App {
     sidebar: sidebar::Sidebar,
     /// Asks for a name, then creates the file and opens it.
     new_file: Option<NewFilePrompt>,
+    /// Asks for a new name for this file or folder.
+    rename: Option<RenamePrompt>,
+    /// Asks before moving this file or folder to the trash.
+    trash_confirm: Option<PathBuf>,
+    /// Where Move to Trash sends things; tests use their own.
+    trash: Box<dyn Trash>,
     /// A dialog took keyboard focus from the panes last frame.
     modal_was_open: bool,
     /// Tests receive the dialog kind instead of opening a portal window.
@@ -188,6 +231,10 @@ impl App {
             banner: None,
             error: None,
             hint: None,
+            back: Vec::new(),
+            pending_jump: None,
+            #[cfg(test)]
+            opened_urls: Vec::new(),
             dialog: None,
             confirm: None,
             close_after_save: false,
@@ -200,6 +247,9 @@ impl App {
             browser: FileBrowser::new(root),
             sidebar: sidebar::Sidebar::load(sidebar_store),
             new_file: None,
+            rename: None,
+            trash_confirm: None,
+            trash: Box::new(SystemTrash),
             modal_was_open: false,
             #[cfg(test)]
             dialog_hook: None,
@@ -321,7 +371,7 @@ impl App {
     fn spawn_dialog(&mut self, kind: DialogKind) {
         #[cfg(test)]
         if let Some(hook) = &self.dialog_hook {
-            let _ = hook.send(kind);
+            let _ = hook.send(kind.clone());
             return;
         }
         if self.dialog.is_some() {
@@ -352,6 +402,10 @@ impl App {
                         .save_file(),
                 ),
                 DialogKind::Folder => DialogResult::Folder(dialog.pick_folder()),
+                DialogKind::MoveTo(path) => {
+                    let folder = dialog.set_title("Move to…").pick_folder();
+                    DialogResult::MoveTo(path, folder)
+                }
             };
             let _ = tx.send(result);
         });
@@ -378,7 +432,8 @@ impl App {
             Ok(DialogResult::Open(None) | DialogResult::SaveAs(None)) => {
                 self.close_after_save = false;
             }
-            Ok(DialogResult::Folder(None)) => {}
+            Ok(DialogResult::MoveTo(path, Some(dir))) => self.move_entry(path, dir),
+            Ok(DialogResult::Folder(None) | DialogResult::MoveTo(_, None)) => {}
             Err(TryRecvError::Disconnected) => {
                 self.error = Some("The file dialog failed. Is xdg-desktop-portal running?".into());
             }
@@ -500,7 +555,7 @@ impl App {
         } else if live {
             self.focus_pane(ctx, Pane::Live);
         }
-        let (open_folder, save_as, save, open, new_file) = ctx.input_mut(|i| {
+        let (open_folder, save_as, save, open, new_file, back) = ctx.input_mut(|i| {
             (
                 // Ctrl+Shift+O before Ctrl+O: extra Shift still matches Open.
                 i.consume_shortcut(&OPEN_FOLDER),
@@ -508,8 +563,12 @@ impl App {
                 i.consume_shortcut(&SAVE),
                 i.consume_shortcut(&OPEN),
                 i.consume_shortcut(&NEW_FILE),
+                i.consume_shortcut(&BACK),
             )
         });
+        if back {
+            self.go_back();
+        }
         if open_folder {
             self.spawn_dialog(DialogKind::Folder);
         } else if save_as {
@@ -623,7 +682,7 @@ impl App {
             if self.doc.is_dirty() {
                 ui.label("●");
             }
-            if let Some((hint, _)) = self.hint {
+            if let Some((hint, _)) = &self.hint {
                 ui.label(RichText::new(hint).color(Color32::from_rgb(230, 200, 120)));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -640,7 +699,11 @@ impl App {
     /// While a dialog is open the panes don't get keys (typing mustn't edit
     /// the document behind it); focus returns when it closes.
     fn hold_focus_for_dialogs(&mut self, ctx: &egui::Context) {
-        let open = self.recent_list.is_some() || self.confirm.is_some() || self.new_file.is_some();
+        let open = self.recent_list.is_some()
+            || self.confirm.is_some()
+            || self.new_file.is_some()
+            || self.rename.is_some()
+            || self.trash_confirm.is_some();
         if open {
             self.code.release_focus(ctx);
             self.live.release_focus(ctx);
@@ -804,39 +867,19 @@ impl App {
         let Some(mut prompt) = self.new_file.clone() else {
             return;
         };
-        let (submit_key, cancel_key) = ctx.input_mut(|i| {
-            (
-                i.consume_key(Modifiers::NONE, Key::Enter),
-                i.consume_key(Modifiers::NONE, Key::Escape),
-            )
-        });
-        let mut submit = submit_key;
-        let mut cancel = cancel_key;
-        let field = egui::Id::new("new_file_name");
-        egui::Modal::new(egui::Id::new("new_file")).show(ctx, |ui| {
-            ui.set_min_width(420.0);
-            ui.heading("New file");
-            ui.label(prompt.dir.display().to_string());
-            if !ui.memory(|m| m.has_focus(field)) {
-                ui.memory_mut(|m| m.request_focus(field));
-            }
-            ui.add(
-                egui::TextEdit::singleline(&mut prompt.name)
-                    .id(field)
-                    .desired_width(f32::INFINITY),
-            );
-            if let Some(error) = &prompt.error {
-                ui.label(RichText::new(error).color(Color32::from_rgb(255, 140, 120)));
-            }
-            ui.horizontal(|ui| {
-                if ui.button("Create").clicked() {
-                    submit = true;
-                }
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
-                }
-            });
-        });
+        let detail = prompt.dir.display().to_string();
+        let (submit, cancel) = name_modal(
+            ctx,
+            PromptText {
+                id: "new_file",
+                heading: "New file",
+                detail: &detail,
+                action: "Create",
+            },
+            &mut prompt.name,
+            prompt.error.as_deref(),
+            None,
+        );
         if cancel {
             self.new_file = None;
             return;
@@ -844,6 +887,187 @@ impl App {
         self.new_file = Some(prompt);
         if submit {
             self.submit_new_file();
+        }
+    }
+
+    /// Rename… for a sidebar entry: the whole name, with the part before
+    /// a file's extension selected, so typing keeps the extension.
+    fn begin_rename(&mut self, path: PathBuf) {
+        if self.confirm.is_some() || self.new_file.is_some() {
+            return;
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let stem_chars = match path.extension() {
+            Some(ext) if !path.is_dir() => {
+                name.chars().count() - ext.to_string_lossy().chars().count() - 1
+            }
+            _ => name.chars().count(),
+        };
+        self.recent_list = None;
+        self.rename = Some(RenamePrompt {
+            path,
+            name,
+            error: None,
+            select: Some(stem_chars),
+        });
+    }
+
+    fn rename_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut prompt) = self.rename.clone() else {
+            return;
+        };
+        let detail = prompt.path.display().to_string();
+        let (submit, cancel) = name_modal(
+            ctx,
+            PromptText {
+                id: "rename",
+                heading: "Rename",
+                detail: &detail,
+                action: "Rename",
+            },
+            &mut prompt.name,
+            prompt.error.as_deref(),
+            prompt.select.take(),
+        );
+        if cancel {
+            self.rename = None;
+            return;
+        }
+        self.rename = Some(prompt.clone());
+        if !submit {
+            return;
+        }
+        let was_unchanged = self.unchanged_if_affected(&prompt.path);
+        match rename(&prompt.path, &prompt.name) {
+            Ok(new) => {
+                self.rename = None;
+                self.moved(&prompt.path, &new, was_unchanged);
+            }
+            Err(e @ (inkmark_files::OpError::Exists(_) | inkmark_files::OpError::Invalid)) => {
+                if let Some(prompt) = &mut self.rename {
+                    // Not capitalized: the message may start with a file name.
+                    prompt.error = Some(format!("Can't rename: {e}"));
+                }
+            }
+            Err(e) => {
+                self.rename = None;
+                self.error = Some(format!(
+                    "Couldn't rename {}: {e}",
+                    display_name(&prompt.path)
+                ));
+            }
+        }
+    }
+
+    fn move_entry(&mut self, path: PathBuf, dir: PathBuf) {
+        let was_unchanged = self.unchanged_if_affected(&path);
+        match move_into(&path, &dir) {
+            Ok(new) if new == path => {}
+            Ok(new) => self.moved(&path, &new, was_unchanged),
+            Err(e) => {
+                self.error = Some(format!("Couldn't move {}: {e}", display_name(&path)));
+            }
+        }
+    }
+
+    /// Whether the open document is `path` or inside it, and matched the
+    /// disk just now (asked before a rename or move changes its ctime).
+    /// `false` when the document isn't affected.
+    fn unchanged_if_affected(&self, path: &Path) -> bool {
+        self.doc.path().is_some_and(|open| open.starts_with(path))
+            && matches!(self.doc.disk_status(), Ok(DiskStatus::Unchanged))
+    }
+
+    /// `old` became `new`: the document, the recent list and the sidebar
+    /// follow.
+    fn moved(&mut self, old: &Path, new: &Path, was_unchanged: bool) {
+        if let Some(open) = self.doc.path().map(Path::to_path_buf)
+            && let Ok(rest) = open.strip_prefix(old)
+        {
+            let followed = if rest.as_os_str().is_empty() {
+                new.to_path_buf()
+            } else {
+                new.join(rest)
+            };
+            self.doc.moved_to(followed, was_unchanged);
+        }
+        // Places to go back to, and a jump waiting on a file, follow too.
+        let follow = |p: &mut PathBuf| {
+            if let Ok(rest) = p.strip_prefix(old) {
+                *p = if rest.as_os_str().is_empty() {
+                    new.to_path_buf()
+                } else {
+                    new.join(rest)
+                };
+            }
+        };
+        for place in &mut self.back {
+            if let Some(path) = &mut place.path {
+                follow(path);
+            }
+        }
+        if let Some((path, _)) = &mut self.pending_jump {
+            follow(path);
+        }
+        self.recent.moved(old, new);
+        for dir in [old.parent(), new.parent()].into_iter().flatten() {
+            self.browser.refresh_dir(dir);
+        }
+        self.browser.select(new);
+    }
+
+    fn trash_ui(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.trash_confirm.clone() else {
+            return;
+        };
+        let (confirm_key, cancel_key) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::Enter),
+                i.consume_key(Modifiers::NONE, Key::Escape),
+            )
+        });
+        let (mut confirm, mut cancel) = (confirm_key, cancel_key);
+        let open_inside = self.doc.path().is_some_and(|open| open.starts_with(&path));
+        egui::Modal::new(egui::Id::new("trash")).show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            ui.heading(format!("Move “{}” to the trash?", display_name(&path)));
+            ui.label("You can restore it from your file manager's trash.");
+            if open_inside {
+                ui.label("It's open: your text stays in the editor until you close it.");
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Move to Trash").clicked() {
+                    confirm = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if cancel {
+            self.trash_confirm = None;
+        } else if confirm {
+            self.trash_confirm = None;
+            match self.trash.trash(&path) {
+                Ok(()) => {
+                    if let Some(dir) = path.parent() {
+                        self.browser.refresh_dir(dir);
+                    }
+                    if open_inside {
+                        self.banner = Some(Banner::DiskMissing);
+                    }
+                }
+                Err(e) => {
+                    self.error = Some(format!(
+                        "Couldn't move {} to the trash: {e}",
+                        display_name(&path)
+                    ));
+                }
+            }
         }
     }
 }
@@ -908,14 +1132,171 @@ impl App {
         if output.new_file {
             self.begin_new_file();
         }
+        if let Some(path) = &output.rename {
+            self.begin_rename(path.clone());
+        }
+        if let Some(path) = &output.trash
+            && self.confirm.is_none()
+        {
+            self.trash_confirm = Some(path.clone());
+        }
+        if let Some(path) = &output.move_to {
+            self.spawn_dialog(DialogKind::MoveTo(path.clone()));
+        }
+        if let Some((path, dir)) = &output.dropped {
+            self.move_entry(path.clone(), dir.clone());
+        }
+    }
+
+    fn show_hint(&mut self, hint: impl Into<String>) {
+        self.hint = Some((hint.into(), Instant::now()));
+    }
+
+    /// Follows the link at `at` in the open document (Ctrl+click).
+    fn follow(&mut self, at: usize) {
+        let Some(link) = inkmark_parse::link_at(&self.doc, self.parse.output(), at) else {
+            return;
+        };
+        let here = Place {
+            path: self.doc.path().map(Path::to_path_buf),
+            offset: self.selection().head,
+        };
+        let dest = match link {
+            inkmark_parse::Link::Footnote(label) => {
+                match inkmark_parse::footnote_offset(&self.doc, self.parse.output(), &label) {
+                    Some(offset) => {
+                        self.back.push(here);
+                        self.jump_to(offset);
+                    }
+                    None => self.show_hint(format!("No note [^{label}] in this file")),
+                }
+                return;
+            }
+            inkmark_parse::Link::Dest(dest) => dest,
+        };
+        let base = self
+            .doc
+            .path()
+            .and_then(Path::parent)
+            .map_or_else(|| self.browser.root().to_path_buf(), Path::to_path_buf);
+        match links::resolve(&dest, &base) {
+            links::Target::External(url) => self.open_external(url),
+            links::Target::Anchor(anchor) => {
+                if self.jump_to_anchor(&anchor) {
+                    self.back.push(here);
+                }
+            }
+            links::Target::File { path, anchor } if Some(path.as_path()) == self.doc.path() => {
+                if anchor.is_none_or(|a| self.jump_to_anchor(&a)) {
+                    self.back.push(here);
+                }
+            }
+            links::Target::File { path, .. } if !path.exists() => {
+                self.show_hint(format!("{} doesn't exist", display_name(&path)));
+            }
+            links::Target::File { path, anchor } => {
+                self.back.push(here);
+                self.pending_jump = anchor.map(|a| (path.clone(), Jump::Anchor(a)));
+                self.request_open(path);
+            }
+            links::Target::Refused(reason) => self.show_hint(reason),
+        }
+    }
+
+    /// Alt+Left: back to where the last followed link was clicked.
+    fn go_back(&mut self) {
+        let Some(place) = self.back.pop() else {
+            return;
+        };
+        match place.path {
+            // Gone since (deleted, or moved by another program): say so
+            // rather than open an empty new file in its place.
+            Some(path) if Some(path.as_path()) != self.doc.path() && !path.exists() => {
+                self.show_hint(format!("{} no longer exists", display_name(&path)));
+            }
+            Some(path) if Some(path.as_path()) != self.doc.path() => {
+                self.pending_jump = Some((path.clone(), Jump::Offset(place.offset)));
+                self.request_open(path);
+            }
+            _ => self.jump_to(place.offset.min(self.doc.len())),
+        }
+    }
+
+    fn jump_to_anchor(&mut self, anchor: &str) -> bool {
+        match inkmark_parse::heading_offset(&self.doc, self.parse.output(), anchor) {
+            Some(offset) => {
+                self.jump_to(offset);
+                true
+            }
+            None => {
+                self.show_hint(format!("No heading #{anchor} in this file"));
+                false
+            }
+        }
+    }
+
+    /// Puts the caret at `offset`, scrolled into view. Both panes: a
+    /// Ctrl+click lands here before its release moves focus to the clicked
+    /// pane, whose caret is then mirrored to the other.
+    fn jump_to(&mut self, offset: usize) {
+        let caret = inkmark_buffer::Selection::caret(offset);
+        self.code.set_selection(caret);
+        self.live.set_selection(caret);
+    }
+
+    /// Applies a jump waiting on a file opened from a link, once that file
+    /// is open and parsed. Dropped if another file ended up open instead
+    /// (the open failed, or the unsaved-changes prompt was cancelled).
+    fn apply_pending_jump(&mut self) {
+        let Some((path, jump)) = self.pending_jump.clone() else {
+            return;
+        };
+        if self.doc.path() != Some(path.as_path()) {
+            if self.confirm.is_none() {
+                self.pending_jump = None;
+            }
+            return;
+        }
+        if !self.parse.is_settled() {
+            return;
+        }
+        self.pending_jump = None;
+        match jump {
+            Jump::Anchor(anchor) => {
+                self.jump_to_anchor(&anchor);
+            }
+            Jump::Offset(offset) => self.jump_to(offset.min(self.doc.len())),
+        }
+    }
+
+    /// Opens an `http(s)` or `mailto` link in the default app.
+    fn open_external(&mut self, url: String) {
+        #[cfg(test)]
+        {
+            self.opened_urls.push(url);
+        }
+        #[cfg(not(test))]
+        match std::process::Command::new("xdg-open").arg(&url).spawn() {
+            // Reaped on a thread so it doesn't linger as a zombie.
+            Ok(mut child) => {
+                std::thread::spawn(move || child.wait());
+            }
+            Err(e) => self.error = Some(format!("Couldn't open {url}: {e}")),
+        }
     }
 
     fn panes(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if let Some(hint) = self.live.take_hint() {
-            self.hint = Some((hint, Instant::now()));
+            self.show_hint(hint);
         }
-        if let Some((_, shown)) = self.hint {
+        // Ctrl+clicks from the last frame, now that the click is over.
+        if let Some(at) = self.live.take_follow().or(self.code.take_follow()) {
+            self.follow(at);
+        }
+        self.apply_pending_jump();
+        if let Some((_, shown)) = &self.hint {
+            let shown = *shown;
             if shown.elapsed() >= HINT_TIME {
                 self.hint = None;
             } else {
@@ -995,6 +1376,8 @@ impl eframe::App for App {
             .show(ui, |ui| self.editor(ui));
         // After the sidebar, so New file opens the prompt on the click's frame.
         self.new_file_ui(&ctx);
+        self.rename_ui(&ctx);
+        self.trash_ui(&ctx);
         self.confirm_ui(&ctx);
         self.update_title(&ctx);
         self.measure_step(&ctx);
@@ -1018,6 +1401,79 @@ impl App {
             }
         }
     }
+}
+
+/// A file or folder's name for messages.
+fn display_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// A small dialog asking for a name. Returns (submit, cancel); Enter
+/// submits and Escape cancels.
+/// The fixed text of a name prompt.
+struct PromptText<'a> {
+    id: &'a str,
+    heading: &'a str,
+    /// The folder or path it applies to.
+    detail: &'a str,
+    /// The confirming button.
+    action: &'a str,
+}
+
+fn name_modal(
+    ctx: &egui::Context,
+    text: PromptText<'_>,
+    name: &mut String,
+    error: Option<&str>,
+    select: Option<usize>,
+) -> (bool, bool) {
+    let PromptText {
+        id,
+        heading,
+        detail,
+        action,
+    } = text;
+    let (mut submit, mut cancel) = ctx.input_mut(|i| {
+        (
+            i.consume_key(Modifiers::NONE, Key::Enter),
+            i.consume_key(Modifiers::NONE, Key::Escape),
+        )
+    });
+    let field = egui::Id::new((id, "name"));
+    egui::Modal::new(egui::Id::new(id)).show(ctx, |ui| {
+        ui.set_min_width(420.0);
+        ui.heading(heading);
+        ui.label(detail);
+        if !ui.memory(|m| m.has_focus(field)) {
+            ui.memory_mut(|m| m.request_focus(field));
+        }
+        let mut edit = egui::TextEdit::singleline(name)
+            .id(field)
+            .desired_width(f32::INFINITY)
+            .show(ui);
+        if let Some(n) = select {
+            use egui::text::{CCursor, CCursorRange};
+            edit.state
+                .cursor
+                .set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(n))));
+            edit.state.store(ui.ctx(), field);
+        }
+        if let Some(error) = error {
+            ui.label(RichText::new(error).color(Color32::from_rgb(255, 140, 120)));
+        }
+        ui.horizontal(|ui| {
+            if ui.button(action).clicked() {
+                submit = true;
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+        });
+    });
+    (submit, cancel)
 }
 
 #[cfg(test)]
@@ -1211,6 +1667,8 @@ mod tests {
             app.hold_focus_for_dialogs(ui.ctx());
             app.editor(ui);
             app.new_file_ui(ui.ctx());
+            app.rename_ui(ui.ctx());
+            app.trash_ui(ui.ctx());
         });
         out.textures_delta.clear();
     }
@@ -1680,5 +2138,459 @@ mod tests {
         app.check_disk(&ctx);
         assert!(matches!(app.banner, Some(Banner::DiskChanged)));
         assert_eq!(app.error.as_deref(), Some("Couldn't save: disk full"));
+    }
+
+    /// A trash that moves things into a folder of the test's own.
+    struct FolderTrash(PathBuf);
+
+    impl Trash for FolderTrash {
+        fn trash(&self, path: &Path) -> std::io::Result<()> {
+            fs::rename(path, self.0.join(path.file_name().unwrap()))
+        }
+    }
+
+    #[test]
+    fn renaming_the_open_file_keeps_its_unsaved_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("draft.md");
+        fs::write(&old, "one\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(old.clone()));
+        type_into(&mut app, "unsaved\n");
+        app.begin_rename(old.clone());
+        assert_eq!(app.rename.as_ref().unwrap().name, "draft.md");
+        let mut time = 0.0;
+        // The stem is selected: typing replaces it and keeps `.md`.
+        drive(&ctx, &mut app, &mut time, vec![]);
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![egui::Event::Text("final".into())],
+        );
+        assert_eq!(app.rename.as_ref().unwrap().name, "final.md");
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        let new = dir.path().join("final.md");
+        assert!(app.rename.is_none());
+        assert_eq!(app.doc.path(), Some(new.as_path()));
+        assert_eq!(text(&app), "one\nunsaved\n");
+        assert!(app.doc.is_dirty());
+        // The rename itself isn't a change on disk.
+        app.next_disk_check = Instant::now();
+        app.check_disk(&ctx);
+        assert!(app.banner.is_none());
+        assert_eq!(app.recent.entries()[0], new.canonicalize().unwrap());
+        // Saving writes to the new name.
+        app.save();
+        assert_eq!(fs::read_to_string(&new).unwrap(), "one\nunsaved\n");
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn renaming_to_a_taken_name_says_so_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(dir.path().join("b.md"), "b\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        app.begin_rename(a.clone());
+        app.rename.as_mut().unwrap().name = "b.md".into();
+        let mut time = 0.0;
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        let prompt = app.rename.as_ref().expect("still asking");
+        assert!(
+            prompt.error.as_deref().unwrap().contains("b.md"),
+            "{:?}",
+            prompt.error
+        );
+        assert_eq!(fs::read_to_string(dir.path().join("b.md")).unwrap(), "b\n");
+        assert_eq!(app.doc.path(), Some(a.as_path()));
+    }
+
+    #[test]
+    fn moving_the_folder_of_the_open_file_takes_the_document_along() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        let archive = dir.path().join("archive");
+        fs::create_dir(&notes).unwrap();
+        fs::create_dir(&archive).unwrap();
+        let file = notes.join("a.md");
+        fs::write(&file, "a\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(file.clone()));
+        let (hook, kinds) = mpsc::channel();
+        app.dialog_hook = Some(hook);
+        app.apply_browser(&BrowserOutput {
+            move_to: Some(notes.clone()),
+            ..Default::default()
+        });
+        assert_eq!(kinds.try_recv().unwrap(), DialogKind::MoveTo(notes.clone()));
+        app.dialog_hook = None;
+        let (tx, rx) = mpsc::channel();
+        app.dialog = Some(rx);
+        tx.send(DialogResult::MoveTo(notes.clone(), Some(archive.clone())))
+            .unwrap();
+        app.poll_dialog(&ctx);
+        let moved = archive.join("notes/a.md");
+        assert!(moved.exists());
+        assert_eq!(app.doc.path(), Some(moved.as_path()));
+        app.next_disk_check = Instant::now();
+        app.check_disk(&ctx);
+        assert!(app.banner.is_none());
+
+        // Dropping a row works the same way, and a refusal is an error.
+        fs::write(dir.path().join("a.md"), "other\n").unwrap();
+        app.apply_browser(&BrowserOutput {
+            dropped: Some((moved.clone(), dir.path().to_path_buf())),
+            ..Default::default()
+        });
+        assert!(
+            app.error.as_deref().unwrap().contains("already exists"),
+            "{:?}",
+            app.error
+        );
+        assert_eq!(app.doc.path(), Some(moved.as_path()));
+    }
+
+    #[test]
+    fn trashing_asks_first_and_keeps_the_open_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        fs::write(&file, "a\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(file.clone()));
+        app.trash = Box::new(FolderTrash(bin.path().to_path_buf()));
+        app.apply_browser(&BrowserOutput {
+            trash: Some(file.clone()),
+            ..Default::default()
+        });
+        assert_eq!(app.trash_confirm, Some(file.clone()));
+        let mut time = 0.0;
+        // Escape cancels.
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Escape, egui::Modifiers::NONE)],
+        );
+        assert!(app.trash_confirm.is_none());
+        assert!(file.exists());
+        // Enter confirms.
+        app.trash_confirm = Some(file.clone());
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert!(!file.exists());
+        assert!(bin.path().join("a.md").exists());
+        assert_eq!(text(&app), "a\n");
+        assert!(matches!(app.banner, Some(Banner::DiskMissing)));
+    }
+
+    /// Frames until the parse is in and any jump from a followed link is done.
+    fn settle(ctx: &egui::Context, app: &mut App, time: &mut f64) {
+        let start = Instant::now();
+        while !app.parse.is_settled() || app.pending_jump.is_some() {
+            drive(ctx, app, time, vec![]);
+            assert!(start.elapsed() < Duration::from_secs(5), "never settled");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drive(ctx, app, time, vec![]);
+    }
+
+    fn offset_of(app: &App, needle: &str) -> usize {
+        text(app).find(needle).unwrap()
+    }
+
+    #[test]
+    fn following_a_link_to_another_note_and_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "Intro.\n\nSee [the second part](b.md#second-part).\n").unwrap();
+        fs::write(&b, "# First\n\ntext\n\n## Second part\n\nend\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        let clicked_from = offset_of(&app, "Intro") + 2;
+        app.jump_to(clicked_from);
+        drive(&ctx, &mut app, &mut time, vec![]);
+        app.follow(offset_of(&app, "second part"));
+        settle(&ctx, &mut app, &mut time);
+        assert_eq!(app.doc.path(), Some(b.as_path()));
+        assert_eq!(app.selection().head, offset_of(&app, "Second part"));
+        // Alt+Left: back to a.md, where the caret was.
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::ArrowLeft, egui::Modifiers::ALT)],
+        );
+        settle(&ctx, &mut app, &mut time);
+        assert_eq!(app.doc.path(), Some(a.as_path()));
+        assert_eq!(app.selection().head, clicked_from);
+        assert!(app.back.is_empty());
+    }
+
+    #[test]
+    fn following_a_link_asks_before_dropping_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "[next](b.md)\n").unwrap();
+        fs::write(dir.path().join("b.md"), "# B\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        type_into(&mut app, "draft");
+        drive(&ctx, &mut app, &mut time, vec![]);
+        app.follow(1);
+        assert_eq!(
+            app.confirm,
+            Some(Confirm::OpenPath(dir.path().join("b.md")))
+        );
+        assert_eq!(app.doc.path(), Some(a.as_path()));
+        assert!(text(&app).ends_with("draft"));
+    }
+
+    #[test]
+    fn web_links_open_outside_and_other_targets_explain_themselves() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(
+            &a,
+            "[site](https://example.org/x) [pic](photo.png) [js](javascript:x) [gone](#nowhere)\n",
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        app.follow(offset_of(&app, "site"));
+        assert_eq!(app.opened_urls, vec!["https://example.org/x".to_owned()]);
+        for (needle, says) in [
+            ("pic", "photo.png"),
+            ("js]", "javascript"),
+            ("gone", "#nowhere"),
+        ] {
+            app.hint = None;
+            app.follow(offset_of(&app, needle));
+            let hint = app
+                .hint
+                .as_ref()
+                .map(|(h, _)| h.clone())
+                .unwrap_or_default();
+            assert!(hint.contains(says), "{needle}: {hint:?}");
+        }
+        assert_eq!(app.doc.path(), Some(a.as_path()));
+        assert!(
+            app.back.is_empty(),
+            "nothing followed, nothing to go back to"
+        );
+    }
+
+    #[test]
+    fn a_footnote_reference_jumps_to_its_note_and_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "Claim[^1] here.\n\nMore.\n\n[^1]: The source.\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a));
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        app.jump_to(2);
+        app.follow(offset_of(&app, "[^1]"));
+        assert_eq!(app.selection().head, offset_of(&app, "The source"));
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::ArrowLeft, egui::Modifiers::ALT)],
+        );
+        assert_eq!(app.selection().head, 2);
+    }
+
+    #[test]
+    fn confirming_a_rename_unchanged_keeps_a_dotted_name() {
+        // Review of #24: `my.notes.md` used to lose its `.md`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("2024.01.02.md");
+        fs::write(&path, "x\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(path.clone()));
+        let mut time = 0.0;
+        app.begin_rename(path.clone());
+        drive(&ctx, &mut app, &mut time, vec![]);
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert!(app.rename.is_none());
+        assert!(path.exists());
+        assert_eq!(app.doc.path(), Some(path.as_path()));
+        // Editing the selected stem keeps the extension too.
+        app.begin_rename(path.clone());
+        drive(&ctx, &mut app, &mut time, vec![]);
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![egui::Event::Text("2024.01.03".into())],
+        );
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        let renamed = dir.path().join("2024.01.03.md");
+        assert!(renamed.exists());
+        assert_eq!(app.doc.path(), Some(renamed.as_path()));
+    }
+
+    #[test]
+    fn back_follows_a_rename_and_never_opens_a_missing_file() {
+        // Review of #24: Back to the old name used to open an empty new
+        // file there, dropping the note.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "Claim[^1].\n\n[^1]: Source.\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        app.jump_to(2);
+        app.follow(offset_of(&app, "[^1]"));
+        let b = dir.path().join("b.md");
+        app.begin_rename(a.clone());
+        app.rename.as_mut().unwrap().name = "b.md".into();
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert_eq!(app.doc.path(), Some(b.as_path()));
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::ArrowLeft, egui::Modifiers::ALT)],
+        );
+        assert_eq!(app.doc.path(), Some(b.as_path()));
+        assert_eq!(app.selection().head, 2);
+        assert_eq!(text(&app), "Claim[^1].\n\n[^1]: Source.\n");
+
+        // A place in a file deleted since: say so, stay put.
+        let gone = dir.path().join("gone.md");
+        app.back.push(Place {
+            path: Some(gone.clone()),
+            offset: 0,
+        });
+        app.go_back();
+        assert_eq!(app.doc.path(), Some(b.as_path()));
+        assert!(app.hint.as_ref().unwrap().0.contains("gone.md"));
+        assert!(!gone.exists());
+    }
+
+    #[test]
+    fn a_link_to_a_missing_note_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "[todo](later.md)\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        app.follow(1);
+        assert_eq!(app.doc.path(), Some(a.as_path()));
+        assert!(app.hint.as_ref().unwrap().0.contains("later.md"));
+        assert!(app.back.is_empty());
+    }
+
+    #[test]
+    fn ctrl_click_in_the_live_pane_jumps_while_the_code_pane_has_focus() {
+        // Review of #24: the jump ran before the click's release moved
+        // focus, and mirroring the clicked pane's old caret undid it.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "Claim[^1] here.\n\nMore.\n\n[^1]: The source.\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a));
+        app.sidebar.visible = false;
+        assert!(app.mode == Mode::Split && app.focus == Pane::Code);
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![egui::Event::ModifiersChanged(egui::Modifiers::COMMAND)],
+        );
+        // Find the reference in the live pane (right half) by the hand
+        // cursor Ctrl shows over links.
+        let frame_cursor = |app: &mut App, time: &mut f64, pos: egui::Pos2| {
+            *time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_max(
+                    egui::Pos2::ZERO,
+                    egui::pos2(1000.0, 700.0),
+                )),
+                time: Some(*time),
+                events: vec![egui::Event::PointerMoved(pos)],
+                ..Default::default()
+            };
+            let out = ctx.run_ui(input, |ui| app.editor(ui));
+            out.platform_output.cursor_icon
+        };
+        let y = 30.0;
+        let mut found = None;
+        for x in (520..900).step_by(3) {
+            for y in [y - 20.0, y - 10.0, y, y + 10.0] {
+                let pos = egui::pos2(x as f32, y);
+                if frame_cursor(&mut app, &mut time, pos) == egui::CursorIcon::PointingHand {
+                    found = Some(pos);
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let pos = found.expect("the reference shows a hand under Ctrl");
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        drive(&ctx, &mut app, &mut time, vec![button(true)]);
+        drive(&ctx, &mut app, &mut time, vec![button(false)]);
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+        );
+        let note = offset_of(&app, "The source");
+        assert_eq!(app.live.selection().head, note);
+        assert_eq!(app.code.selection().head, note);
     }
 }

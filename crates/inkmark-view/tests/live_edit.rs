@@ -23,6 +23,8 @@ struct Split {
     doc: Document,
     parse: ParseState,
     time: f64,
+    /// Modifier keys held during the next frames (e.g. Ctrl for Ctrl+click).
+    held: Modifiers,
 }
 
 impl Split {
@@ -39,6 +41,7 @@ impl Split {
             doc,
             parse,
             time: 0.0,
+            held: Modifiers::NONE,
         };
         s.live.request_focus(&s.ctx);
         s.settle();
@@ -131,12 +134,19 @@ impl Split {
         }
     }
 
+    /// Holds (or with `NONE`, releases) modifier keys from the next frame.
+    fn hold(&mut self, modifiers: Modifiers) {
+        self.held = modifiers;
+        self.frame(vec![Event::ModifiersChanged(modifiers)]);
+    }
+
     fn click(&mut self, pos: Pos2) {
+        let held = self.held;
         let button = |pressed| Event::PointerButton {
             pos,
             button: PointerButton::Primary,
             pressed,
-            modifiers: Modifiers::NONE,
+            modifiers: held,
         };
         self.frame(vec![Event::PointerMoved(pos), button(true)]);
         self.frame(vec![button(false)]);
@@ -655,4 +665,39 @@ fn typing_around_footnotes_patches_the_source() {
     s.caret(note);
     s.type_text("good ");
     assert_eq!(s.text(), "TextA[^1]B more.\n\n[^1]: The good note.\n");
+}
+
+#[test]
+fn ctrl_click_on_a_link_reports_it_and_leaves_the_caret() {
+    let src = "[a fairly long link text](other.md) after\n\nMore text.\n";
+    let mut s = Split::new(src);
+    let caret = src.find("More").unwrap();
+    s.caret(caret);
+    let on_link = pos2(LIVE_X + 60.0, 13.0);
+    // A plain click moves the caret into the link text, as usual.
+    s.click(on_link);
+    assert!(s.live.selection().head < src.find("](").unwrap());
+    assert_eq!(s.live.take_follow(), None);
+    s.caret(caret);
+    s.hold(Modifiers::COMMAND);
+    s.click(on_link);
+    s.hold(Modifiers::NONE);
+    let at = s.live.take_follow().expect("Ctrl+click follows the link");
+    assert!(at < src.find("](").unwrap(), "{at}");
+    assert_eq!(
+        s.live.selection(),
+        Selection::caret(caret),
+        "the caret stays"
+    );
+    assert_eq!(s.live.take_follow(), None, "taken once");
+    // Ctrl+click off any link is an ordinary click.
+    s.hold(Modifiers::COMMAND);
+    s.click(pos2(LIVE_X + 60.0, SCREEN.bottom() - 20.0));
+    s.hold(Modifiers::NONE);
+    assert_eq!(s.live.take_follow(), None);
+    // The code pane follows too.
+    s.hold(Modifiers::COMMAND);
+    s.click(pos2(30.0, 10.0));
+    s.hold(Modifiers::NONE);
+    assert!(s.code.take_follow().is_some());
 }
