@@ -7,3 +7,8 @@ publish.workspace = true
 
 [dependencies]
 pulldown-cmark.workspace = true
+inkmark-buffer.workspace = true
+
+[dev-dependencies]
+proptest = "1.11.0"
+serde_json = "1.0.151"

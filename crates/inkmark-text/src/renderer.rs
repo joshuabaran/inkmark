@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::Range;
 
 use cosmic_text::{
     Attrs, AttrsList, BufferLine, Ellipsize, Family, FontSystem, Hinting, LineEnding, Shaping, Wrap,
@@ -228,6 +229,20 @@ impl TextRenderer {
 
     /// Paints `text` with its top-left corner at `top_left` (points).
     pub fn draw_line(&mut self, out: &mut GlyphMeshes, text: &str, top_left: Pos2, color: Color32) {
+        self.draw_line_colored(out, text, top_left, color, &[]);
+    }
+
+    /// Like [`draw_line`](Self::draw_line), with byte ranges of `text` drawn
+    /// in other colors. `colors` must be sorted and non-overlapping. Colors
+    /// apply at paint time, so recoloring never re-shapes.
+    pub fn draw_line_colored(
+        &mut self,
+        out: &mut GlyphMeshes,
+        text: &str,
+        top_left: Pos2,
+        color: Color32,
+        colors: &[(Range<usize>, Color32)],
+    ) {
         let ppp = self.pixels_per_point;
         let line_height_px = self.line_height_px;
         let origin = ((top_left.x * ppp).round(), (top_left.y * ppp).round());
@@ -253,9 +268,12 @@ impl TextRenderer {
                 let tint = if g.is_color {
                     Color32::WHITE
                 } else {
-                    glyph.color_opt.map_or(color, |c| {
-                        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), c.a())
-                    })
+                    // Glyphs come in visual order, so search rather than walk.
+                    let i = colors.partition_point(|(r, _)| r.end <= glyph.start);
+                    match colors.get(i) {
+                        Some((r, c)) if r.start <= glyph.start => *c,
+                        _ => color,
+                    }
                 };
                 out.mesh(atlas, g.page).add_rect_with_uv(rect, g.uv, tint);
             }

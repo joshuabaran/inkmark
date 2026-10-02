@@ -7,13 +7,15 @@ use std::time::{Duration, Instant};
 
 use egui::output::IMEOutput;
 use egui::{
-    Color32, CursorIcon, Event, EventFilter, IMEPurpose, Id, ImeEvent, Key, Modifiers, Pos2, Rect,
-    Response, Sense, Ui, pos2, vec2,
+    CursorIcon, Event, EventFilter, IMEPurpose, Id, ImeEvent, Key, Modifiers, Pos2, Rect, Response,
+    Sense, Ui, pos2, vec2,
 };
 use inkmark_buffer::{Bias, Change, Document, Edit, EditKind, Selection};
+use inkmark_parse::{ParseOutput, ParseState};
 use inkmark_text::{GlyphMeshes, HeightCache, ScrollAnchor, TextConfig, TextRenderer};
 
 use crate::motion;
+use crate::theme::{self, BACKGROUND, CARET, SCROLL_THUMB, SCROLL_TRACK, SELECTION, TEXT};
 
 const PADDING: f32 = 12.0;
 const SCROLLBAR_WIDTH: f32 = 10.0;
@@ -25,13 +27,6 @@ const INDENT: &str = "    ";
 /// Frames we keep nudging the scroll after a caret move, while estimated
 /// heights between here and the caret get measured.
 const REVEAL_FRAMES: u8 = 3;
-
-const BACKGROUND: Color32 = Color32::from_rgb(22, 22, 26);
-const TEXT: Color32 = Color32::from_gray(212);
-const SELECTION: Color32 = Color32::from_rgba_premultiplied(38, 60, 98, 120);
-const CARET: Color32 = Color32::from_rgb(120, 170, 255);
-const SCROLL_TRACK: Color32 = Color32::from_gray(28);
-const SCROLL_THUMB: Color32 = Color32::from_gray(80);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Granularity {
@@ -116,7 +111,14 @@ impl CodeView {
         ctx.memory_mut(|m| m.request_focus(self.id));
     }
 
-    pub fn show(&mut self, ui: &mut Ui, doc: &mut Document) -> Response {
+    /// Draws and edits `doc`. `parse`, when given, is brought up to date
+    /// after this frame's edits and colors the Markdown syntax.
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        doc: &mut Document,
+        parse: Option<&mut ParseState>,
+    ) -> Response {
         let rect = ui.available_rect_before_wrap();
         ui.advance_cursor_after_rect(rect);
         let frame = Frame {
@@ -167,7 +169,13 @@ impl CodeView {
         if self.reveal_caret > 0 {
             self.scroll_caret_into_view(ui, doc, viewport);
         }
-        let caret = self.paint(ui, doc, frame, focused);
+        let parse = parse.map(|p| {
+            if let Some(wait) = p.update(doc) {
+                ui.ctx().request_repaint_after(wait);
+            }
+            &*p
+        });
+        let caret = self.paint(ui, doc, parse.map(ParseState::output), frame, focused);
 
         if focused {
             let to_global = ui
@@ -744,7 +752,14 @@ impl CodeView {
     // ---- painting -------------------------------------------------------------
 
     /// Paints the visible lines; returns the caret rect if it is on screen.
-    fn paint(&mut self, ui: &Ui, doc: &Document, frame: Frame, focused: bool) -> Option<Rect> {
+    fn paint(
+        &mut self,
+        ui: &Ui,
+        doc: &Document,
+        parse: Option<&ParseOutput>,
+        frame: Frame,
+        focused: bool,
+    ) -> Option<Rect> {
         let rect = frame.rect;
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, BACKGROUND);
@@ -753,6 +768,7 @@ impl CodeView {
         let caret_line = doc.byte_to_line(self.selection.head);
         let mut meshes = GlyphMeshes::default();
         let mut highlights = Vec::new();
+        let mut colors = Vec::new();
         let mut caret = None;
         let mut y = rect.top() - self.anchor.offset;
         let mut line = self.anchor.line;
@@ -786,7 +802,22 @@ impl CodeView {
                     caret = Some(r.translate(origin.to_vec2()));
                 }
             }
-            self.text.draw_line(&mut meshes, &text, origin, TEXT);
+            colors.clear();
+            if let Some(parse) = parse
+                && parse.map.len() == doc.len()
+            {
+                for span in parse.map.spans_in(range.clone()) {
+                    let local = span.range.start.max(range.start) - range.start
+                        ..span.range.end.min(range.end) - range.start;
+                    if let Some(color) = theme::code_color(&span)
+                        && !local.is_empty()
+                    {
+                        colors.push((local, color));
+                    }
+                }
+            }
+            self.text
+                .draw_line_colored(&mut meshes, &text, origin, TEXT, &colors);
             y += height;
             line += 1;
         }

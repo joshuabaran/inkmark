@@ -2,5 +2,6 @@
 
 mod code_view;
 pub mod motion;
+pub mod theme;
 
 pub use code_view::CodeView;

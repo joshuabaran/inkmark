@@ -5,6 +5,7 @@ use egui::{
     Rect, pos2,
 };
 use inkmark_buffer::{Document, Edit, EditKind, Selection};
+use inkmark_parse::{ParseState, PulldownParser};
 use inkmark_view::CodeView;
 
 const SCREEN: Rect = Rect::from_min_max(Pos2::ZERO, pos2(800.0, 600.0));
@@ -13,6 +14,7 @@ struct Harness {
     ctx: egui::Context,
     view: CodeView,
     doc: Document,
+    parse: Option<ParseState>,
     time: f64,
 }
 
@@ -24,6 +26,7 @@ impl Harness {
             ctx,
             view,
             doc: Document::from_text(text),
+            parse: None,
             time: 0.0,
         };
         h.view.request_focus(&h.ctx);
@@ -40,9 +43,9 @@ impl Harness {
             events,
             ..Default::default()
         };
-        let (view, doc) = (&mut self.view, &mut self.doc);
+        let (view, doc, parse) = (&mut self.view, &mut self.doc, &mut self.parse);
         let mut out = self.ctx.run_ui(input, |ui| {
-            view.show(ui, doc);
+            view.show(ui, doc, parse.as_mut());
         });
         // No renderer here to apply texture uploads; egui asserts they're handled.
         out.textures_delta.clear();
@@ -307,10 +310,16 @@ fn bench_typing_mid_document_5mb() {
     let line = "Some *typical* prose with a [link](https://example.com) and `code`.\n";
     let text = line.repeat(5_000_000 / line.len());
     let mut h = Harness::new(&text);
+    h.parse = Some(ParseState::new(
+        std::sync::Arc::new(PulldownParser),
+        &h.doc,
+        || {},
+    ));
     let mid = h.doc.line_to_byte(h.doc.line_count() / 2);
     h.view.set_selection(Selection::caret(mid));
-    for _ in 0..5 {
+    while !h.parse.as_ref().unwrap().is_settled() {
         h.frame(vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
     let before = h.doc.len();
@@ -332,10 +341,12 @@ fn bench_typing_mid_document_5mb() {
         times.push(start.elapsed().as_secs_f64() * 1000.0);
     }
     assert_eq!(h.doc.len(), before + 300, "every keystroke landed");
+    let parsed = h.parse.as_ref().unwrap().output();
+    parsed.map.validate(h.doc.len()).unwrap();
     times.sort_by(f64::total_cmp);
     let at = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
     println!(
-        "{:.1} MB, {} lines: keystroke→frame ms p50={:.2} p95={:.2} max={:.2}",
+        "{:.1} MB, {} lines, with parsing: keystroke→frame ms p50={:.2} p95={:.2} max={:.2}",
         h.doc.len() as f64 / 1e6,
         h.doc.line_count(),
         at(0.5),

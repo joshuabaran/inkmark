@@ -1,9 +1,11 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText, ViewportCommand};
 use inkmark_buffer::{DiskStatus, Document, LineEnding, OpenError};
+use inkmark_parse::{ParseState, PulldownParser};
 use inkmark_view::CodeView;
 
 /// How often we look for changes made to the file by other programs.
@@ -56,6 +58,7 @@ enum DialogResult {
 struct App {
     doc: Document,
     view: CodeView,
+    parse: ParseState,
     banner: Option<Banner>,
     dialog: Option<Receiver<DialogResult>>,
     confirm: Option<Confirm>,
@@ -70,6 +73,13 @@ impl App {
         let mut app = Self {
             doc: Document::default(),
             view: CodeView::new(ctx, egui::Id::new("code_view")),
+            parse: {
+                let ctx = ctx.clone();
+                // The swap point for a GFM parser later.
+                ParseState::new(Arc::new(PulldownParser), &Document::default(), move || {
+                    ctx.request_repaint()
+                })
+            },
             banner: None,
             dialog: None,
             confirm: None,
@@ -102,6 +112,7 @@ impl App {
             }
         }
         self.view.reset();
+        self.parse.reset(&self.doc);
         self.banner = None;
     }
 
@@ -380,7 +391,9 @@ impl eframe::App for App {
         egui::Panel::bottom("status").show(ui, |ui| self.status_ui(ui));
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show(ui, |ui| self.view.show(ui, &mut self.doc));
+            .show(ui, |ui| {
+                self.view.show(ui, &mut self.doc, Some(&mut self.parse))
+            });
         self.confirm_ui(&ctx);
         self.update_title(&ctx);
     }
