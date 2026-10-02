@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 /// Per-line heights (in points) with prefix sums, for virtualized scrolling.
 ///
 /// Heights start as estimates and are replaced as lines are laid out. Prefix
@@ -78,9 +80,17 @@ impl HeightCache {
 
     /// Records the laid-out height of `line`.
     pub fn set_measured(&mut self, line: usize, height: f32) {
-        if !self.measured[line] {
-            self.measured[line] = true;
-            self.measured_count += 1;
+        self.set(line, height, true);
+    }
+
+    fn set(&mut self, line: usize, height: f32, measured: bool) {
+        if self.measured[line] != measured {
+            self.measured[line] = measured;
+            if measured {
+                self.measured_count += 1;
+            } else {
+                self.measured_count -= 1;
+            }
         }
         let delta = f64::from(height) - f64::from(self.heights[line]);
         self.heights[line] = height;
@@ -91,6 +101,25 @@ impl HeightCache {
                 i += i.isolate_lowest_one();
             }
         }
+    }
+
+    /// Replaces lines `range` with unmeasured lines of the given estimated
+    /// heights. O(log n) per line when the line count is unchanged (typing
+    /// within a line), O(n) otherwise.
+    pub fn splice(&mut self, range: Range<usize>, estimates: impl ExactSizeIterator<Item = f32>) {
+        if estimates.len() == range.len() {
+            for (line, h) in range.zip(estimates) {
+                self.set(line, h, false);
+            }
+            return;
+        }
+        let removed_measured = self.measured[range.clone()].iter().filter(|&&m| m).count();
+        let added = estimates.len();
+        self.heights.splice(range.clone(), estimates);
+        self.measured
+            .splice(range, std::iter::repeat_n(false, added));
+        self.measured_count -= removed_measured;
+        self.rebuild_tree();
     }
 
     pub fn total(&self) -> f64 {
@@ -240,6 +269,27 @@ mod tests {
             short.scroll_by(ScrollAnchor::default(), 5.0, 30.0),
             ScrollAnchor::default()
         );
+    }
+
+    #[test]
+    fn splice_matches_naive() {
+        let mut heights: Vec<f32> = (0..200).map(|i| 10.0 + (i % 4) as f32).collect();
+        let mut cache = HeightCache::new(heights.iter().copied());
+        cache.set_measured(50, 99.0);
+        heights[50] = 99.0;
+        // Same count: in place, and the line becomes unmeasured again.
+        cache.splice(50..51, [12.0].into_iter());
+        heights[50] = 12.0;
+        assert_eq!(cache.measured_count(), 0);
+        // Grow and shrink.
+        cache.splice(10..12, [1.0, 2.0, 3.0, 4.0].into_iter());
+        heights.splice(10..12, [1.0, 2.0, 3.0, 4.0]);
+        cache.splice(100..150, [7.0].into_iter());
+        heights.splice(100..150, [7.0]);
+        assert_eq!(cache.len(), heights.len());
+        for line in [0, 10, 13, 14, 99, 100, 101, heights.len()] {
+            assert!((cache.offset_of(line) - naive_offset(&heights, line)).abs() < 1e-6);
+        }
     }
 
     #[test]

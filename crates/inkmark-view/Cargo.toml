@@ -10,3 +10,4 @@ egui.workspace = true
 inkmark-buffer.workspace = true
 inkmark-parse.workspace = true
 inkmark-text.workspace = true
+unicode-segmentation.workspace = true

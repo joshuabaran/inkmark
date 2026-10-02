@@ -6,6 +6,7 @@ use cosmic_text::{
 use egui::{Color32, Mesh, Painter, Pos2, Rect, Shape, pos2, vec2};
 
 use crate::atlas::{AtlasStats, GlyphAtlas};
+use crate::geometry::{ClusterSpan, LineGeometry, Row};
 
 const TAB_WIDTH: u16 = 4;
 /// Laid-out lines kept between frames before unused ones are dropped.
@@ -31,7 +32,8 @@ struct CachedLine {
 ///
 /// Everything is laid out in physical pixels with metrics hinting, then
 /// converted to points at paint time, so glyphs land on the pixel grid at any
-/// scale factor.
+/// scale factor. Layouts are cached by line text, so inserting or deleting
+/// lines doesn't invalidate the lines around them.
 pub struct TextRenderer {
     font_system: FontSystem,
     atlas: GlyphAtlas,
@@ -41,7 +43,7 @@ pub struct TextRenderer {
     line_height_px: f32,
     /// Average advance of typical text, for height estimates.
     avg_advance_px: f32,
-    lines: HashMap<usize, CachedLine>,
+    lines: HashMap<String, CachedLine>,
     frame: u64,
 }
 
@@ -121,7 +123,7 @@ impl TextRenderer {
         const SAMPLE: &str = "The quick brown fox jumps over the lazy dog, then naps; 0123456789.";
         let (config, ppp) = (self.config(), self.pixels_per_point);
         let mut line = self.new_line(SAMPLE);
-        let width = layout(&mut line, &mut self.font_system, config, ppp, false)
+        let width = layout(&mut line, &mut self.font_system, config, ppp, false, None)
             .iter()
             .map(|l| l.w)
             .sum::<f32>();
@@ -142,58 +144,101 @@ impl TextRenderer {
         rows * self.line_height_px / self.pixels_per_point
     }
 
-    /// Lays out `text` as line `index` (cached) and returns its height in points.
-    pub fn line_height(&mut self, index: usize, text: &str) -> f32 {
+    /// One empty row's height in points.
+    pub fn row_height(&self) -> f32 {
+        self.line_height_px / self.pixels_per_point
+    }
+
+    /// Lays out `text` (cached) and returns its height in points.
+    pub fn line_height(&mut self, text: &str) -> f32 {
         let rows = self
-            .cached_line(index, text)
+            .cached_line(text)
             .layout_opt()
             .map_or(1, |l| l.len().max(1));
-        rows as f32 * self.line_height_px / self.pixels_per_point
+        rows as f32 * self.row_height()
     }
 
-    /// Drops the cached layout of line `index`, e.g. after it was edited.
-    pub fn invalidate_line(&mut self, index: usize) {
-        self.lines.remove(&index);
+    /// Caret and hit-test geometry of `text`, in points from its top-left.
+    pub fn geometry(&mut self, text: &str) -> LineGeometry {
+        let ppp = self.pixels_per_point;
+        let line_height_px = self.line_height_px;
+        let line = self.cached_line(text);
+        let mut rows: Vec<Row> = Vec::new();
+        for run in line.layout_runs(None, line_height_px) {
+            let clusters: Vec<ClusterSpan> = run
+                .glyphs
+                .iter()
+                .map(|g| ClusterSpan {
+                    start: g.start,
+                    end: g.end,
+                    x: g.x / ppp,
+                    w: g.w / ppp,
+                })
+                .collect();
+            let prev_end = rows.last().map_or(0, |r| r.end);
+            let start = clusters.iter().map(|c| c.start).min().unwrap_or(prev_end);
+            let end = clusters.iter().map(|c| c.end).max().unwrap_or(prev_end);
+            rows.push(Row {
+                top: run.line_top / ppp,
+                height: run.line_height / ppp,
+                start,
+                end,
+                clusters,
+            });
+        }
+        if rows.is_empty() {
+            rows.push(Row {
+                height: self.row_height(),
+                ..Row::default()
+            });
+        }
+        // The last row owns everything to the end of the line.
+        if let Some(last) = rows.last_mut() {
+            last.end = last.end.max(text.len());
+        }
+        LineGeometry { rows }
     }
 
-    fn cached_line(&mut self, index: usize, text: &str) -> &mut BufferLine {
+    fn cached_line(&mut self, text: &str) -> &mut BufferLine {
         let (frame, config, ppp) = (self.frame, self.config(), self.pixels_per_point);
-        if !self.lines.contains_key(&index) {
+        // Snap glyphs from monospace fallback fonts (e.g. CJK) to whole cells.
+        let mono_width = config.monospace.then_some(self.avg_advance_px);
+        if !self.lines.contains_key(text) {
             let mut line = self.new_line(text);
-            layout(&mut line, &mut self.font_system, config, ppp, true);
+            layout(
+                &mut line,
+                &mut self.font_system,
+                config,
+                ppp,
+                true,
+                mono_width,
+            );
             self.lines.insert(
-                index,
+                text.to_owned(),
                 CachedLine {
                     line,
                     last_used: frame,
                 },
             );
         }
-        let cached = self.lines.get_mut(&index).expect("inserted above");
+        let cached = self.lines.get_mut(text).expect("inserted above");
         cached.last_used = frame;
         &mut cached.line
     }
 
-    /// Paints line `index` with its top-left corner at `top_left` (points).
-    pub fn draw_line(
-        &mut self,
-        out: &mut GlyphMeshes,
-        index: usize,
-        text: &str,
-        top_left: Pos2,
-        color: Color32,
-    ) {
+    /// Paints `text` with its top-left corner at `top_left` (points).
+    pub fn draw_line(&mut self, out: &mut GlyphMeshes, text: &str, top_left: Pos2, color: Color32) {
         let ppp = self.pixels_per_point;
         let line_height_px = self.line_height_px;
         let origin = ((top_left.x * ppp).round(), (top_left.y * ppp).round());
-        self.cached_line(index, text);
+        self.cached_line(text);
         let Self {
             font_system,
             atlas,
             lines,
             ..
         } = self;
-        let line = &lines[&index].line;
+        let line = &lines[text].line;
         for run in line.layout_runs(None, line_height_px) {
             for glyph in run.glyphs {
                 let physical = glyph.physical((origin.0, origin.1 + run.line_y), 1.0);
@@ -247,6 +292,7 @@ fn layout<'a>(
     config: TextConfig,
     pixels_per_point: f32,
     wrap: bool,
+    match_mono_width: Option<f32>,
 ) -> &'a [cosmic_text::LayoutLine] {
     let width = config
         .wrap_width
@@ -262,7 +308,7 @@ fn layout<'a>(
             Wrap::None
         },
         Ellipsize::None,
-        None,
+        match_mono_width,
         TAB_WIDTH,
         Hinting::Enabled,
     )

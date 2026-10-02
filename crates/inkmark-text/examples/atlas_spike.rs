@@ -401,14 +401,13 @@ impl Spike {
         let mut y = text_rect.min.y - self.anchor.offset;
         let mut line = self.anchor.line;
         while y < text_rect.max.y && line < self.lines.len() {
-            let height = self.text.line_height(line, &self.lines[line]);
+            let height = self.text.line_height(&self.lines[line]);
             self.heights.set_measured(line, height);
             if line == self.anchor.line && self.anchor.offset > height {
                 self.anchor.offset = height;
             }
             self.text.draw_line(
                 &mut meshes,
-                line,
                 &self.lines[line],
                 pos2(text_rect.min.x + PADDING, y),
                 Color32::from_gray(210),

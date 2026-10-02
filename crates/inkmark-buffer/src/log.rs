@@ -69,6 +69,7 @@ mod tests {
             start: at,
             old_end: at,
             new_end: at + len,
+            ..Change::default()
         }
     }
 

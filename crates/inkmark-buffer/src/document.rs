@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use ropey::Rope;
 
-use crate::edit::{Change, Edit, Selection};
+use crate::edit::{Change, Edit, LineChange, Selection};
 use crate::file::{self, DiskStamp, DiskStatus, Encoding, OpenError};
 use crate::history::{EditKind, History, Transaction};
 use crate::log::EditLog;
@@ -92,6 +92,25 @@ impl Document {
         self.path = Some(path);
         self.disk_stamp = Some(stamp);
         self.history.mark_saved();
+        Ok(())
+    }
+
+    /// Sets where the next `save` writes, for a file that doesn't exist yet.
+    pub fn set_path(&mut self, path: impl Into<PathBuf>) {
+        self.path = Some(path.into());
+        self.disk_stamp = None;
+    }
+
+    /// Accepts the file's current on-disk state as seen ("keep my version"),
+    /// so `disk_status` reports `Unchanged` until it changes again.
+    pub fn acknowledge_disk_state(&mut self) -> io::Result<()> {
+        if let Some(path) = &self.path {
+            self.disk_stamp = match DiskStamp::of(path) {
+                Ok(stamp) => Some(stamp),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e),
+            };
+        }
         Ok(())
     }
 
@@ -292,6 +311,11 @@ impl Document {
             }
         }
         let removed = String::from(self.rope.byte_slice(start..end));
+        let lines = LineChange {
+            start: self.rope.byte_to_line(start),
+            removed: removed.matches('\n').count(),
+            inserted: edit.insert.matches('\n').count(),
+        };
         let char_start = self.rope.byte_to_char(start);
         if start < end {
             self.rope.remove(char_start..self.rope.byte_to_char(end));
@@ -307,6 +331,7 @@ impl Document {
                 start,
                 old_end: end,
                 new_end,
+                lines,
             },
         );
         Ok(Edit::replace(start..new_end, removed))
@@ -507,6 +532,31 @@ mod tests {
             b"\xEF\xBB\xBF# Title\r\n\r\nBody\r\nMore\r\n"
         );
         assert_eq!(doc.disk_status().unwrap(), DiskStatus::Unchanged);
+    }
+
+    #[test]
+    fn changes_report_line_deltas() {
+        let mut doc = Document::from_text("one\ntwo\nthree\n");
+        let before = doc.epoch();
+        // Replace "o\ntwo\nth" (spanning lines 0-2) with "X\nY".
+        doc.apply(
+            vec![Edit::replace(2..10, "X\nY")],
+            caret(2),
+            caret(5),
+            EditKind::Other,
+        )
+        .unwrap();
+        let change = *doc.log().changes_since(before).unwrap().next().unwrap();
+        assert_eq!(
+            change.lines,
+            crate::edit::LineChange {
+                start: 0,
+                removed: 2,
+                inserted: 1
+            }
+        );
+        assert_eq!(doc.slice(0..doc.len()), "onX\nYree\n");
+        assert_eq!(doc.line_count(), 4 - 2 + 1);
     }
 
     #[test]

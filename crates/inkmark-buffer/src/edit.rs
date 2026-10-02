@@ -64,11 +64,23 @@ pub enum Bias {
 
 /// The shape of one applied edit: bytes `start..old_end` became `start..new_end`.
 /// This is what views and parse results need to shift their own offsets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Change {
     pub start: usize,
     pub old_end: usize,
     pub new_end: usize,
+    pub lines: LineChange,
+}
+
+/// The same change in lines: line `start` through line `start + removed`
+/// (old document) became line `start` through `start + inserted` (new).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LineChange {
+    pub start: usize,
+    /// Newlines in the replaced text.
+    pub removed: usize,
+    /// Newlines in the inserted text.
+    pub inserted: usize,
 }
 
 impl Change {
@@ -98,6 +110,7 @@ mod tests {
             start: 2,
             old_end: 4,
             new_end: 5,
+            ..Change::default()
         };
         assert_eq!(c.map(1, Bias::Right), 1);
         assert_eq!(c.map(2, Bias::Left), 2);
@@ -115,6 +128,7 @@ mod tests {
             start: 3,
             old_end: 3,
             new_end: 6,
+            ..Change::default()
         };
         assert_eq!(c.map(3, Bias::Left), 3);
         assert_eq!(c.map(3, Bias::Right), 6);
