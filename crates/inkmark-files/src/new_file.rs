@@ -1,5 +1,7 @@
 //! Creating one new Markdown file in a folder.
 
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::list::is_markdown_name;
@@ -14,8 +16,8 @@ pub enum NewFileError {
 }
 
 /// Writes an empty file in `dir`. A name without a Markdown extension gets
-/// `.md` appended (`notes` becomes `notes.md`, `notes.md` stays). An existing
-/// file is left untouched.
+/// `.md` appended (`notes` becomes `notes.md`, `notes.md` stays). Any
+/// existing directory entry, including a dangling symlink, is left untouched.
 pub fn create_new_file(dir: &Path, name: &str) -> Result<PathBuf, NewFileError> {
     let name = name.trim();
     if name.is_empty() {
@@ -30,9 +32,11 @@ pub fn create_new_file(dir: &Path, name: &str) -> Result<PathBuf, NewFileError> 
         format!("{name}.md")
     };
     let path = dir.join(file_name);
-    if path.exists() {
-        return Err(NewFileError::Exists(path));
+    // `create_new` fails if the name is taken, without following a symlink.
+    // An exists-then-write check would create the target of a dangling link.
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(_) => Ok(path),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Err(NewFileError::Exists(path)),
+        Err(error) => Err(NewFileError::Io(error.to_string())),
     }
-    std::fs::write(&path, "").map_err(|error| NewFileError::Io(error.to_string()))?;
-    Ok(path)
 }

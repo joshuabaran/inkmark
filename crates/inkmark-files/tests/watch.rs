@@ -2,7 +2,7 @@
 //! polls until a deadline; it does not sleep for a fixed time and hope.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::time::{Duration, Instant};
 
 use inkmark_files::{NewFileError, Tree, Watch, create_new_file};
@@ -115,5 +115,28 @@ fn new_file_appends_md_refuses_existing_names_and_writes_the_file() {
     assert_eq!(
         create_new_file(dir.path(), "nested/nope"),
         Err(NewFileError::Invalid)
+    );
+}
+
+#[test]
+fn a_dangling_symlink_is_not_created_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let target = elsewhere.path().join("target.md");
+    symlink(&target, dir.path().join("new.md")).unwrap();
+
+    assert_eq!(
+        create_new_file(dir.path(), "new"),
+        Err(NewFileError::Exists(dir.path().join("new.md")))
+    );
+    assert!(
+        !target.exists(),
+        "create followed the dangling symlink and wrote {target:?}"
+    );
+    assert!(
+        fs::symlink_metadata(dir.path().join("new.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
     );
 }
