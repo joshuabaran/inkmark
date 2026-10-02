@@ -25,9 +25,7 @@ optdepends=(
 )
 provides=("$_pkgname")
 conflicts=("$_pkgname")
-# The repository is private, so clone over SSH with your GitHub key. If it
-# goes public, "git+$url.git" works for anyone.
-source=("$_pkgname::git+ssh://git@github.com/joshuabaran/inkmark.git")
+source=("$_pkgname::git+$url.git")
 sha256sums=('SKIP')
 
 pkgver() {

@@ -272,4 +272,3 @@ Measured 2026-10-02 on the Omarchy host (240 Hz 1440p monitor, scale 1, Mesa rad
 - **GFM** (tables, task lists, strikethrough, autolinks) is the next feature: an `inkmark-parse-gfm` crate behind the same trait.
 - **Fallback glyphs in the code pane** (box drawing, CJK) don't snap to whole monospace cells, so ASCII-art alignment can be off.
 - **Images:** no SVG; remote URLs aren't fetched (MVP has no network); reference definitions deleted by a local edit linger until the next full parse.
-- **PKGBUILD** clones over SSH while the repository is private; switch `source` to `git+$url.git` if it goes public.
