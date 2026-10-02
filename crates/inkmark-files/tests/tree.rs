@@ -324,6 +324,26 @@ fn the_root_follows_a_file_a_folder_a_missing_path_or_no_argument() {
     ));
 }
 
+#[test]
+fn expanding_again_reads_the_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    touch(&sub.join("a.md"));
+    let mut tree = Tree::new(dir.path());
+    tree.load_pending();
+    let index = row(&mut tree, "sub").index;
+    tree.expand(index);
+    assert!(names(&mut tree).iter().any(|name| name == "  a.md"));
+
+    tree.collapse(index);
+    touch(&sub.join("b.md"));
+    tree.expand(index);
+    let listed = names(&mut tree);
+    assert!(listed.iter().any(|name| name == "  a.md"));
+    assert!(listed.iter().any(|name| name == "  b.md"));
+}
+
 struct ModeGuard(PathBuf);
 
 impl Drop for ModeGuard {

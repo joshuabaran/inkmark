@@ -8,7 +8,7 @@ use eframe::egui::{
     ViewportCommand, pos2,
 };
 use inkmark_buffer::{DiskStatus, Document, LineEnding, OpenError};
-use inkmark_files::{Launch, choose_root};
+use inkmark_files::{Launch, NewFileError, choose_root, create_new_file};
 use inkmark_parse::{GfmParser, ParseState};
 use inkmark_text::Fonts;
 use inkmark_view::{BrowserOutput, CodeView, FileBrowser, LiveView};
@@ -30,6 +30,7 @@ const OPEN_FOLDER: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::O);
 const TOGGLE_BROWSER: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::E);
+const NEW_FILE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -110,6 +111,13 @@ enum DialogResult {
     Folder(Option<PathBuf>),
 }
 
+#[derive(Clone)]
+struct NewFilePrompt {
+    dir: PathBuf,
+    name: String,
+    error: Option<String>,
+}
+
 struct App {
     doc: Document,
     code: CodeView,
@@ -131,6 +139,8 @@ struct App {
     recent_list: Option<usize>,
     browser: FileBrowser,
     sidebar: sidebar::Sidebar,
+    /// Asks for a name, then creates the file and opens it.
+    new_file: Option<NewFilePrompt>,
     /// A dialog took keyboard focus from the panes last frame.
     modal_was_open: bool,
     /// Tests receive the dialog kind instead of opening a portal window.
@@ -179,6 +189,7 @@ impl App {
             recent_list: None,
             browser: FileBrowser::new(root),
             sidebar: sidebar::Sidebar::load(sidebar_store),
+            new_file: None,
             modal_was_open: false,
             #[cfg(test)]
             dialog_hook: None,
@@ -468,7 +479,10 @@ impl App {
         if recent {
             self.recent_list = match self.recent_list {
                 Some(_) => None,
-                None => Some(0),
+                None => {
+                    self.new_file = None;
+                    Some(0)
+                }
             };
         }
         if minimap {
@@ -485,13 +499,14 @@ impl App {
         } else if live {
             self.focus_pane(ctx, Pane::Live);
         }
-        let (open_folder, save_as, save, open) = ctx.input_mut(|i| {
+        let (open_folder, save_as, save, open, new_file) = ctx.input_mut(|i| {
             (
                 // Ctrl+Shift+O before Ctrl+O: extra Shift still matches Open.
                 i.consume_shortcut(&OPEN_FOLDER),
                 i.consume_shortcut(&SAVE_AS),
                 i.consume_shortcut(&SAVE),
                 i.consume_shortcut(&OPEN),
+                i.consume_shortcut(&NEW_FILE),
             )
         });
         if open_folder {
@@ -507,6 +522,9 @@ impl App {
             } else {
                 self.spawn_dialog(DialogKind::Open);
             }
+        }
+        if new_file {
+            self.begin_new_file();
         }
     }
 
@@ -611,10 +629,11 @@ impl App {
     /// While a dialog is open the panes don't get keys (typing mustn't edit
     /// the document behind it); focus returns when it closes.
     fn hold_focus_for_dialogs(&mut self, ctx: &egui::Context) {
-        let open = self.recent_list.is_some() || self.confirm.is_some();
+        let open = self.recent_list.is_some() || self.confirm.is_some() || self.new_file.is_some();
         if open {
             self.code.release_focus(ctx);
             self.live.release_focus(ctx);
+            ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("file_browser")));
         } else if self.modal_was_open {
             match self.focus {
                 Pane::Code => self.code.request_focus(ctx),
@@ -728,6 +747,96 @@ impl App {
             _ => {}
         }
     }
+
+    fn begin_new_file(&mut self) {
+        if self.new_file.is_some() || self.confirm.is_some() {
+            return;
+        }
+        self.recent_list = None;
+        self.new_file = Some(NewFilePrompt {
+            dir: self.browser.new_file_dir(),
+            name: String::new(),
+            error: None,
+        });
+    }
+
+    /// Creates the named file and opens it through the unsaved-changes prompt.
+    /// Cancelling that prompt leaves the empty file on disk.
+    fn submit_new_file(&mut self) {
+        let Some(prompt) = self.new_file.clone() else {
+            return;
+        };
+        match create_new_file(&prompt.dir, &prompt.name) {
+            Ok(path) => {
+                self.new_file = None;
+                self.browser.note_created(&path);
+                self.request_open(path);
+            }
+            Err(NewFileError::Exists(_)) => {
+                if let Some(prompt) = &mut self.new_file {
+                    prompt.error = Some("A file with that name already exists.".into());
+                }
+            }
+            Err(NewFileError::Empty | NewFileError::Invalid) => {
+                if let Some(prompt) = &mut self.new_file {
+                    prompt.error = Some("Enter a file name.".into());
+                }
+            }
+            Err(NewFileError::Io(message)) => {
+                self.new_file = None;
+                self.banner = Some(Banner::Error(format!(
+                    "Couldn't create the file: {message}"
+                )));
+            }
+        }
+    }
+
+    fn new_file_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut prompt) = self.new_file.clone() else {
+            return;
+        };
+        let (submit_key, cancel_key) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::Enter),
+                i.consume_key(Modifiers::NONE, Key::Escape),
+            )
+        });
+        let mut submit = submit_key;
+        let mut cancel = cancel_key;
+        let field = egui::Id::new("new_file_name");
+        egui::Modal::new(egui::Id::new("new_file")).show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            ui.heading("New file");
+            ui.label(prompt.dir.display().to_string());
+            if !ui.memory(|m| m.has_focus(field)) {
+                ui.memory_mut(|m| m.request_focus(field));
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut prompt.name)
+                    .id(field)
+                    .desired_width(f32::INFINITY),
+            );
+            if let Some(error) = &prompt.error {
+                ui.label(RichText::new(error).color(Color32::from_rgb(255, 140, 120)));
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Create").clicked() {
+                    submit = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if cancel {
+            self.new_file = None;
+            return;
+        }
+        self.new_file = Some(prompt);
+        if submit {
+            self.submit_new_file();
+        }
+    }
 }
 
 impl App {
@@ -786,6 +895,9 @@ impl App {
         }
         if let Some(path) = &output.open_file {
             self.request_open(path.clone());
+        }
+        if output.new_file {
+            self.begin_new_file();
         }
     }
 
@@ -862,6 +974,8 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.editor(ui));
+        // After the sidebar, so New file opens the prompt on the click's frame.
+        self.new_file_ui(&ctx);
         self.confirm_ui(&ctx);
         self.update_title(&ctx);
         self.measure_step(&ctx);
@@ -1075,7 +1189,9 @@ mod tests {
         let mut out = ctx.run_ui(input, |ui| {
             app.handle_shortcuts(ui.ctx());
             app.poll_dialog(ui.ctx());
+            app.hold_focus_for_dialogs(ui.ctx());
             app.editor(ui);
+            app.new_file_ui(ui.ctx());
         });
         out.textures_delta.clear();
     }
@@ -1281,5 +1397,203 @@ mod tests {
         click_at(&ctx, &mut app, &mut time, rect.center());
         assert_eq!(app.doc.path(), Some(b.as_path()));
         assert_eq!(text(&app), "b\n");
+    }
+
+    fn type_text(ctx: &egui::Context, app: &mut App, time: &mut f64, text: &str) {
+        drive(ctx, app, time, vec![egui::Event::Text(text.to_string())]);
+    }
+
+    #[test]
+    fn new_file_appends_md_refuses_an_existing_name_and_opens_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        let chapter = notes.join("chapter");
+        fs::create_dir_all(&chapter).unwrap();
+        fs::write(notes.join("a.md"), "a\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::with_recent(
+            &ctx,
+            Some(notes.join("a.md")),
+            recent::Recent::from_store(Some(dir.path().join("recent"))),
+        );
+        let mut time = 0.0;
+        wait_rows(&ctx, &mut app, &mut time);
+        let chapter_row = app
+            .browser
+            .row_rect(&chapter)
+            .expect("chapter should be listed");
+        click_at(&ctx, &mut app, &mut time, chapter_row.center());
+
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::N, egui::Modifiers::COMMAND)],
+        );
+        let prompt = app.new_file.as_ref().expect("Ctrl+N opens the prompt");
+        assert_eq!(prompt.dir, chapter);
+        // A blank name is refused and writes nothing.
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert!(
+            app.new_file
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("file name")
+        );
+        assert!(!chapter.join("inside.md").exists());
+
+        type_text(&ctx, &mut app, &mut time, "inside");
+        assert_eq!(app.new_file.as_ref().unwrap().name, "inside");
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        let created = chapter.join("inside.md");
+        assert_eq!(fs::read_to_string(&created).unwrap(), "");
+        assert_eq!(app.doc.path(), Some(created.as_path()));
+        assert_eq!(text(&app), "");
+        assert!(app.new_file.is_none());
+
+        // The header button targets the open file's folder and refuses a clash.
+        drive(&ctx, &mut app, &mut time, vec![]);
+        let button = app.browser.new_file_rect().expect("New file button");
+        click_at(&ctx, &mut app, &mut time, button.center());
+        assert_eq!(app.new_file.as_ref().unwrap().dir, chapter);
+        type_text(&ctx, &mut app, &mut time, "inside");
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert!(
+            app.new_file
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("already exists")
+        );
+        assert_eq!(fs::read_to_string(&created).unwrap(), "");
+        assert_eq!(app.doc.path(), Some(created.as_path()));
+
+        // A name that already has a Markdown extension is not given another.
+        app.new_file.as_mut().unwrap().name = "also.md".into();
+        app.new_file.as_mut().unwrap().error = None;
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        let also = chapter.join("also.md");
+        assert!(also.is_file());
+        assert!(!chapter.join("also.md.md").exists());
+        assert_eq!(app.doc.path(), Some(also.as_path()));
+
+        // Unsaved edits still go through the confirm prompt. The empty file stays.
+        type_into(&mut app, "dirty");
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::N, egui::Modifiers::COMMAND)],
+        );
+        type_text(&ctx, &mut app, &mut time, "fresh");
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        let fresh = chapter.join("fresh.md");
+        assert_eq!(fs::read_to_string(&fresh).unwrap(), "");
+        assert_eq!(text(&app), "dirty");
+        assert_eq!(app.confirm, Some(Confirm::OpenPath(fresh)));
+
+        // No selection: the new file lands in the root.
+        let root_note = dir.path().join("root-note");
+        fs::create_dir(&root_note).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::with_recent(
+            &ctx,
+            Some(root_note.clone()),
+            recent::Recent::from_store(Some(dir.path().join("recent-root"))),
+        );
+        let mut time = 0.0;
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::N, egui::Modifiers::COMMAND)],
+        );
+        assert_eq!(app.new_file.as_ref().unwrap().dir, root_note);
+        type_text(&ctx, &mut app, &mut time, "plain");
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        let plain = root_note.join("plain.md");
+        assert!(plain.is_file());
+        assert_eq!(app.doc.path(), Some(plain.as_path()));
+        assert_eq!(text(&app), "");
+    }
+
+    #[test]
+    fn a_sibling_change_updates_the_tree_and_the_open_file_keeps_its_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        fs::create_dir(&notes).unwrap();
+        let open = notes.join("open.md");
+        fs::write(&open, "open\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::with_recent(
+            &ctx,
+            Some(open.clone()),
+            recent::Recent::from_store(Some(dir.path().join("recent"))),
+        );
+        let mut time = 0.0;
+        wait_rows(&ctx, &mut app, &mut time);
+        fs::write(notes.join("other.md"), "o\n").unwrap();
+        let start = std::time::Instant::now();
+        loop {
+            drive(&ctx, &mut app, &mut time, vec![]);
+            if app
+                .browser
+                .row_names()
+                .iter()
+                .any(|name| name == "other.md")
+            {
+                break;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(1) {
+                panic!(
+                    "sibling did not appear within 1s: {:?}",
+                    app.browser.row_names()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(text(&app), "open\n");
+        assert!(app.banner.is_none());
+
+        fs::write(&open, "changed by someone else\n").unwrap();
+        app.next_disk_check = std::time::Instant::now();
+        app.check_disk(&ctx);
+        assert!(matches!(app.banner, Some(Banner::DiskChanged)));
+        assert_eq!(text(&app), "open\n");
     }
 }

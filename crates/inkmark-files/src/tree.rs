@@ -220,16 +220,21 @@ impl Tree {
     }
 
     pub fn set_expanded(&mut self, index: usize, expanded: bool) {
-        let Some(node) = self.nodes.get_mut(index) else {
+        let Some(node) = self.nodes.get(index) else {
             return;
         };
         if !node.alive || !node.kind.is_dir() {
             return;
         }
-        node.expanded = expanded;
+        // A collapsed folder is not watched, so a cached listing may be stale.
+        let reload = expanded && !node.expanded && node.loaded;
+        self.nodes[index].expanded = expanded;
         self.rows_dirty = true;
         if expanded {
             self.nudge_reveal();
+        }
+        if reload {
+            self.invalidate(index);
         }
     }
 

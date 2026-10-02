@@ -1,6 +1,7 @@
 //! The folder sidebar: a virtualized tree over [`inkmark_files::Tree`].
 //! Directory listings run on a worker thread; a frame only paints the rows
-//! in view.
+//! in view. Expanded folders are watched, so a create, rename or delete
+//! shows up without Refresh.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -13,7 +14,7 @@ use egui::{
     Align2, Color32, EventFilter, FontId, Id, Key, Modifiers, Rect, Response, RichText, ScrollArea,
     Sense, Ui, pos2, vec2,
 };
-use inkmark_files::{Entry, Pending, Row, Tree, list_dir};
+use inkmark_files::{Entry, Pending, Row, Tree, Watch, list_dir};
 
 use crate::theme::{self, BACKGROUND, MARKUP, SELECTION, TEXT};
 
@@ -26,6 +27,8 @@ pub struct BrowserOutput {
     pub open_file: Option<PathBuf>,
     /// The Open Folder… button. The app shows the portal folder picker.
     pub open_folder: bool,
+    /// New file, in the selected folder or the root.
+    pub new_file: bool,
 }
 
 struct Listed {
@@ -60,6 +63,8 @@ pub struct FileBrowser {
     up_rect: Option<Rect>,
     open_folder_rect: Option<Rect>,
     refresh_rect: Option<Rect>,
+    new_file_rect: Option<Rect>,
+    watch: Option<Watch>,
 }
 
 impl FileBrowser {
@@ -83,6 +88,8 @@ impl FileBrowser {
             up_rect: None,
             open_folder_rect: None,
             refresh_rect: None,
+            new_file_rect: None,
+            watch: None,
         }
     }
 
@@ -154,6 +161,42 @@ impl FileBrowser {
         self.refresh_rect
     }
 
+    pub fn new_file_rect(&self) -> Option<Rect> {
+        self.new_file_rect
+    }
+
+    /// Folder a new file would be created in: the selected folder, the
+    /// parent of the selected file, or the root.
+    pub fn new_file_dir(&mut self) -> PathBuf {
+        let Some(path) = self.selected.clone() else {
+            return self.tree.root().to_path_buf();
+        };
+        if let Some(row) = self.snaps().into_iter().find(|row| row.path == path) {
+            if row.kind.is_dir() {
+                return row.path;
+            }
+            if let Some(parent) = row.path.parent() {
+                return parent.to_path_buf();
+            }
+        } else if path.is_dir() {
+            return path;
+        } else if let Some(parent) = path.parent() {
+            return parent.to_path_buf();
+        }
+        self.tree.root().to_path_buf()
+    }
+
+    /// The file was just created here: re-read its folder and reveal it.
+    pub fn note_created(&mut self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            let indexes = self.tree.dirs_at(parent);
+            for index in indexes {
+                self.tree.invalidate(index);
+            }
+        }
+        self.set_current(Some(path.to_path_buf()));
+    }
+
     /// Rows painted last frame. A large folder stays small here.
     pub fn painted(&self) -> usize {
         self.painted
@@ -203,6 +246,7 @@ impl FileBrowser {
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_watch(ctx);
         while let Ok(done) = self.rx.try_recv() {
             self.inflight.remove(&(done.index, done.generation));
             if done.ticket == self.ticket {
@@ -234,6 +278,31 @@ impl FileBrowser {
         self.reveal_if_listed();
     }
 
+    fn poll_watch(&mut self, ctx: &egui::Context) {
+        if self.watch.is_none() {
+            let ctx = ctx.clone();
+            self.watch = Watch::new(move || ctx.request_repaint()).ok();
+        }
+        let Some(watch) = &mut self.watch else {
+            return;
+        };
+        let dirs = self.tree.expanded_dirs();
+        watch.sync(&dirs);
+        let changed = watch.changed();
+        let mut indexes = Vec::new();
+        for path in &changed {
+            indexes.extend(self.tree.dirs_at(path));
+        }
+        for index in indexes {
+            self.tree.invalidate(index);
+        }
+        // A backup wake: the watch thread also requests a repaint, but a
+        // missed one would otherwise wait on the disk-check interval.
+        if !dirs.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    }
+
     fn reveal_if_listed(&mut self) {
         if self.revealed {
             return;
@@ -252,7 +321,8 @@ impl FileBrowser {
         let name = self.tree.root_name().to_string();
         ui.add_space(4.0);
         ui.label(RichText::new(name).strong().color(TEXT));
-        ui.horizontal(|ui| {
+        // Wrapped, so a narrow sidebar doesn't spill the buttons over the panes.
+        ui.horizontal_wrapped(|ui| {
             let can_up = self.tree.parent_root().is_some();
             let up = ui.add_enabled(can_up, egui::Button::new("Up"));
             self.up_rect = Some(up.rect);
@@ -268,6 +338,11 @@ impl FileBrowser {
             self.refresh_rect = Some(refresh.rect);
             if refresh.clicked() {
                 self.refresh();
+            }
+            let new_file = ui.button("New file");
+            self.new_file_rect = Some(new_file.rect);
+            if new_file.clicked() {
+                output.new_file = true;
             }
             let mut show_all = self.tree.show_all();
             if ui.checkbox(&mut show_all, "All files").changed() {
@@ -410,11 +485,19 @@ impl FileBrowser {
         let scroll_to = self.scroll_to.take();
         self.row_rects.clear();
         self.painted = 0;
+        let viewport = ui.available_height();
         let mut area = ScrollArea::vertical()
             .auto_shrink([false, false])
             .id_salt(self.id);
+        // Aligning an already-visible row to the top hides the rows above it
+        // under the header, where clicks miss. A zero-height first frame
+        // keeps the request for the next one.
         if let Some(offset) = scroll_to {
-            area = area.vertical_scroll_offset(offset);
+            if viewport <= ROW_H {
+                self.scroll_to = Some(offset);
+            } else if offset + ROW_H > viewport {
+                area = area.vertical_scroll_offset(offset);
+            }
         }
         let mut clicked = None;
         ui.scope(|ui| {

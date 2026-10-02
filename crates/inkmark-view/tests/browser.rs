@@ -176,6 +176,40 @@ fn only_visible_rows_are_painted() {
     assert!((1..40).contains(&painted), "painted {painted} rows of 400");
 }
 
+fn wait_for_names(h: &mut Harness, mut pred: impl FnMut(&[String]) -> bool) {
+    let start = Instant::now();
+    loop {
+        h.frame(vec![]);
+        let names = h.browser.row_names();
+        if pred(&names) {
+            return;
+        }
+        if start.elapsed() > Duration::from_secs(1) {
+            panic!("sidebar did not update within 1s, rows: {names:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn external_create_rename_and_delete_show_up_in_the_sidebar() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.md"), "a\n").unwrap();
+    let mut h = Harness::new(dir.path());
+    h.wait_until(|browser| browser.row_names() == ["a.md"]);
+
+    fs::write(dir.path().join("b.md"), "b\n").unwrap();
+    wait_for_names(&mut h, |names| names.iter().any(|name| name == "b.md"));
+
+    fs::rename(dir.path().join("b.md"), dir.path().join("c.md")).unwrap();
+    wait_for_names(&mut h, |names| {
+        names.iter().any(|name| name == "c.md") && !names.iter().any(|name| name == "b.md")
+    });
+
+    fs::remove_file(dir.path().join("c.md")).unwrap();
+    wait_for_names(&mut h, |names| !names.iter().any(|name| name == "c.md"));
+}
+
 #[test]
 #[ignore]
 fn bench_sidebar_10k_folder() {
