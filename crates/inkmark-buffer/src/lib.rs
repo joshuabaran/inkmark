@@ -3,6 +3,7 @@
 mod document;
 mod edit;
 mod file;
+pub mod find;
 mod history;
 mod log;
 

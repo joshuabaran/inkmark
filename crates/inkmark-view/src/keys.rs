@@ -87,9 +87,13 @@ pub enum Action {
     MoveColumnRight = 46,
     FormatTable = 47,
     InsertTable = 48,
+    Find = 49,
+    Replace = 50,
+    FindNext = 51,
+    FindPrevious = 52,
 }
 
-const COUNT: usize = 49;
+const COUNT: usize = 53;
 
 impl Action {
     pub const ALL: [Action; COUNT] = [
@@ -142,6 +146,10 @@ impl Action {
         Action::MoveColumnRight,
         Action::FormatTable,
         Action::InsertTable,
+        Action::Find,
+        Action::Replace,
+        Action::FindNext,
+        Action::FindPrevious,
     ];
 
     pub const fn index(self) -> usize {
@@ -201,6 +209,10 @@ impl Action {
             MoveColumnRight => "move_column_right",
             FormatTable => "format_table",
             InsertTable => "insert_table",
+            Find => "find",
+            Replace => "replace",
+            FindNext => "find_next",
+            FindPrevious => "find_previous",
         }
     }
 
@@ -257,6 +269,10 @@ impl Action {
             MoveColumnRight => "Move the table column right",
             FormatTable => "Line up the table's pipes",
             InsertTable => "Insert a 3×3 table",
+            Find => "Find in this file",
+            Replace => "Replace in this file",
+            FindNext => "Find the next match",
+            FindPrevious => "Find the previous match",
         }
     }
 
@@ -264,7 +280,8 @@ impl Action {
         use Action::*;
         match self {
             CycleMode | FocusCode | FocusLive | ToggleMinimap | OpenFile | Save | SaveAs
-            | OpenFolder | ToggleSidebar | NewFile | RecentFiles | Back | Forward => Scope::App,
+            | OpenFolder | ToggleSidebar | NewFile | RecentFiles | Back | Forward | Find
+            | Replace | FindNext | FindPrevious => Scope::App,
             Rename | MoveToTrash => Scope::Browser,
             InsertRowAbove | InsertRowBelow | InsertColumnLeft | InsertColumnRight | DeleteRow
             | DeleteColumn | MoveRowUp | MoveRowDown | MoveColumnLeft | MoveColumnRight
@@ -889,6 +906,10 @@ fn default_chords(action: Action) -> Vec<Chord> {
         MoveColumnRight => vec![chord(alt_shift, Key::ArrowRight)],
         FormatTable => vec![chord(ctrl_alt, Key::F)],
         InsertTable => vec![chord(ctrl_alt, Key::T)],
+        Find => vec![chord(ctrl, Key::F)],
+        Replace => vec![chord(ctrl, Key::H)],
+        FindNext => vec![chord(Modifiers::NONE, Key::F3)],
+        FindPrevious => vec![chord(shift, Key::F3)],
     }
 }
 
