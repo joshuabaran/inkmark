@@ -18,6 +18,7 @@ use crate::commands::{self, EditPlan};
 use crate::lines::SCROLLBAR_WIDTH;
 use crate::lines::{LineIndex, ScrollPos, Synced};
 use crate::motion;
+use crate::tables;
 use crate::theme::{self, Theme};
 
 const PADDING: f32 = 12.0;
@@ -274,7 +275,11 @@ impl CodeView {
         }
 
         if focused {
-            self.handle_events(ui, doc, viewport);
+            let current = parse
+                .as_deref()
+                .map(ParseState::output)
+                .filter(|p| p.map.len() == doc.len());
+            self.handle_events(ui, doc, viewport, current);
         } else {
             self.preedit.clear();
         }
@@ -580,7 +585,13 @@ impl CodeView {
 
     // ---- input ----------------------------------------------------------------
 
-    fn handle_events(&mut self, ui: &Ui, doc: &mut Document, viewport: f32) {
+    fn handle_events(
+        &mut self,
+        ui: &Ui,
+        doc: &mut Document,
+        viewport: f32,
+        parse: Option<&ParseOutput>,
+    ) {
         let events = ui.input(|i| i.events.clone());
         for event in events {
             match event {
@@ -631,7 +642,22 @@ impl CodeView {
                     pressed: true,
                     modifiers,
                     ..
-                } if self.preedit.is_empty() => self.handle_key(doc, key, modifiers, viewport),
+                } if self.preedit.is_empty() => {
+                    // Table commands need the parse to find the table.
+                    if let Some(command) = tables::shortcut(key, modifiers)
+                        && let Some(parse) = parse
+                    {
+                        match tables::run(doc, parse, self.selection.head, command) {
+                            (Some(plan), _) => {
+                                self.apply_plan(doc, plan);
+                                continue;
+                            }
+                            (None, true) => continue,
+                            (None, false) => {}
+                        }
+                    }
+                    self.handle_key(doc, key, modifiers, viewport)
+                }
                 _ => {}
             }
         }

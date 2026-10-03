@@ -721,7 +721,9 @@ impl App {
                 i.consume_shortcut(&SAVE),
                 i.consume_shortcut(&OPEN),
                 i.consume_shortcut(&NEW_FILE),
-                i.consume_shortcut(&BACK),
+                // Exactly Alt+Left: egui's shortcut matching would also
+                // take Alt+Shift+Left, which moves a table column.
+                consume_exact(i, BACK.modifiers, BACK.logical_key),
             )
         });
         if back {
@@ -1571,6 +1573,25 @@ impl App {
             }
         }
     }
+}
+
+/// Takes a press of `key` with exactly `modifiers` (egui's own matching
+/// ignores extra Shift and Alt).
+fn consume_exact(i: &mut egui::InputState, modifiers: Modifiers, key: Key) -> bool {
+    let mut found = false;
+    i.events.retain(|e| match e {
+        egui::Event::Key {
+            key: k,
+            pressed: true,
+            modifiers: m,
+            ..
+        } if !found && *k == key && *m == modifiers => {
+            found = true;
+            false
+        }
+        _ => true,
+    });
+    found
 }
 
 /// A file or folder's name for messages.
@@ -3194,5 +3215,28 @@ mod tests {
         app.apply_settings_from(Some(&config), system);
         assert_eq!(app.live.font_size, TEXT_SIZE);
         assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn alt_shift_left_moves_a_table_column_instead_of_going_back() {
+        // egui matches Alt+Shift+Left as Alt+Left (Back) unless told not to.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.md");
+        fs::write(&path, "| a | b |\n|---|---|\n| c | d |\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(path));
+        r.app.back.push(Place {
+            path: None,
+            offset: 0,
+        });
+        r.app.focus = Pane::Live;
+        r.app.live.request_focus(&r.ctx);
+        r.app.jump_to(text(&r.app).find('d').unwrap());
+        r.frame(vec![]);
+        r.key(
+            egui::Key::ArrowLeft,
+            egui::Modifiers::ALT.plus(egui::Modifiers::SHIFT),
+        );
+        assert_eq!(r.app.back.len(), 1, "Back wasn't taken");
+        assert!(text(&r.app).contains("| d   | c   |"), "{}", text(&r.app));
     }
 }

@@ -25,6 +25,8 @@ struct Split {
     time: f64,
     /// Modifier keys held during the next frames (e.g. Ctrl for Ctrl+click).
     held: Modifiers,
+    /// What the last frame drew, to find menu items by their text.
+    shapes: Vec<egui::epaint::ClippedShape>,
 }
 
 impl Split {
@@ -42,6 +44,7 @@ impl Split {
             parse,
             time: 0.0,
             held: Modifiers::NONE,
+            shapes: Vec::new(),
         };
         s.live.request_focus(&s.ctx);
         s.settle();
@@ -112,6 +115,7 @@ impl Split {
             });
         });
         out.textures_delta.clear();
+        self.shapes = out.shapes;
     }
 
     fn key(&mut self, key: Key, modifiers: Modifiers) {
@@ -781,4 +785,168 @@ fn end_on_a_mid_word_wrap_stays_on_the_row() {
         "x",
         "after the row's last x"
     );
+}
+
+impl Split {
+    /// Where the last frame drew `text` (topmost match, e.g. a menu item).
+    fn text_rect(&self, text: &str) -> Option<Rect> {
+        fn find(shape: &egui::Shape, text: &str) -> Option<Rect> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == text => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                egui::Shape::Vec(v) => v.iter().find_map(|s| find(s, text)),
+                _ => None,
+            }
+        }
+        self.shapes.iter().rev().find_map(|c| find(&c.shape, text))
+    }
+
+    fn right_click(&mut self, pos: Pos2) {
+        let button = |pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        self.frame(vec![Event::PointerMoved(pos)]);
+        self.frame(vec![button(true)]);
+        self.frame(vec![button(false)]);
+        self.frame(vec![]);
+    }
+
+    fn click_text(&mut self, text: &str) {
+        for _ in 0..3 {
+            if self.text_rect(text).is_some() {
+                break;
+            }
+            self.frame(vec![]);
+        }
+        let at = self
+            .text_rect(text)
+            .unwrap_or_else(|| panic!("{text:?} isn't on screen"))
+            .center();
+        self.frame(vec![Event::PointerMoved(at)]);
+        self.click(at);
+        self.frame(vec![]);
+    }
+}
+
+const TABLE: &str = "Intro.\n\n| a | b |\n|---|---|\n| c | d |\n\nAfter.\n";
+
+#[test]
+fn table_shortcuts_work_in_the_live_pane() {
+    let mut s = Split::new(TABLE);
+    s.caret(TABLE.find('c').unwrap());
+    s.key(Key::ArrowDown, Modifiers::COMMAND.plus(Modifiers::ALT));
+    assert_eq!(
+        s.text(),
+        "Intro.\n\n| a   | b   |\n| --- | --- |\n| c   | d   |\n|     |     |\n\nAfter.\n"
+    );
+    s.key(Key::Z, Modifiers::COMMAND);
+    assert_eq!(s.text(), TABLE, "one undo step");
+    s.caret(TABLE.find('c').unwrap());
+    s.key(Key::ArrowRight, Modifiers::ALT.plus(Modifiers::SHIFT));
+    assert!(s.text().contains("| d   | c   |"), "{}", s.text());
+    s.key(Key::Z, Modifiers::COMMAND);
+    // Outside a table, Alt+Shift+Right still extends the selection.
+    s.caret(0);
+    s.key(Key::ArrowRight, Modifiers::ALT.plus(Modifiers::SHIFT));
+    assert_eq!(s.text(), TABLE);
+    assert!(!s.live.selection().range().is_empty());
+}
+
+#[test]
+fn leaving_an_edited_table_re_pads_it_as_its_own_undo_step() {
+    let mut s = Split::new(TABLE);
+    let c = TABLE.find('c').unwrap();
+    s.caret(c + 1);
+    s.type_text("ell");
+    assert_eq!(
+        s.text(),
+        TABLE.replace("| c |", "| cell |"),
+        "typing changes only the cell"
+    );
+    // Leave the table: it's re-padded.
+    s.key(Key::End, Modifiers::COMMAND);
+    let padded = "Intro.\n\n| a    | b   |\n| ---- | --- |\n| cell | d   |\n\nAfter.\n";
+    assert_eq!(s.text(), padded);
+    assert_eq!(
+        s.live.selection().head,
+        padded.len(),
+        "the caret is still at the end"
+    );
+    s.key(Key::Z, Modifiers::COMMAND);
+    assert_eq!(
+        s.text(),
+        TABLE.replace("| c |", "| cell |"),
+        "undo the re-padding alone"
+    );
+    s.key(Key::Z, Modifiers::COMMAND);
+    assert_eq!(s.text(), TABLE);
+
+    // Only passing through a table doesn't touch it.
+    let mut s = Split::new(TABLE);
+    s.caret(TABLE.find('c').unwrap());
+    s.press(Key::ArrowRight);
+    s.key(Key::End, Modifiers::COMMAND);
+    assert_eq!(s.text(), TABLE);
+}
+
+#[test]
+fn the_right_click_menu_edits_tables_and_inserts_one() {
+    let mut s = Split::new(TABLE);
+    // A right-click moves the caret to the table's header row first.
+    s.right_click(pos2(LIVE_X + 30.0, 70.0));
+    assert!(
+        tables_row(&s.text(), s.live.selection().head),
+        "the caret moved into the table"
+    );
+    s.click_text("Insert row below");
+    assert_eq!(
+        s.text(),
+        "Intro.\n\n| a   | b   |\n| --- | --- |\n|     |     |\n| c   | d   |\n\nAfter.\n"
+    );
+
+    // Outside a table: Insert table, with its first header selected.
+    let mut s = Split::new("Hello.\n");
+    s.right_click(pos2(LIVE_X + 30.0, 13.0));
+    s.click_text("Insert table");
+    assert!(
+        s.text().starts_with("Hello.\n\n| Column 1 |"),
+        "{}",
+        s.text()
+    );
+    let sel = s.live.selection().range();
+    assert_eq!(&s.text()[sel], "Column 1");
+}
+
+#[test]
+fn table_shortcuts_work_in_the_code_pane_too() {
+    let mut s = Split::new(TABLE);
+    s.code.request_focus(&s.ctx);
+    s.code
+        .set_selection(Selection::caret(TABLE.find('c').unwrap()));
+    s.frame(vec![]);
+    s.frame(vec![Event::Key {
+        key: Key::F,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::COMMAND.plus(Modifiers::ALT),
+    }]);
+    assert!(s.text().contains("| --- | --- |"), "{}", s.text());
+    s.frame(vec![Event::Key {
+        key: Key::T,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::COMMAND.plus(Modifiers::ALT),
+    }]);
+    assert!(s.text().contains("| Column 1 |"), "{}", s.text());
+}
+
+/// Whether `at` is on one of the table lines of the `TABLE` sample.
+fn tables_row(text: &str, at: usize) -> bool {
+    text[..at].matches('\n').count() >= 2 && text[at..].contains("After.")
 }

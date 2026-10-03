@@ -7,6 +7,7 @@
 
 use std::ops::Range;
 
+use egui::{Key, Modifiers};
 use inkmark_buffer::{Document, Edit, EditKind, Selection};
 use inkmark_parse::{BlockKind, ParseOutput};
 use unicode_width::UnicodeWidthStr;
@@ -37,6 +38,68 @@ pub enum TableOp {
     MoveColumnLeft,
     MoveColumnRight,
     Align(Align),
+}
+
+/// A table command from the keyboard or the live pane's menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TableCommand {
+    /// Applies to the table at the caret; outside one, the key does what
+    /// it otherwise would.
+    Edit(TableOp),
+    Insert,
+}
+
+/// The table shortcuts (PLAN.md, Table editing): Ctrl+Alt+arrows insert,
+/// Ctrl+Alt+(Shift+)Backspace delete, Alt+Shift+arrows move, Ctrl+Alt+F
+/// formats, Ctrl+Alt+T inserts a table.
+pub(crate) fn shortcut(key: Key, m: Modifiers) -> Option<TableCommand> {
+    use TableCommand::{Edit, Insert};
+    use TableOp::*;
+    let ctrl_alt = m.command && m.alt;
+    let alt_shift = m.alt && m.shift && !m.command;
+    Some(match key {
+        Key::F if ctrl_alt && !m.shift => Edit(Format),
+        Key::T if ctrl_alt && !m.shift => Insert,
+        Key::ArrowUp if ctrl_alt && !m.shift => Edit(InsertRowAbove),
+        Key::ArrowDown if ctrl_alt && !m.shift => Edit(InsertRowBelow),
+        Key::ArrowLeft if ctrl_alt && !m.shift => Edit(InsertColumnLeft),
+        Key::ArrowRight if ctrl_alt && !m.shift => Edit(InsertColumnRight),
+        Key::Backspace if ctrl_alt => Edit(if m.shift { DeleteColumn } else { DeleteRow }),
+        Key::ArrowUp if alt_shift => Edit(MoveRowUp),
+        Key::ArrowDown if alt_shift => Edit(MoveRowDown),
+        Key::ArrowLeft if alt_shift => Edit(MoveColumnLeft),
+        Key::ArrowRight if alt_shift => Edit(MoveColumnRight),
+        _ => return None,
+    })
+}
+
+/// Runs `command` at `offset`. `None`: nothing to do (no table there for
+/// an edit, or the edit doesn't apply), and `in_table` says whether the
+/// key should still be swallowed (inside a table) or do its usual job.
+pub(crate) fn run(
+    doc: &Document,
+    parse: &ParseOutput,
+    offset: usize,
+    command: TableCommand,
+) -> (Option<EditPlan>, bool) {
+    match command {
+        TableCommand::Insert => (Some(insert_table(doc, offset)), true),
+        TableCommand::Edit(op) => {
+            let in_table = Table::at(doc, parse, offset).is_some();
+            (table_edit(doc, parse, offset, op), in_table)
+        }
+    }
+}
+
+/// The start of the table holding `offset`, if any (to notice the caret
+/// leaving it).
+pub(crate) fn table_start(doc: &Document, parse: &ParseOutput, offset: usize) -> Option<usize> {
+    Table::at(doc, parse, offset).map(|(t, _)| t.range.start)
+}
+
+/// The source of the table holding `offset`, if any.
+pub(crate) fn table_text(doc: &Document, parse: &ParseOutput, offset: usize) -> Option<String> {
+    Table::at(doc, parse, offset).map(|(t, _)| doc.slice(t.range).into_owned())
 }
 
 /// A table read from its source.
@@ -326,16 +389,24 @@ pub(crate) fn table_edit(
     })
 }
 
-/// Re-pads the table holding `offset`, leaving the caret where it was
-/// (it's outside the table: the caller re-pads a table the caret left).
+/// Re-pads the table starting at `start` (the one the caret just left), if
+/// it's still there and needs it. Returns the edit and how much longer the
+/// table got, to move a caret after it.
 pub(crate) fn format_table(
     doc: &Document,
     parse: &ParseOutput,
-    offset: usize,
-) -> Option<Vec<Edit>> {
-    let (table, _) = Table::at(doc, parse, offset)?;
+    start: usize,
+) -> Option<(Edit, isize)> {
+    let (table, _) = Table::at(doc, parse, start)?;
+    if table.range.start != start {
+        return None;
+    }
     let (text, _) = table.render();
-    (text != doc.slice(table.range.clone())).then(|| vec![Edit::replace(table.range, text)])
+    if text == doc.slice(table.range.clone()) {
+        return None;
+    }
+    let grew = text.len() as isize - table.range.len() as isize;
+    Some((Edit::replace(table.range, text), grew))
 }
 
 /// A new 3×3 table (a header and two rows) on its own after the caret's
