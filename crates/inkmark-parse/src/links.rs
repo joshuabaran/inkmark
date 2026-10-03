@@ -2,6 +2,7 @@
 //! Ctrl+click follows.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use inkmark_buffer::Document;
 use pulldown_cmark::{BrokenLink, CowStr, Event, Parser, Tag};
@@ -153,6 +154,68 @@ pub fn headings(doc: &Document, out: &ParseOutput) -> Vec<Heading> {
         });
     }
     found
+}
+
+/// One heading's place in the source, and the bytes a fold of it hides.
+///
+/// `line` stays on screen. `body` is the source after that heading's last
+/// line, up to the next heading of the same or higher level (a smaller or
+/// equal level number). It is empty when nothing follows the heading but
+/// that next heading, or the end of the document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadingRegion {
+    pub level: u8,
+    pub line: usize,
+    pub body: Range<usize>,
+}
+
+/// Every heading, with the source range folding it would hide. The range
+/// is bytes in the document, so a view can keep it across a reparse and
+/// move it when the document is edited.
+pub fn heading_regions(doc: &Document, out: &ParseOutput) -> Vec<HeadingRegion> {
+    let doc_len = doc.len();
+    let headings: Vec<(u8, Range<usize>)> = out
+        .blocks
+        .iter()
+        .filter_map(|block| match block.kind {
+            BlockKind::Heading(level) => Some((level, block.range.clone())),
+            _ => None,
+        })
+        .collect();
+    let mut regions = Vec::with_capacity(headings.len());
+    for (i, (level, range)) in headings.iter().enumerate() {
+        let start = range.start.min(doc_len);
+        let line = doc.byte_to_line(start);
+        // The heading block may or may not include its trailing newline.
+        // The body begins on the line after the block's last byte, so a
+        // setext underline stays with the heading.
+        let block_end = range.end.min(doc_len).max(start);
+        let last = if block_end > start {
+            doc.byte_to_line(block_end - 1)
+        } else {
+            line
+        };
+        let body_line = last + 1;
+        let body_start = if body_line < doc.line_count() {
+            doc.line_to_byte(body_line)
+        } else {
+            doc_len
+        };
+        let body_end = headings[i + 1..]
+            .iter()
+            .find(|(next_level, _)| next_level <= level)
+            .map(|(_, next)| {
+                let next_line = doc.byte_to_line(next.start.min(doc_len));
+                doc.line_to_byte(next_line)
+            })
+            .unwrap_or(doc_len);
+        regions.push(HeadingRegion {
+            level: *level,
+            line,
+            body: body_start..body_end.max(body_start),
+        });
+    }
+    regions
 }
 
 /// Where `#anchor` points: the start of the heading's text whose GitHub
@@ -397,6 +460,50 @@ mod tests {
         let found = headings(&doc, &out);
         assert_eq!(found[0].text, "");
         assert_eq!(found[0].offset, 0);
+    }
+
+    #[test]
+    fn a_fold_runs_to_the_next_heading_of_the_same_or_higher_level() {
+        let src = "# Alpha\nbody\n## Beta\nnested\n# Gamma\nend\n";
+        let doc = Document::from_text(src);
+        let out = GfmParser.parse(src);
+        let regions = heading_regions(&doc, &out);
+        assert_eq!(regions.len(), 3);
+        assert_eq!(regions[0].level, 1);
+        assert_eq!(regions[0].line, 0);
+        // The heading line itself stays outside the hidden range.
+        assert!(regions[0].body.start > src.find("Alpha").unwrap());
+        assert_eq!(regions[0].body.start, src.find("body").unwrap());
+        assert_eq!(regions[0].body.end, src.find("# Gamma").unwrap());
+        assert_eq!(regions[1].level, 2);
+        assert_eq!(regions[1].body.start, src.find("nested").unwrap());
+        assert_eq!(regions[1].body.end, src.find("# Gamma").unwrap());
+        assert_eq!(regions[2].body.start, src.find("end").unwrap());
+        assert_eq!(doc.byte_to_line(regions[0].body.start), 1);
+    }
+
+    #[test]
+    fn adjacent_headings_have_nothing_to_fold() {
+        let src = "# A\n# B\n";
+        let doc = Document::from_text(src);
+        let regions = heading_regions(&doc, &GfmParser.parse(src));
+        assert!(regions[0].body.is_empty(), "{:?}", regions[0].body);
+        assert_eq!(regions[1].body.start, src.len());
+    }
+
+    #[test]
+    fn a_setext_heading_keeps_its_underline() {
+        let src = "Title\n=====\n\nbody\n";
+        let doc = Document::from_text(src);
+        let regions = heading_regions(&doc, &GfmParser.parse(src));
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].line, 0);
+        let underline = src.find("=====").unwrap();
+        assert!(regions[0].body.start > underline);
+        let after_underline = underline + src[underline..].find('\n').unwrap() + 1;
+        assert_eq!(regions[0].body.start, after_underline);
+        let body = src.find("body").unwrap();
+        assert!(regions[0].body.start <= body && body < regions[0].body.end);
     }
 
     fn span(range: std::ops::Range<usize>, kind: SpanKind) -> crate::map::Span {

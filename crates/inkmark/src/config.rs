@@ -227,7 +227,7 @@ mod tests {
         use inkmark_view::keys::Action;
 
         let settings = parse(
-            "[font]\ntext_size = 18\n[keys]\nbold = \"Ctrl+G\"\nitalic = []\ninsert_row_below = [\"Ctrl+Alt+Down\", \"F6\"]\n",
+            "[font]\ntext_size = 18\n[keys]\nbold = \"Ctrl+L\"\nitalic = []\ninsert_row_below = [\"Ctrl+Alt+Down\", \"F6\"]\n",
         )
         .unwrap();
         assert_eq!(settings.text_size, Some(18.0));
@@ -236,7 +236,7 @@ mod tests {
             "{:?}",
             settings.key_problems
         );
-        assert_eq!(settings.keys.shortcut_text(Action::Bold), "Ctrl+G");
+        assert_eq!(settings.keys.shortcut_text(Action::Bold), "Ctrl+L");
         assert!(settings.keys.chords(Action::Italic).is_empty());
         assert_eq!(
             settings.keys.shortcut_text(Action::InsertRowBelow),
@@ -288,9 +288,9 @@ mod tests {
         assert!(problems.is_empty());
         assert_eq!(parse(&text).unwrap().keys, KeyMap::builtin());
 
-        let (text, problems) = list_keys_from(Ok(Some("[keys]\nbold = \"Ctrl+G\"\n".into())));
+        let (text, problems) = list_keys_from(Ok(Some("[keys]\nbold = \"Ctrl+L\"\n".into())));
         assert!(problems.is_empty(), "{problems:?}");
-        assert!(text.contains("bold = \"Ctrl+G\""));
+        assert!(text.contains("bold = \"Ctrl+L\""));
         assert!(text.contains("italic = \"Ctrl+I\""));
         assert!(!text.contains("bold = \"Ctrl+B\""));
 
