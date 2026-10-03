@@ -410,7 +410,7 @@ Decided 2026-10-03: follow the OS. No in-app theme picker; fonts are configurabl
 |---|---|
 | Colors | If Omarchy's `~/.local/state/omarchy/current/theme/colors.toml` exists, it's used, and `omarchy theme set` applies live. Otherwise the built-in dark or light theme follows the desktop's light/dark setting. `INKMARK_THEME=<colors.toml>` overrides both (testing, screenshots). |
 | Mapping a palette | Accent for headings and the caret, blue for links, green for code, yellow for emphasis, muted for markup; structural shades blended from background and foreground. Text colors too faint on the background are moved toward the foreground until they reach WCAG contrast (4.5:1 text, 3:1 markup). All 22 bundled Omarchy palettes pass. |
-| Fonts | Default to fontconfig's `monospace` (code) and `sans-serif` (live text), which is what `omarchy font set` changes. `~/.config/inkmark/config.toml` `[font]` overrides family and size for each; the file and `~/.config/fontconfig/fonts.conf` are checked every second and changes apply live. A missing font is reported and the default kept. |
+| Fonts | The document defaults to fontconfig's `monospace` (code) and `sans-serif` (live text), which is what `omarchy font set` changes. `~/.config/inkmark/config.toml` `[font]` overrides family and size for each; the file and `~/.config/fontconfig/fonts.conf` are checked every second and changes apply live. A missing font is reported and the default kept. The chrome (sidebar, status, dialogs) is Hack, which egui already bundles and which has the folder marks and ●. |
 
 **Slices:** T1 one `Theme` for every color, built-in light, contrast test; T2 the OS theme (Omarchy palette, live switch, desktop light/dark); T3 fonts (fontconfig defaults, config file, live re-shaping).
 
@@ -488,7 +488,7 @@ From `~/Projects/inkmark/PRODUCT_REVIEW.md`, outside the repo. This is the order
 | **P7** | Math | When a note needs it: a live-only overlay for the math span. The source is unchanged, and the editor does not re-emit it. |
 | **P8** | Search across the folder | Filename search first. Content search second, off the UI thread, the same way the parse is. This is also how a rename finds the references it does not rewrite. |
 
-**P0, as built (0.2.1):** the open file's sidebar row draws ● beside its name while the buffer is dirty, the same mark the footer shows. A saved file does not, and neither does any other row. `the_open_file_shows_the_unsaved_mark` covers a clean file, a dirty file, and the mark going away again.
+**P0, as built (0.2.1):** the open file's sidebar row draws ● beside its name while the buffer is dirty, the same mark the footer shows. A saved file does not, and neither does any other row. `the_open_file_shows_the_unsaved_mark` covers a clean file, a dirty file, and the mark going away again. The chrome is Hack, so ●, ▸, and ▾ have glyphs; the document font is unchanged.
 
 **Not this round:** vim mode, multi-cursor, LSP or Marksman-style diagnostics, tabs, backlinks, a graph, tags, Mermaid and other diagrams, images from the network, rewriting links in other notes when one is renamed or moved, screen-reader support (AccessKit). Link rewriting waits on P8 and a change preview. Network images still need a policy: inkmark makes no network requests.
 

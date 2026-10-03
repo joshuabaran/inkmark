@@ -158,6 +158,18 @@ fn main() -> eframe::Result {
     result
 }
 
+/// The chrome is Hack, which has the folder and unsaved marks. Hack is
+/// inserted in front of egui's own proportional list, so those fallback
+/// faces stay whatever this egui version ships. The document is
+/// cosmic-text and is not affected.
+fn install_ui_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.insert(0, "Hack".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
 /// The open file's state on disk, when it needs the user's attention.
 /// Errors are shown separately, so one never hides the other.
 enum Banner {
@@ -319,6 +331,7 @@ impl App {
     }
 
     fn with_recent(ctx: &egui::Context, path: Option<PathBuf>, recent: recent::Recent) -> Self {
+        install_ui_font(ctx);
         // One font database and glyph atlas for both panes.
         let fonts = Fonts::shared(ctx);
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1831,6 +1844,45 @@ mod tests {
                 inkmark_buffer::EditKind::Other,
             )
             .unwrap();
+    }
+
+    /// Advance width and atlas size of one proportional glyph.
+    fn glyph_box(ctx: &egui::Context, c: char) -> (f32, f32, f32) {
+        let font = egui::FontId::proportional(13.0);
+        ctx.fonts_mut(|fonts| {
+            let galley = fonts.layout_no_wrap(c.to_string(), font, egui::Color32::WHITE);
+            let glyph = galley.rows[0].glyphs[0];
+            (
+                glyph.advance_width,
+                glyph.uv_rect.size.x,
+                glyph.uv_rect.size.y,
+            )
+        })
+    }
+
+    #[test]
+    fn the_chrome_draws_the_folder_and_unsaved_marks() {
+        let ctx = egui::Context::default();
+        // Default proportional faces replace all three marks with one box.
+        let mut first = ctx.run_ui(egui::RawInput::default(), |_| {});
+        first.textures_delta.clear();
+        let missing = glyph_box(&ctx, '▸');
+        assert_eq!(glyph_box(&ctx, '▾').1, missing.1);
+        assert_eq!(glyph_box(&ctx, '▾').2, missing.2);
+        assert_eq!(glyph_box(&ctx, '●').1, missing.1);
+        assert_eq!(glyph_box(&ctx, '●').2, missing.2);
+
+        install_ui_font(&ctx);
+        let mut second = ctx.run_ui(egui::RawInput::default(), |_| {});
+        second.textures_delta.clear();
+        for mark in ['▸', '▾', '●'] {
+            let drawn = glyph_box(&ctx, mark);
+            assert_ne!(
+                (drawn.1, drawn.2),
+                (missing.1, missing.2),
+                "{mark} still uses the missing-glyph box"
+            );
+        }
     }
 
     #[test]

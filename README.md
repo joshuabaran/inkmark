@@ -21,8 +21,10 @@ disk are the only source of truth: no accounts, sync or plugins.
 - **Per-pane minimaps**, images (PNG, JPEG, GIF, WebP, BMP, SVG), recent files.
 - **Your desktop's look**: on [Omarchy](https://omarchy.org) it uses the
   current theme's colors and follows `omarchy theme set` live; elsewhere it
-  picks dark or light to match the desktop. Fonts come from fontconfig
+  picks dark or light to match the desktop. The document uses fontconfig
   (Omarchy's `omarchy font set` included) unless you choose your own.
+  The sidebar, status bar, and dialogs use Hack, so the folder and unsaved
+  marks render the same on every machine.
 - **Folder sidebar**: browse a directory of notes; open, create, rename
   and move them (drag and drop works), or move them to the trash.
 - **Links you can follow**: Ctrl+click a link to open another note, jump
@@ -192,6 +194,7 @@ and applies changes to it while running:
 [font]
 code = "JetBrains Mono"   # code pane and code spans; default: the system monospace font
 text = "Inter"            # live pane; default: the system sans-serif font
+                          # neither changes the sidebar or the other chrome
 code_size = 14            # points
 text_size = 16
 
