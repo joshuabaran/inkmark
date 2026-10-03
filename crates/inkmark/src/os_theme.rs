@@ -76,8 +76,10 @@ impl OsTheme {
             }
         }
         if let Some(at) = self.changed_at {
-            if at.elapsed() < SETTLE {
-                ctx.request_repaint_after(SETTLE - at.elapsed());
+            // One sample. Sampling twice can cross the deadline between the
+            // check and the subtraction, and `Duration` panics on that.
+            if let Some(left) = time_left(at, SETTLE) {
+                ctx.request_repaint_after(left);
                 return;
             }
             self.changed_at = None;
@@ -100,8 +102,12 @@ impl OsTheme {
         if let Some(path) = file {
             match load_palette(&path) {
                 Ok(palette) => {
+                    let theme = Theme::from_palette(&palette);
+                    let dark = theme.dark;
+                    theme::set(ctx, theme);
                     self.system = None;
-                    theme::set(ctx, Theme::from_palette(&palette));
+                    // One line per apply, including a switch after the settle.
+                    crate::session::line(&format!("theme dark={dark}"));
                     return;
                 }
                 Err(e) => eprintln!("inkmark: {}: {e}", path.display()),
@@ -115,6 +121,14 @@ impl OsTheme {
         };
         theme::set(ctx, theme);
     }
+}
+
+/// Time left before `window` elapses, or nothing once it has.
+/// A single clock read, so the caller never subtracts past zero.
+pub fn time_left(started: Instant, window: Duration) -> Option<Duration> {
+    window
+        .checked_sub(started.elapsed())
+        .filter(|left| !left.is_zero())
 }
 
 /// Where Omarchy keeps the current theme's palette.
@@ -133,14 +147,33 @@ fn watch(colors: &Path, ctx: &egui::Context) -> Option<(RecommendedWatcher, Rece
     let (tx, rx) = mpsc::channel();
     let ctx = ctx.clone();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        if event.is_ok() {
-            let _ = tx.send(());
-            ctx.request_repaint();
+        // `notify` reports the open that happens when the palette is read.
+        // Treating that as a change reads the file again and never settles.
+        let Ok(event) = event else {
+            return;
+        };
+        if !palette_changed(event.kind) {
+            return;
         }
+        let _ = tx.send(());
+        ctx.request_repaint();
     })
     .ok()?;
     watcher.watch(current, RecursiveMode::Recursive).ok()?;
     Some((watcher, rx))
+}
+
+/// A real palette change. Opens and reads are not: those fire while loading.
+fn palette_changed(kind: notify::EventKind) -> bool {
+    matches!(
+        kind,
+        notify::EventKind::Modify(_)
+            | notify::EventKind::Create(_)
+            | notify::EventKind::Remove(_)
+            | notify::EventKind::Access(notify::event::AccessKind::Close(
+                notify::event::AccessMode::Write,
+            ))
+    )
 }
 
 /// Reads an Omarchy `colors.toml`: `mode = "dark" | "light"` and colors as
@@ -239,6 +272,34 @@ mod tests {
             checked += 1;
         }
         eprintln!("checked {checked} Omarchy palettes");
+    }
+
+    #[test]
+    fn an_open_or_a_read_is_not_a_palette_change() {
+        use notify::EventKind;
+        use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind};
+
+        assert!(!palette_changed(EventKind::Access(AccessKind::Open(
+            AccessMode::Read
+        ))));
+        assert!(!palette_changed(EventKind::Access(AccessKind::Read)));
+        assert!(!palette_changed(EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(palette_changed(EventKind::Modify(ModifyKind::Any)));
+        assert!(palette_changed(EventKind::Create(CreateKind::File)));
+        assert!(palette_changed(EventKind::Remove(RemoveKind::File)));
+        assert!(palette_changed(EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+    }
+
+    #[test]
+    fn a_deadline_that_has_passed_has_no_time_left() {
+        let started = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
+        assert_eq!(time_left(started, Duration::from_secs(1)), None);
+        assert_eq!(time_left(Instant::now(), Duration::ZERO), None);
+        assert!(time_left(Instant::now(), Duration::from_secs(30)).is_some());
     }
 
     #[test]
