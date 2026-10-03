@@ -47,6 +47,7 @@ mod links;
 mod measure;
 mod os_theme;
 mod recent;
+mod session;
 mod sidebar;
 
 const USAGE: &str = "\
@@ -118,11 +119,17 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         }
     };
+    session::init();
+    // `with_active` is ignored on Wayland. The e2e script asks Hyprland not
+    // to focus a window whose app id is `inkmark-e2e`.
+    let e2e = std::env::var_os("INKMARK_E2E").is_some();
+    let viewport = egui::ViewportBuilder::default()
+        .with_title(if e2e { "inkmark e2e" } else { "inkmark" })
+        .with_app_id(if e2e { "inkmark-e2e" } else { "inkmark" })
+        .with_inner_size(if e2e { [480.0, 320.0] } else { [1200.0, 800.0] })
+        .with_active(!e2e);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("inkmark")
-            .with_app_id("inkmark")
-            .with_inner_size([1200.0, 800.0]),
+        viewport,
         ..Default::default()
     };
     // Built with `--features glow`, INKMARK_RENDERER=glow picks OpenGL over wgpu.
@@ -135,7 +142,7 @@ fn main() -> eframe::Result {
         },
         ..options
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "inkmark",
         options,
         Box::new(|cc| {
@@ -143,7 +150,12 @@ fn main() -> eframe::Result {
             app.measure = measure::Measure::from_env(start);
             Ok(Box::new(app))
         }),
-    )
+    );
+    match &result {
+        Ok(()) => session::line("event_loop returned ok"),
+        Err(err) => session::line(&format!("event_loop returned error: {err}")),
+    }
+    result
 }
 
 /// The open file's state on disk, when it needs the user's attention.
@@ -249,6 +261,17 @@ struct App {
     confirm: Option<Confirm>,
     close_after_save: bool,
     close_allowed: bool,
+    /// Whether the window had keyboard focus last frame.
+    focused: Option<bool>,
+    /// Last `alive` line in the session log.
+    last_beat: Instant,
+    started: Instant,
+    /// Set from `INKMARK_E2E_QUIT_AFTER`. Absent in normal use.
+    quit_after: Option<Duration>,
+    /// A close request was already written to the session log.
+    logged_close: bool,
+    /// `sending close` was already written.
+    logged_send: bool,
     next_disk_check: Instant,
     title: String,
     measure: Option<measure::Measure>,
@@ -332,6 +355,12 @@ impl App {
             confirm: None,
             close_after_save: false,
             close_allowed: false,
+            focused: None,
+            last_beat: Instant::now(),
+            started: Instant::now(),
+            quit_after: session::quit_after(),
+            logged_close: false,
+            logged_send: false,
             next_disk_check: Instant::now() + DISK_CHECK_INTERVAL,
             title: String::new(),
             measure: None,
@@ -756,15 +785,59 @@ impl App {
     }
 
     fn guard_close(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested())
-            && self.doc.is_dirty()
-            && !self.close_allowed
-        {
+        let requested = ctx.input(|i| i.viewport().close_requested());
+        if requested && !self.logged_close {
+            let cancel = self.doc.is_dirty() && !self.close_allowed;
+            session::line(&format!(
+                "close_requested dirty={} cancel={cancel}",
+                self.doc.is_dirty()
+            ));
+            self.logged_close = true;
+        }
+        if !requested {
+            self.logged_close = false;
+        }
+        if requested && self.doc.is_dirty() && !self.close_allowed {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.confirm = Some(Confirm::Close);
         }
         if self.close_allowed {
+            if !self.logged_send {
+                session::line("sending close");
+                self.logged_send = true;
+            }
             ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+    }
+
+    /// Heartbeat, focus changes, and the e2e harness's timed quit.
+    fn note_session(&mut self, ctx: &egui::Context) {
+        let path = self.doc.path().map(|path| path.display().to_string());
+        let path = path.as_deref().unwrap_or("untitled");
+        if self.focused.is_none() {
+            session::line(&format!("first_frame path={path}"));
+        }
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
+        if self.focused != Some(focused) {
+            session::line(&format!("focus {focused}"));
+            self.focused = Some(focused);
+        }
+        if self.last_beat.elapsed() >= session::heartbeat_every() {
+            self.last_beat = Instant::now();
+            session::line(&format!(
+                "alive focused={focused} dirty={} path={path}",
+                self.doc.is_dirty()
+            ));
+        }
+        if let Some(after) = self.quit_after {
+            let left = after.saturating_sub(self.started.elapsed());
+            if left.is_zero() && !self.close_allowed {
+                session::line("e2e_quit");
+                self.close_allowed = true;
+            } else if !left.is_zero() {
+                // Wake once to close. Idle runs leave the repaint schedule alone.
+                ctx.request_repaint_after(left);
+            }
         }
     }
 
@@ -1541,10 +1614,10 @@ impl App {
         self.apply_pending_jump();
         if let Some((_, shown)) = &self.hint {
             let shown = *shown;
-            if shown.elapsed() >= HINT_TIME {
-                self.hint = None;
+            if let Some(left) = os_theme::time_left(shown, HINT_TIME) {
+                ctx.request_repaint_after(left);
             } else {
-                ctx.request_repaint_after(HINT_TIME - shown.elapsed());
+                self.hint = None;
             }
         }
         match self.mode {
@@ -1612,6 +1685,7 @@ impl App {
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.os_theme.poll(&ctx);
+        self.note_session(&ctx);
         self.handle_shortcuts(&ctx);
         self.poll_dialog(&ctx);
         self.check_disk(&ctx);
