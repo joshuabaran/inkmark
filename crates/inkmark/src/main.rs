@@ -319,6 +319,8 @@ struct App {
     /// Find and replace in the open document. Closed, it still remembers
     /// the query so F3 can repeat it.
     find: FindBar,
+    /// Heading rows for the outline, rebuilt when the parse revision changes.
+    outline: outline::Outline,
     /// The error banner text the settings put up, to take down once fixed.
     settings_error: Option<String>,
     /// A dialog took keyboard focus from the panes last frame.
@@ -399,6 +401,7 @@ impl App {
             settings: config::Settings::default(),
             keys: keys::KeyMap::builtin(),
             find: FindBar::default(),
+            outline: outline::Outline::default(),
             settings_error: None,
             modal_was_open: false,
             #[cfg(test)]
@@ -1509,9 +1512,12 @@ impl App {
                 divider.y_range(),
                 Stroke::new(1.0, colors.divider),
             );
+            self.outline
+                .refresh(self.parse.revision(), &self.doc, self.parse.output());
+            let caret = self.selection().head;
             let clicked = ui
                 .scope_builder(UiBuilder::new().max_rect(outline_rect), |ui| {
-                    outline::show(ui, &self.doc, self.parse.output(), self.selection().head)
+                    outline::show(ui, self.outline.rows(), caret)
                 })
                 .inner;
             if let Some(offset) = clicked {
@@ -3896,6 +3902,11 @@ mod tests {
         run.click_text("Beta");
         run.frame(vec![egui::Event::Text("Q".into())]);
         assert!(text(&run.app).contains("QBeta"), "{}", text(&run.app));
+        let edited = run.text_rect("QBeta").expect("QBeta");
+        assert!(
+            edited.left() > 700.0,
+            "the outline shows the edited heading, {edited:?}"
+        );
     }
 
     #[test]

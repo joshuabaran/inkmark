@@ -105,6 +105,7 @@ pub struct Heading {
 /// quote. The outline and [`heading_offset`] both walk this list, so a click
 /// and a Ctrl+click land on the same byte.
 pub fn headings(doc: &Document, out: &ParseOutput) -> Vec<Heading> {
+    let doc_len = doc.len();
     let mut found = Vec::new();
     for block in out.blocks.iter() {
         let BlockKind::Heading(level) = block.kind else {
@@ -113,18 +114,42 @@ pub fn headings(doc: &Document, out: &ParseOutput) -> Vec<Heading> {
         let spans = out.map.spans_in(block.range.clone());
         let mut text = String::new();
         let mut first_text = None;
+        // Source offset of the first character that survives trimming.
+        let mut content_at = None;
         for s in &spans {
-            match &s.kind {
-                SpanKind::Text => text.push_str(&doc.slice(s.range.clone())),
-                SpanKind::Replaced(r) => text.push_str(r),
-                _ => continue,
+            // A parse that has not caught up can name bytes past the rope.
+            // Skipping them keeps a frame from panicking on the slice.
+            if s.range.start > doc_len || s.range.end > doc_len {
+                continue;
             }
+            let piece = match &s.kind {
+                SpanKind::Text => doc.slice(s.range.clone()),
+                SpanKind::Replaced(rendered) => std::borrow::Cow::Borrowed(rendered.as_ref()),
+                _ => continue,
+            };
             first_text.get_or_insert(s.range.start);
+            if content_at.is_none() {
+                let rest = piece.trim_start();
+                if !rest.is_empty() {
+                    let at = match &s.kind {
+                        // Text is the source bytes, so the trim is a byte shift.
+                        SpanKind::Text => s.range.start + (piece.len() - rest.len()),
+                        // A replacement (an entity) is not the source. The
+                        // caret goes to the start of that span.
+                        _ => s.range.start,
+                    };
+                    content_at = Some(at.min(doc_len));
+                }
+            }
+            text.push_str(&piece);
         }
         found.push(Heading {
             level,
             text: text.trim().to_owned(),
-            offset: first_text.unwrap_or(block.range.start),
+            offset: content_at
+                .or(first_text)
+                .unwrap_or(block.range.start)
+                .min(doc_len),
         });
     }
     found
@@ -329,5 +354,57 @@ mod tests {
         assert_eq!(found[3].offset, src.find("Listed").unwrap());
         assert!(found[5].offset < src.len());
         assert!(found.iter().all(|h| h.text != "Not a heading"));
+    }
+
+    #[test]
+    fn a_heading_offset_skips_leading_space_in_its_text() {
+        let src = "#  Hello\n";
+        let doc = Document::from_text(src);
+        let out = ParseOutput {
+            blocks: crate::tree::BlockTree::from_blocks(vec![crate::tree::Block {
+                kind: BlockKind::Heading(1),
+                range: 0..src.len(),
+                depth: 0,
+            }]),
+            map: crate::map::SourceMap::from_spans(vec![
+                span(0..2, SpanKind::Whitespace),
+                span(2..9, SpanKind::Text),
+                span(9..10, SpanKind::Whitespace),
+            ]),
+            ..ParseOutput::default()
+        };
+        let found = headings(&doc, &out);
+        assert_eq!(found[0].text, "Hello");
+        assert_eq!(found[0].offset, src.find('H').unwrap());
+        assert_eq!(
+            heading_offset(&doc, &out, "hello"),
+            Some(src.find('H').unwrap())
+        );
+    }
+
+    #[test]
+    fn a_span_past_the_document_is_not_sliced() {
+        let doc = Document::from_text("Hi");
+        let out = ParseOutput {
+            blocks: crate::tree::BlockTree::from_blocks(vec![crate::tree::Block {
+                kind: BlockKind::Heading(1),
+                range: 0..20,
+                depth: 0,
+            }]),
+            map: crate::map::SourceMap::from_spans(vec![span(0..20, SpanKind::Text)]),
+            ..ParseOutput::default()
+        };
+        let found = headings(&doc, &out);
+        assert_eq!(found[0].text, "");
+        assert_eq!(found[0].offset, 0);
+    }
+
+    fn span(range: std::ops::Range<usize>, kind: SpanKind) -> crate::map::Span {
+        crate::map::Span {
+            range,
+            kind,
+            style: crate::map::Style::default(),
+            heading: 1,
+        }
     }
 }

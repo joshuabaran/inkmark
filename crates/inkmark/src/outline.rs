@@ -6,6 +6,28 @@ use inkmark_buffer::Document;
 use inkmark_parse::{Heading, ParseOutput};
 use inkmark_view::theme;
 
+/// Heading rows kept until the parse revision changes.
+#[derive(Default)]
+pub(crate) struct Outline {
+    rows: Vec<Heading>,
+    revision: Option<u64>,
+}
+
+impl Outline {
+    /// Rebuilds the rows when `revision` is not the one they were built from.
+    pub(crate) fn refresh(&mut self, revision: u64, doc: &Document, out: &ParseOutput) {
+        if self.revision == Some(revision) {
+            return;
+        }
+        self.rows = inkmark_parse::headings(doc, out);
+        self.revision = Some(revision);
+    }
+
+    pub(crate) fn rows(&self) -> &[Heading] {
+        &self.rows
+    }
+}
+
 /// Width the outline takes when the window has room for it.
 pub const PREFERRED_WIDTH: f32 = 200.0;
 /// Narrowest the outline gets before the panes give up more room.
@@ -39,19 +61,14 @@ pub(crate) fn column_widths(total: f32, sidebar_wanted: Option<f32>) -> (f32, f3
 }
 
 /// Draws the outline and returns the byte offset of a clicked heading.
-pub(crate) fn show(
-    ui: &mut egui::Ui,
-    doc: &Document,
-    out: &ParseOutput,
-    caret: usize,
-) -> Option<usize> {
+/// `headings` is the cached list from [`Outline::refresh`].
+pub(crate) fn show(ui: &mut egui::Ui, headings: &[Heading], caret: usize) -> Option<usize> {
     let colors = theme::current(ui.ctx());
     ui.painter()
         .rect_filled(ui.max_rect(), 0.0, colors.background);
     ui.add_space(4.0);
     ui.label(RichText::new("Outline").strong().color(colors.text));
 
-    let headings = inkmark_parse::headings(doc, out);
     if headings.is_empty() {
         ui.label(RichText::new("No headings").color(colors.hint));
         return None;
