@@ -1732,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "inkmark"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "eframe",
  "inkmark-buffer",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "inkmark-buffer"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "proptest",
  "ropey",
@@ -1762,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "inkmark-files"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "notify",
  "rustix 1.1.5",
@@ -1772,14 +1772,14 @@ dependencies = [
 
 [[package]]
 name = "inkmark-minimap"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "egui",
 ]
 
 [[package]]
 name = "inkmark-parse"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "inkmark-buffer",
  "proptest",
@@ -1789,7 +1789,7 @@ dependencies = [
 
 [[package]]
 name = "inkmark-text"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cosmic-text",
  "eframe",
@@ -1799,7 +1799,7 @@ dependencies = [
 
 [[package]]
 name = "inkmark-view"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "egui",
  "flate2",
