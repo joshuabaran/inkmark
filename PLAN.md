@@ -393,6 +393,15 @@ Working with a folder of notes: manage files from the sidebar, and follow links 
 
 **As built:** the trash is the `trash` crate behind a `Trash` trait; renames use `renameat2(RENAME_NOREPLACE)` via `rustix`. Link destinations come from re-parsing the clicked block with pulldown-cmark (reference links resolve through the document's definitions; autolink literals are the link-styled text itself). The sidebar tests check the right-click menu by finding its items in egui's drawn output, since sending clicks to the desktop isn't an option. Not done: Back across an unsaved-changes prompt that you cancel drops that step; Forward (Alt+Right); links to non-Markdown files.
 
+### Release v0.1.0
+
+Decided 2026-10-03: the first release is **v0.1.0** (the version already in `Cargo.toml`), with a **Linux x86_64 binary** only. No CHANGELOG yet (release notes are generated from the merged PRs), no versioned Arch package (`inkmark-git` stays), no aarch64 build.
+
+- `scripts/package.sh` builds `inkmark-<version>-<target>.tar.gz` (stripped binary, desktop entry, icon, licenses, README) and a `.sha256`; it runs the same locally and in CI.
+- `.github/workflows/release.yml` runs on a `v*` tag: checks the tag matches the crate version, runs the tests, packages, and publishes the GitHub release.
+- The owner pushes the tag after the release PR merges: `git tag v0.1.0 && git push origin v0.1.0`.
+- `inkmark --help` / `--version` exist, and `--` ends options (the desktop entry uses `inkmark -- %f`).
+
 ### Later
 
 - Tables: re-pad columns so pipes stay aligned as you type; add and remove columns.

@@ -56,9 +56,62 @@ mod measure;
 mod recent;
 mod sidebar;
 
+const USAGE: &str = "\
+Usage: inkmark [FILE | FOLDER]
+
+  FILE     open it, browsing its folder (a missing path becomes a new file)
+  FOLDER   browse it, with nothing open
+           (no argument: browse the current directory)
+
+Options:
+  -h, --help     show this help
+  -V, --version  show the version
+  --             treat what follows as a path, even if it starts with -";
+
+/// What the command line asks for.
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Run(Option<PathBuf>),
+    Help,
+    Version,
+}
+
+fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Command, String> {
+    let mut path = None;
+    let mut options_done = false;
+    for arg in args {
+        let text = arg.to_str().unwrap_or_default();
+        match text {
+            "--" if !options_done => options_done = true,
+            "-h" | "--help" if !options_done => return Ok(Command::Help),
+            "-V" | "--version" if !options_done => return Ok(Command::Version),
+            _ if !options_done && text.starts_with('-') && text.len() > 1 => {
+                return Err(format!("unknown option {text}"));
+            }
+            _ if path.is_some() => return Err("only one file or folder can be opened".into()),
+            _ => path = Some(PathBuf::from(arg)),
+        }
+    }
+    Ok(Command::Run(path))
+}
+
 fn main() -> eframe::Result {
     let start = Instant::now();
-    let path = std::env::args_os().nth(1).map(PathBuf::from);
+    let path = match parse_args(std::env::args_os().skip(1)) {
+        Ok(Command::Run(path)) => path,
+        Ok(Command::Help) => {
+            println!("inkmark {}\n\n{USAGE}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Ok(Command::Version) => {
+            println!("inkmark {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Err(message) => {
+            eprintln!("inkmark: {message}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("inkmark")
@@ -2902,5 +2955,31 @@ mod tests {
         r.frame(vec![]);
         r.click_text("c.md");
         assert_eq!(r.app.doc.path(), Some(c.as_path()));
+    }
+
+    #[test]
+    fn the_command_line_takes_one_path_or_an_option() {
+        let parse = |args: &[&str]| parse_args(args.iter().map(std::ffi::OsString::from));
+        assert_eq!(parse(&[]), Ok(Command::Run(None)));
+        assert_eq!(
+            parse(&["notes.md"]),
+            Ok(Command::Run(Some("notes.md".into())))
+        );
+        assert_eq!(parse(&["--help"]), Ok(Command::Help));
+        assert_eq!(parse(&["-h"]), Ok(Command::Help));
+        assert_eq!(parse(&["notes.md", "-V"]), Ok(Command::Version));
+        assert_eq!(parse(&["--version"]), Ok(Command::Version));
+        // A file whose name starts with `-`, after `--`; a lone `-` is a name.
+        assert_eq!(
+            parse(&["--", "--help"]),
+            Ok(Command::Run(Some("--help".into())))
+        );
+        assert_eq!(parse(&["-"]), Ok(Command::Run(Some("-".into()))));
+        assert!(
+            parse(&["--frobnicate"])
+                .unwrap_err()
+                .contains("--frobnicate")
+        );
+        assert!(parse(&["a.md", "b.md"]).is_err());
     }
 }

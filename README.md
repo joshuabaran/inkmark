@@ -26,6 +26,20 @@ See [PLAN.md](PLAN.md) for the design, measurements and roadmap.
 
 ## Install
 
+### From a release
+
+Each [release](https://github.com/joshuabaran/inkmark/releases) has a
+Linux x86_64 build (glibc 2.39 or newer, so current Arch, Fedora, or Ubuntu
+24.04 and later). Download the `.tar.gz` and its `.sha256`, then:
+
+```sh
+sha256sum -c inkmark-*.tar.gz.sha256
+tar xzf inkmark-*.tar.gz && cd inkmark-*/
+install -Dm755 inkmark ~/.local/bin/inkmark
+install -Dm644 inkmark.desktop ~/.local/share/applications/inkmark.desktop
+install -Dm644 inkmark.svg ~/.local/share/icons/hicolor/scalable/apps/inkmark.svg
+```
+
 ### Arch Linux
 
 ```sh
@@ -57,6 +71,7 @@ with `INKMARK_RENDERER=glow` to use OpenGL.
 ## Use
 
 ```sh
+inkmark --help        # usage; inkmark --version prints the version
 inkmark notes.md      # browses that file's folder; a missing path is a new file there
 inkmark ~/notes       # browses the folder, with nothing open
 inkmark               # browses the current directory and shows recent files
