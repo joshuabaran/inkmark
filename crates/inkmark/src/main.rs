@@ -4,8 +4,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Color32, Key, KeyboardShortcut, Modifiers, Rect, RichText, Stroke, UiBuilder,
-    ViewportCommand, pos2,
+    self, Key, KeyboardShortcut, Modifiers, Rect, RichText, Stroke, UiBuilder, ViewportCommand,
+    pos2,
 };
 use inkmark_buffer::{DiskStatus, Document, LineEnding, OpenError};
 use inkmark_files::{
@@ -13,7 +13,14 @@ use inkmark_files::{
 };
 use inkmark_parse::{GfmParser, ParseState};
 use inkmark_text::Fonts;
-use inkmark_view::{BrowserOutput, CodeView, FileBrowser, LiveView};
+use inkmark_view::{BrowserOutput, CodeView, FileBrowser, LiveView, theme};
+
+/// Font sizes, in points, unless config.toml sets them, and line height as
+/// a multiple of the size.
+const CODE_SIZE: f32 = 14.0;
+const TEXT_SIZE: f32 = 16.0;
+const CODE_LINE: f32 = 21.0 / 14.0;
+const TEXT_LINE: f32 = 26.0 / 16.0;
 
 /// How long a key hint stays in the status bar.
 const HINT_TIME: Duration = Duration::from_secs(4);
@@ -51,8 +58,10 @@ enum Pane {
     Live,
 }
 
+mod config;
 mod links;
 mod measure;
+mod os_theme;
 mod recent;
 mod sidebar;
 
@@ -133,7 +142,6 @@ fn main() -> eframe::Result {
         "inkmark",
         options,
         Box::new(|cc| {
-            cc.egui_ctx.set_theme(egui::Theme::Dark);
             let mut app = App::new(&cc.egui_ctx, path);
             app.measure = measure::Measure::from_env(start);
             Ok(Box::new(app))
@@ -245,6 +253,18 @@ struct App {
     trash_confirm: Option<PathBuf>,
     /// Where Move to Trash sends things; tests use their own.
     trash: Box<dyn Trash>,
+    /// The desktop's colors, followed live (fixed in tests).
+    os_theme: os_theme::OsTheme,
+    /// The font database both panes share, for applying font settings.
+    fonts: inkmark_text::SharedFonts,
+    /// config.toml and fontconfig's file, watched for font changes (none
+    /// in tests), with their last modification times.
+    font_files: Vec<Option<PathBuf>>,
+    font_stamps: Vec<Option<std::time::SystemTime>>,
+    /// The last config.toml that read cleanly, kept through a bad read.
+    settings: config::Settings,
+    /// The error banner text the settings put up, to take down once fixed.
+    settings_error: Option<String>,
     /// A dialog took keyboard focus from the panes last frame.
     modal_was_open: bool,
     /// Tests receive the dialog kind instead of opening a portal window.
@@ -254,7 +274,11 @@ struct App {
 
 impl App {
     fn new(ctx: &egui::Context, path: Option<PathBuf>) -> Self {
-        Self::with_recent(ctx, path, recent::Recent::load())
+        let mut app = Self::with_recent(ctx, path, recent::Recent::load());
+        app.os_theme = os_theme::OsTheme::follow(ctx);
+        app.font_files = vec![config::config_path(), config::fontconfig_path()];
+        app.apply_settings();
+        app
     }
 
     fn with_recent(ctx: &egui::Context, path: Option<PathBuf>, recent: recent::Recent) -> Self {
@@ -271,7 +295,7 @@ impl App {
         let mut app = Self {
             doc: Document::default(),
             code: CodeView::with_fonts(fonts.clone(), egui::Id::new("code_view")),
-            live: LiveView::with_fonts(fonts, egui::Id::new("live_view")),
+            live: LiveView::with_fonts(fonts.clone(), egui::Id::new("live_view")),
             mode: Mode::Split,
             focus: Pane::Code,
             parse: {
@@ -303,6 +327,12 @@ impl App {
             rename: None,
             trash_confirm: None,
             trash: Box::new(SystemTrash),
+            os_theme: os_theme::OsTheme::fixed(),
+            fonts: fonts.clone(),
+            font_files: Vec::new(),
+            font_stamps: Vec::new(),
+            settings: config::Settings::default(),
+            settings_error: None,
             modal_was_open: false,
             #[cfg(test)]
             dialog_hook: None,
@@ -494,10 +524,85 @@ impl App {
         self.dialog = None;
     }
 
+    /// Reads config.toml and the system fonts and applies them: config
+    /// first, then fontconfig's monospace and sans-serif families.
+    fn apply_settings(&mut self) {
+        self.font_stamps = config::stamps(&self.font_files);
+        let path = self.font_files.first().cloned().flatten();
+        self.apply_settings_from(path.as_deref(), config::system_font);
+    }
+
+    fn apply_settings_from(
+        &mut self,
+        config_file: Option<&Path>,
+        system_font: impl Fn(&str) -> Option<String>,
+    ) {
+        let mut problems = Vec::new();
+        // No file: defaults. A file that can't be read or parsed (perhaps
+        // half-written): say so and keep the last good settings.
+        let read = match config_file.map(std::fs::read_to_string) {
+            None => Ok(None),
+            Some(Ok(text)) => config::parse(&text).map(Some),
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Some(Err(e)) => Err(e.to_string()),
+        };
+        match read {
+            Ok(settings) => self.settings = settings.unwrap_or_default(),
+            Err(e) => problems.push(format!(
+                "Couldn't read config.toml: {e} (keeping the previous settings)"
+            )),
+        }
+        let settings = self.settings.clone();
+        // A font named in the config that isn't installed falls back to the
+        // system's, as if it weren't named.
+        let mut missing = Vec::new();
+        let mut pick = |configured: Option<&String>, alias: &str| match configured {
+            Some(name) if self.fonts.borrow().has_family(name) => Some(name.clone()),
+            Some(name) => {
+                missing.push(name.clone());
+                system_font(alias)
+            }
+            None => system_font(alias),
+        };
+        let code = pick(settings.code_font.as_ref(), "monospace");
+        let text = pick(settings.text_font.as_ref(), "sans-serif");
+        missing.extend(
+            self.fonts
+                .borrow_mut()
+                .set_families(code.as_deref(), text.as_deref()),
+        );
+        if !missing.is_empty() {
+            problems.push(format!(
+                "Font not installed: {} (using the system font)",
+                missing.join(", ")
+            ));
+        }
+        let code_size = settings.code_size.unwrap_or(CODE_SIZE);
+        let text_size = settings.text_size.unwrap_or(TEXT_SIZE);
+        self.code.font_size = code_size;
+        self.code.line_height = (code_size * CODE_LINE).round();
+        self.live.font_size = text_size;
+        self.live.line_height = (text_size * TEXT_LINE).round();
+        // Show what's wrong; once nothing is, take down only our own banner.
+        if problems.is_empty() {
+            if self.error.is_some() && self.error == self.settings_error {
+                self.error = None;
+            }
+            self.settings_error = None;
+        } else {
+            let message = problems.join(". ");
+            self.error = Some(message.clone());
+            self.settings_error = Some(message);
+        }
+    }
+
     fn check_disk(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         if now >= self.next_disk_check {
             self.next_disk_check = now + DISK_CHECK_INTERVAL;
+            if !self.font_files.is_empty() && config::stamps(&self.font_files) != self.font_stamps {
+                self.apply_settings();
+            }
             self.banner = match self.doc.disk_status() {
                 Ok(DiskStatus::Modified) => Some(Banner::DiskChanged),
                 Ok(DiskStatus::Missing) => Some(Banner::DiskMissing),
@@ -674,7 +779,7 @@ impl App {
         let mut action = None;
         if let Some(message) = &self.error {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(message).color(Color32::from_rgb(255, 140, 120)));
+                ui.label(RichText::new(message).color(theme::current(ui.ctx()).error));
                 if ui.button("Dismiss").clicked() {
                     action = Some("dismiss");
                 }
@@ -736,7 +841,7 @@ impl App {
                 ui.label("●");
             }
             if let Some((hint, _)) = &self.hint {
-                ui.label(RichText::new(hint).color(Color32::from_rgb(230, 200, 120)));
+                ui.label(RichText::new(hint).color(theme::current(ui.ctx()).hint));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(if encoding.bom { "UTF-8 BOM" } else { "UTF-8" });
@@ -1165,10 +1270,13 @@ impl App {
         if handle_resp.drag_stopped() {
             self.sidebar.save();
         }
+        // The gap would otherwise show the window's clear color.
+        let colors = theme::current(ui.ctx());
+        ui.painter().rect_filled(handle, 0.0, colors.background);
         ui.painter().vline(
             handle.center().x,
             handle.y_range(),
-            Stroke::new(1.0, Color32::from_gray(40)),
+            Stroke::new(1.0, colors.divider),
         );
         if right.width() > 1.0 {
             ui.scope_builder(UiBuilder::new().max_rect(right), |ui| self.panes(ui));
@@ -1377,7 +1485,7 @@ impl App {
                 ui.painter().vline(
                     mid,
                     rect.y_range(),
-                    Stroke::new(2.0, Color32::from_gray(40)),
+                    Stroke::new(2.0, theme::current(ui.ctx()).divider),
                 );
             }
         }
@@ -1420,6 +1528,7 @@ impl App {
     /// drive exactly this, without a real window.
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.os_theme.poll(&ctx);
         self.handle_shortcuts(&ctx);
         self.poll_dialog(&ctx);
         self.check_disk(&ctx);
@@ -1523,7 +1632,7 @@ fn name_modal(
             edit.state.store(ui.ctx(), field);
         }
         if let Some(error) = error {
-            ui.label(RichText::new(error).color(Color32::from_rgb(255, 140, 120)));
+            ui.label(RichText::new(error).color(theme::current(ui.ctx()).error));
         }
         ui.horizontal(|ui| {
             if ui.button(action).clicked() {
@@ -2981,5 +3090,109 @@ mod tests {
                 .contains("--frobnicate")
         );
         assert!(parse(&["a.md", "b.md"]).is_err());
+    }
+
+    #[test]
+    fn font_settings_apply_and_report_missing_fonts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path(), None);
+        let config = dir.path().join("config.toml");
+        fs::write(
+            &config,
+            "[font]\ncode = \"No Such Mono 123\"\ntext_size = 20\n",
+        )
+        .unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+        app.apply_settings_from(Some(&config), |alias| {
+            asked.borrow_mut().push(alias.to_owned());
+            None
+        });
+        assert_eq!(app.live.font_size, 20.0);
+        assert_eq!(app.code.font_size, CODE_SIZE);
+        assert!(
+            app.error.as_deref().unwrap().contains("No Such Mono 123"),
+            "{:?}",
+            app.error
+        );
+        // The configured code font isn't installed, so it falls back to the
+        // system's too.
+        assert_eq!(
+            *asked.borrow(),
+            vec!["monospace".to_owned(), "sans-serif".to_owned()]
+        );
+
+        app.error = None;
+        fs::write(&config, "[font]\ncode_size = \"big\"\n").unwrap();
+        app.apply_settings_from(Some(&config), |_| None);
+        assert!(app.error.as_deref().unwrap().contains("code_size"));
+        assert_eq!(
+            app.live.font_size, 20.0,
+            "a bad file keeps the last good settings"
+        );
+    }
+
+    #[test]
+    fn settings_fall_back_scale_and_clear_their_own_errors() {
+        // Review of #30.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path(), None);
+        let Some(installed) = ["DejaVu Sans", "Noto Sans", "Liberation Sans"]
+            .into_iter()
+            .find(|f| app.fonts.borrow().has_family(f))
+        else {
+            return;
+        };
+        let system = |alias: &str| (alias == "sans-serif").then(|| installed.to_owned());
+        let config = dir.path().join("config.toml");
+
+        // A configured font that isn't installed falls back to the system's.
+        fs::write(
+            &config,
+            "[font]\ntext = \"No Such Sans 123\"\ntext_size = 24\n",
+        )
+        .unwrap();
+        app.apply_settings_from(Some(&config), system);
+        assert_eq!(app.fonts.borrow().families().1, installed);
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap()
+                .contains("using the system font")
+        );
+        // Line height follows the size.
+        assert_eq!(app.live.line_height, (24.0 * TEXT_LINE).round());
+        assert_eq!(app.code.line_height, 21.0);
+
+        // Fixed: the settings' own error goes away.
+        fs::write(&config, "[font]\ntext_size = 24\n").unwrap();
+        app.apply_settings_from(Some(&config), system);
+        assert!(app.error.is_none(), "{:?}", app.error);
+
+        // An unrelated error stays.
+        app.error = Some("Couldn't save: disk full".into());
+        app.apply_settings_from(Some(&config), system);
+        assert_eq!(app.error.as_deref(), Some("Couldn't save: disk full"));
+
+        // A file that exists but can't be read keeps the previous settings.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = fs::read_to_string(&config).is_err();
+        app.error = None;
+        app.apply_settings_from(Some(&config), system);
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+        if unreadable {
+            assert!(
+                app.error
+                    .as_deref()
+                    .unwrap()
+                    .contains("keeping the previous")
+            );
+            assert_eq!(app.live.font_size, 24.0);
+        }
+        // A deleted file means defaults.
+        fs::remove_file(&config).unwrap();
+        app.apply_settings_from(Some(&config), system);
+        assert_eq!(app.live.font_size, TEXT_SIZE);
+        assert!(app.error.is_none());
     }
 }

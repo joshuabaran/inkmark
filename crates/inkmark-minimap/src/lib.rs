@@ -13,11 +13,6 @@ pub const WIDTH: f32 = 88.0;
 /// Document points per minimap point is `1 / SCALE`.
 pub const SCALE: f32 = 0.125;
 
-const BACKGROUND: Color32 = Color32::from_rgb(19, 19, 23);
-const VIEWPORT: Color32 = Color32::from_rgba_premultiplied(18, 18, 18, 18);
-const VIEWPORT_HOVER: Color32 = Color32::from_rgba_premultiplied(30, 30, 30, 30);
-const VIEWPORT_EDGE: Color32 = Color32::from_rgba_premultiplied(40, 40, 40, 40);
-
 /// Where a minimap sits and what part of the document it shows this frame.
 /// Document coordinates are the pane's own (its line heights), in points.
 #[derive(Clone, Copy, Debug)]
@@ -92,8 +87,8 @@ impl Minimap {
         top.clamp(0.0, (self.total - self.viewport).max(0.0))
     }
 
-    pub fn paint_background(&self, painter: &Painter) {
-        painter.rect_filled(self.rect, 0.0, BACKGROUND);
+    pub fn paint_background(&self, painter: &Painter, color: Color32) {
+        painter.rect_filled(self.rect, 0.0, color);
     }
 
     /// A horizontal bar for document range `doc_y .. doc_y + height`,
@@ -114,10 +109,12 @@ impl Minimap {
         painter.rect_filled(r, 0.0, color);
     }
 
-    pub fn paint_viewport(&self, painter: &Painter, hovered: bool) {
+    /// The visible window: `fill` (darker or lighter while `hovered`, the
+    /// caller picks) and an `edge` outline.
+    pub fn paint_viewport(&self, painter: &Painter, fill: Color32, edge: Color32) {
         let r = self.viewport_rect();
-        painter.rect_filled(r, 0.0, if hovered { VIEWPORT_HOVER } else { VIEWPORT });
-        painter.rect_stroke(r, 0.0, Stroke::new(1.0, VIEWPORT_EDGE), StrokeKind::Inside);
+        painter.rect_filled(r, 0.0, fill);
+        painter.rect_stroke(r, 0.0, Stroke::new(1.0, edge), StrokeKind::Inside);
     }
 }
 

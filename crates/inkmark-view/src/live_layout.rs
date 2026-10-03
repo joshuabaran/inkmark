@@ -9,7 +9,7 @@ use inkmark_buffer::Document;
 use inkmark_parse::{BlockKind, Leaf, SourceMap, Span, SpanKind, Style, Syntax};
 use inkmark_text::FontStyle;
 
-use crate::theme;
+use crate::theme::Theme;
 
 /// A run of display text and the source bytes it shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -190,6 +190,7 @@ pub(crate) fn build(
     map: &SourceMap,
     leaf: &Leaf,
     reveal: Option<Reveal>,
+    theme: &Theme,
 ) -> LeafLayout {
     let range = leaf.block.range.clone();
     let style = match leaf.block.kind {
@@ -241,15 +242,15 @@ pub(crate) fn build(
             _ => on_line(&r),
         };
         match &span.kind {
-            SpanKind::Text => b.exact(r, font, theme::live_color(&span)),
+            SpanKind::Text => b.exact(r, font, theme.live_color(&span)),
             SpanKind::Replaced(text) if !raw && r == span.range => {
-                b.push(text, r, false, font, theme::live_color(&span))
+                b.push(text, r, false, font, theme.live_color(&span))
             }
-            SpanKind::Replaced(_) => b.exact(r, font, theme::live_color(&span)),
+            SpanKind::Replaced(_) => b.exact(r, font, theme.live_color(&span)),
             SpanKind::SoftBreak => b.push(" ", r, false, font, None),
             SpanKind::Syntax(Syntax::HardBreak) => {
                 if raw {
-                    b.exact(r, font, Some(theme::MARKUP));
+                    b.exact(r, font, Some(theme.markup));
                 } else {
                     let end = r.end;
                     b.segments.push(Segment {
@@ -276,7 +277,7 @@ pub(crate) fn build(
                     italic: false,
                     ..font
                 };
-                b.exact(r, font, Some(theme::syntax_color(&span)));
+                b.exact(r, font, Some(theme.syntax_color(&span)));
             }
             SpanKind::Syntax(_) | SpanKind::Whitespace => {}
         }
@@ -356,7 +357,7 @@ mod tests {
         let leaves = out
             .blocks
             .leaves_from(0)
-            .map(|leaf| build(&doc, &out.map, &leaf, reveal.clone()))
+            .map(|leaf| build(&doc, &out.map, &leaf, reveal.clone(), &Theme::dark()))
             .collect();
         (doc, leaves)
     }
@@ -381,7 +382,13 @@ mod tests {
         let out = PulldownParser.parse(src);
         let line = doc.line_range(doc.byte_to_line(caret));
         let leaf = out.blocks.leaves_from(caret).next().unwrap();
-        build(&doc, &out.map, &leaf, Some(Reveal { line, caret }))
+        build(
+            &doc,
+            &out.map,
+            &leaf,
+            Some(Reveal { line, caret }),
+            &Theme::dark(),
+        )
     }
 
     #[test]
@@ -415,7 +422,7 @@ mod tests {
         let doc = Document::from_text("a ~~old~~ b\n");
         let out = inkmark_parse::GfmParser.parse("a ~~old~~ b\n");
         let leaf = out.blocks.leaves_from(0).next().unwrap();
-        let l = build(&doc, &out.map, &leaf, None);
+        let l = build(&doc, &out.map, &leaf, None, &Theme::dark());
         assert_eq!(texts(&l), vec!["a old b"]);
         assert_eq!(l.segments[0].strikes, vec![2..5]);
         let l = build(
@@ -426,6 +433,7 @@ mod tests {
                 line: 0..12,
                 caret: 5,
             }),
+            &Theme::dark(),
         );
         assert_eq!(texts(&l), vec!["a ~~old~~ b"]);
         assert_eq!(l.segments[0].strikes, vec![4..7]);
@@ -485,7 +493,13 @@ mod tests {
         let leaf = out.blocks.leaves_from(0).next().unwrap();
         let at = |caret: usize| {
             let line = doc.line_range(doc.byte_to_line(caret));
-            build(&doc, &out.map, &leaf, Some(Reveal { line, caret }))
+            build(
+                &doc,
+                &out.map,
+                &leaf,
+                Some(Reveal { line, caret }),
+                &Theme::dark(),
+            )
         };
         assert_eq!(texts(&at(0)), vec!["Text[1] more."]);
         assert_eq!(texts(&at(4)), vec!["Text[^1] more."]);
@@ -501,6 +515,7 @@ mod tests {
                 line: doc.line_range(2),
                 caret: 16,
             }),
+            &Theme::dark(),
         );
         assert_eq!(texts(&l), vec!["Note."]);
     }
