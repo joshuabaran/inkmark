@@ -307,7 +307,68 @@ impl TextRenderer {
         for (range, style) in line.runs {
             attrs.add_span(range.clone(), &self.attrs(*style));
         }
+        // Monospace text: wide characters (CJK, most emoji) are shaped two
+        // cells wide, so wrapping sees the widths they'll be drawn at. Their
+        // fonts set them 1 em wide; scale that to two cells.
+        let config = self.config();
+        if config.monospace && self.avg_advance_px > 0.0 {
+            let em = config.font_size * self.pixels_per_point;
+            let scale = 2.0 * self.avg_advance_px / em;
+            let wide = self.attrs(FontStyle::default()).metrics(Metrics::new(
+                em * scale,
+                (config.line_height * self.pixels_per_point).round(),
+            ));
+            for (i, c) in line.text.char_indices() {
+                if unicode_width::UnicodeWidthChar::width(c) == Some(2) {
+                    attrs.add_span(i..i + c.len_utf8(), &wide);
+                }
+            }
+        }
         BufferLine::new(line.text, LineEnding::None, attrs, Shaping::Advanced)
+    }
+
+    /// Monospace text on its cell grid: each glyph's `(x, w)` in pixels
+    /// from the row's start, one cell per column its cluster takes (two for
+    /// wide characters, a tab to the next stop), and how far to shift the
+    /// drawn glyph to center it in its cells. `None` for proportional text.
+    fn cells(
+        &self,
+        glyphs: &[cosmic_text::LayoutGlyph],
+        text: &str,
+    ) -> Option<Vec<(f32, f32, f32)>> {
+        if !self.config().monospace || self.avg_advance_px <= 0.0 {
+            return None;
+        }
+        let cell = self.avg_advance_px;
+        let mut col = 0usize;
+        let mut out: Vec<(f32, f32, f32)> = Vec::with_capacity(glyphs.len());
+        let mut prev: Option<(usize, (f32, f32, f32))> = None;
+        for g in glyphs {
+            // More glyphs of one cluster (combining marks): the same cells.
+            if let Some((start, placed)) = prev
+                && start == g.start
+            {
+                out.push(placed);
+                continue;
+            }
+            let cluster = text.get(g.start..g.end).unwrap_or("");
+            let cols = if cluster == "\t" {
+                TAB_WIDTH as usize - col % TAB_WIDTH as usize
+            } else {
+                unicode_width::UnicodeWidthStr::width(cluster).max(1)
+            };
+            let (x, w) = (col as f32 * cell, cols as f32 * cell);
+            let center = if cluster == "\t" {
+                0.0
+            } else {
+                ((w - g.w) / 2.0).max(0.0)
+            };
+            let placed = (x, w, center);
+            out.push(placed);
+            prev = Some((g.start, placed));
+            col += cols;
+        }
+        Some(out)
     }
 
     fn measure_avg_advance(&mut self) -> f32 {
@@ -368,17 +429,24 @@ impl TextRenderer {
         let row_height = self.row_height();
         let text = line.text;
         let text_len = text.len();
-        let buffer_line = self.cached_line(line);
+        self.cached_line(line);
+        let hash = line.key_hash();
+        let buffer_line = &self.lines[&hash].line;
         let mut rows: Vec<Row> = Vec::new();
         for run in buffer_line.layout_runs(None, line_height_px) {
+            let cells = self.cells(run.glyphs, text);
             let clusters: Vec<ClusterSpan> = run
                 .glyphs
                 .iter()
-                .map(|g| ClusterSpan {
-                    start: g.start,
-                    end: g.end,
-                    x: g.x / ppp,
-                    w: g.w / ppp,
+                .enumerate()
+                .map(|(i, g)| {
+                    let (x, w) = cells.as_ref().map_or((g.x, g.w), |c| (c[i].0, c[i].1));
+                    ClusterSpan {
+                        start: g.start,
+                        end: g.end,
+                        x: x / ppp,
+                        w: w / ppp,
+                    }
                 })
                 .collect();
             let prev_end = rows.last().map_or(0, |r| r.end);
@@ -483,10 +551,16 @@ impl TextRenderer {
         let Fonts {
             font_system, atlas, ..
         } = &mut *fonts;
+        let text = &self.lines[&hash].key.text;
         let buffer_line = &self.lines[&hash].line;
         for run in buffer_line.layout_runs(None, line_height_px) {
-            for glyph in run.glyphs {
-                let physical = glyph.physical((origin.0, origin.1 + run.line_y), 1.0);
+            let cells = self.cells(run.glyphs, text);
+            for (i, glyph) in run.glyphs.iter().enumerate() {
+                let mut placed = glyph.clone();
+                if let Some(cells) = &cells {
+                    placed.x = cells[i].0 + cells[i].2;
+                }
+                let physical = placed.physical((origin.0, origin.1 + run.line_y), 1.0);
                 let Some(g) = atlas.get(font_system, physical.cache_key) else {
                     continue;
                 };

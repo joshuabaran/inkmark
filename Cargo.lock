@@ -1755,6 +1755,7 @@ dependencies = [
  "cosmic-text",
  "eframe",
  "egui",
+ "unicode-width",
 ]
 
 [[package]]

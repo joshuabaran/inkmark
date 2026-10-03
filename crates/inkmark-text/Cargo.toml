@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 cosmic-text.workspace = true
 egui.workspace = true
+unicode-width.workspace = true
 
 [dev-dependencies]
 eframe.workspace = true
