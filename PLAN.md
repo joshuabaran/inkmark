@@ -2,7 +2,7 @@
 
 **Name (working):** `inkmark` · Rust · egui/eframe · Linux/Wayland (Omarchy/Hyprland) first · no Electron/WebView
 
-**Status:** Signed off 2026-10-01. MVP (M1–M6), GFM (G1–G4) and the [file browser](#file-browser-next) (F1–F3) are complete as of 2026-10-02; the first outside review's 21 issues and seven suggestions are fixed, and footnotes are in ([hardening and footnotes](#hardening-and-footnotes-2026-10-02)); [notes and links](#notes-and-links) is in review. [Configurable key bindings](#configurable-key-bindings) are in as of 2026-10-02. See [Results](#results) for measurements and the [Roadmap](#roadmap) for what's planned. Changes to locked decisions require updating this doc first.
+**Status:** Signed off 2026-10-01. MVP (M1–M6), GFM (G1–G4) and the [file browser](#file-browser-next) (F1–F3) are complete as of 2026-10-02; the first outside review's 21 issues and seven suggestions are fixed, and footnotes are in ([hardening and footnotes](#hardening-and-footnotes-2026-10-02)); [notes and links](#notes-and-links) is in review. [Configurable key bindings](#configurable-key-bindings) are in as of 2026-10-02. v0.2.0 is released, and the silent-exit fix is merged. 0.2.1 is the unsaved mark in the [product review](#product-review-2026-10-03); the rest of that review is what's next. See [Results](#results) for measurements and the [Roadmap](#roadmap) for what's planned. Changes to locked decisions require updating this doc first.
 
 ---
 
@@ -17,7 +17,7 @@
 | Parse strategy | Background full reparse is authoritative; synchronous **local reparse** of the edited top-level block for immediate feedback (see §2). Incremental parsing beyond that is a later optimization. |
 | Live editing model | **Reveal-at-cursor** (Typora/Obsidian style). Live is the source with syntax hidden away from the caret; every live edit is a direct source byte-range patch. No AST→Markdown re-emit. |
 | History | One document epoch, one undo stack shared by both panes. |
-| Scope | Single-file open/save, dark theme, keyboard-usable. **Since 2026-10-02:** still one open document at a time, but browsing a folder to pick it is planned ([file browser](#file-browser-next)). |
+| Scope | Single-file open/save, dark theme, keyboard-usable. **Since 2026-10-02:** still one open document at a time; a folder browser picks which one ([file browser](#file-browser-next)). **Since 2026-10-03:** one open document stays the model ([product review](#product-review-2026-10-03)). |
 | Perf target | Responsive on 5–10 MB CommonMark (~100k+ lines of typical prose). |
 | Platform | Native on the Omarchy host (Arch, Wayland, Hyprland). No Windows/macOS for MVP. |
 
@@ -88,7 +88,7 @@
 - **Live editing:**
   - *Typing:* inserts source characters at the caret. Nothing is auto-escaped; what you type is Markdown, as in Typora/Obsidian.
   - *Formatting commands* (`Ctrl+B`, `Ctrl+I`, `` Ctrl+` ``, `Ctrl+K` link, heading level): add or remove delimiters as source patches.
-  - *Smart editing rules* (list item continue/outdent on Enter, blockquote prefix on Enter, Tab/Shift+Tab nesting in lists, Backspace at the start of a marker): explicit rules that each produce one or more source patches.
+  - *Smart editing rules* (list item continue/outdent on Enter, blockquote prefix on Enter, Tab/Shift+Tab nesting in lists, Backspace at the start of a marker): explicit rules that each produce one or more source patches. Tables, tasks and Enter-continues-list are the set. The [product review](#product-review-2026-10-03) stops new rules of this kind.
 - **Raw HTML** (block and inline) shows in live as source text styled like code and edited as plain source. It is never rendered.
 - **Scroll sync (split):** sync on the source block or line of the top visible line in the focused pane. The other pane scrolls so the same block's top lines up. No pixel sync.
 - **Focus:** only one pane takes keyboard and IME input. `Ctrl+1` focuses code and `Ctrl+2` focuses live. Tab is never used to switch panes; it indents.
@@ -104,7 +104,7 @@
 ### 5. Rendering
 
 - **Virtualization:** both panes lay out and paint only lines or blocks in the viewport, plus a small overscan.
-- **HeightCache:** each pane keeps a height per line (code) or per block (live). Heights are measured once laid out and estimated before that (from text length × average glyph advance ÷ wrap width). This drives the scrollbar, scroll sync and minimap. When a block's real height replaces its estimate, adjust the scroll position so the view stays anchored to the top visible block.
+- **HeightCache:** each pane keeps a height per line (code) or per block (live). Heights are measured once laid out and estimated before that (from text length × average glyph advance ÷ wrap width). This drives the scrollbar, scroll sync and minimap. When a block's real height replaces its estimate, adjust the scroll position so the view stays anchored to the top visible block. The [product review](#product-review-2026-10-03) tightens the live pane: measure a block before it can move the scroll position, and estimate only below the viewport.
 - **Glyph atlas:**
   - swash rasterizes into a few egui textures, keyed by font, glyph, size and subpixel bin.
   - Each frame emits one `Mesh` per pane for the visible lines.
@@ -391,7 +391,7 @@ Working with a folder of notes: manage files from the sidebar, and follow links 
 | **N2** | Sidebar UI | Right-click menu (Rename…, Move to…, Move to Trash, New file here), F2 and Delete keys, drag and drop with a highlighted target, the delete confirmation, and the open document following a rename or move. Headless egui and app tests. |
 | **N3** | Following links | Ctrl+click in both panes (pointer cursor while Ctrl is held over a link), the targets above, and Alt+Left. Tests for link resolution (relative paths, `%20`, anchors, reference links, footnotes) and for following and going back in the app. |
 
-**As built:** the trash is the `trash` crate behind a `Trash` trait; renames use `renameat2(RENAME_NOREPLACE)` via `rustix`. Link destinations come from re-parsing the clicked block with pulldown-cmark (reference links resolve through the document's definitions; autolink literals are the link-styled text itself). The sidebar tests check the right-click menu by finding its items in egui's drawn output, since sending clicks to the desktop isn't an option. Not done: Back across an unsaved-changes prompt that you cancel drops that step; Forward (Alt+Right); links to non-Markdown files.
+**As built:** the trash is the `trash` crate behind a `Trash` trait; renames use `renameat2(RENAME_NOREPLACE)` via `rustix`. Link destinations come from re-parsing the clicked block with pulldown-cmark (reference links resolve through the document's definitions; autolink literals are the link-styled text itself). The sidebar tests check the right-click menu by finding its items in egui's drawn output, since sending clicks to the desktop isn't an option. Cancelling the unsaved-changes prompt puts the history step back (`settle_history`). Alt+Right is Forward, and non-Markdown links open through the allowlist, both in [Cleanup](#cleanup).
 
 ### Release v0.1.0
 
@@ -452,8 +452,54 @@ Done 2026-10-02 on branch `key-bindings`. Decided 2026-10-02:
 | Listing | `inkmark --list-keys` prints the bindings that would apply, as TOML ready to paste back. The README shortcut table is generated from the same defaults; a test fails if the README drifts. |
 | Not bindings | Arrows, Backspace, Delete, Enter, Tab, Home, End, Page Up/Down, and Shift held to extend a selection. Ctrl+click and IME. |
 
+### Product review (2026-10-03)
+
+From `~/Projects/inkmark/PRODUCT_REVIEW.md`, outside the repo. This is the order of work after v0.2.0. It replaces "search across the folder, then tabs, then math."
+
+**Already shipped, so not scheduled again**
+
+- Alt+Right, and cancelling the unsaved-changes prompt restores the history step ([Cleanup](#cleanup), [Notes and links](#notes-and-links)).
+- Deleting a link or footnote definition drops that label on the local reparse (`replace_definitions`). A reference drawn in a block the edit did not touch can still look like a link until the full parse. That paint is the remaining bug.
+- Clicking the live pane moves the caret. Ctrl+1 focuses the code pane at that spot.
+
+**Decisions (2026-10-03)**
+
+| Question | Decision |
+|---|---|
+| Live editing | Keep the model: a keystroke is a byte-range patch, both panes share one undo stack, and a typed character inserts that character. No mode that rewrites a block. No new smart rules, column choreography, or Typora parity. Tables, tasks, and Enter-continues-list stay. New live work is rendering and navigation. |
+| One document | Tabs, backlinks, a graph, and tags stay off. One open document keeps a single undo stack and one scroll sync. |
+| Find before folder search | Find and replace in the current file comes before search across the folder. Vim mode, multi-cursor, and an LSP wait until find and the outline have been in daily use for a week. |
+| Math | A live-only overlay from the source span, drawn and never written back, and only once a note you have open uses it. Mermaid and other diagrams wait until a document you have open needs them. |
+| Live line length | The live pane wraps to about 70–80 characters. The code pane stays as wide as the split gives it. |
+| Reading scroll | Measure a live block before its height can move the scroll position. Estimate only below the viewport. |
+| Unsaved mark | The open file shows ● on its sidebar row, the same mark the footer puts beside the path. |
+
+**Slices, in order**
+
+| # | Slice | Done when |
+|---|--------|-----------|
+| **P0** | Unsaved mark | With unsaved edits, the open file's sidebar row shows ● beside its name, as the footer does. A saved file does not. Headless tests cover both. |
+| **P1** | Stale reference paint | Deleting or changing a definition restyles every reference to that label on the local reparse, including references in blocks the edit did not touch. A regression test deletes a definition far from its reference and checks the reference's span before the full parse. |
+| **P2** | Find and replace in this file | Rope byte offsets. Incremental, case-sensitive and case-insensitive, plain and regex, next and previous. Replace one, and replace all as one undo group. No widget that copies the document. |
+| **P3** | Heading outline | Drawn from the `BlockTree`. Click jumps both panes. Same map as Ctrl+click on a heading in the live pane, kept visible. |
+| **P4** | Go to line, fold by heading | Go to line in the code pane. Folds are display state on the code pane only; the live pane ignores them. Stored as source ranges so a reparse keeps them. |
+| **P5** | Structural selection | In the code pane: select word, select paragraph, jump to the matching fence or link brackets, using the source map. |
+| **P6** | Live reading | The live pane's measure is about 70–80 characters whatever the window width. Far-off blocks are not estimated in a way that shoves the viewport; only blocks at and above the viewport are measured, and only blocks below it are estimated. |
+| **P7** | Math | When a note needs it: a live-only overlay for the math span. The source is unchanged, and the editor does not re-emit it. |
+| **P8** | Search across the folder | Filename search first. Content search second, off the UI thread, the same way the parse is. This is also how a rename finds the references it does not rewrite. |
+
+**P0, as built (0.2.1):** the open file's sidebar row draws ● beside its name while the buffer is dirty, the same mark the footer shows. A saved file does not, and neither does any other row. `the_open_file_shows_the_unsaved_mark` covers a clean file, a dirty file, and the mark going away again.
+
+**Not this round:** vim mode, multi-cursor, LSP or Marksman-style diagnostics, tabs, backlinks, a graph, tags, Mermaid and other diagrams, images from the network, rewriting links in other notes when one is renamed or moved, screen-reader support (AccessKit). Link rewriting waits on P8 and a change preview. Network images still need a policy: inkmark makes no network requests.
+
+**Crashes.** Issue 35: the window closed during ordinary use and left no core dump and no Omarchy notification. Leaving the 5 MB file idle reproduced `overflow when subtracting durations`, exit 101, no core. The theme settle (150 ms) and the status hint (4 s) each read the clock twice and subtracted. Both now use one `checked_sub`. Fixed in #36. A separate clipboard-thread segfault on shutdown does dump core; those exits did not.
+
+The session log is `$XDG_STATE_HOME/inkmark/session.log` (or `INKMARK_LOG`). It records the start, the first frame, focus changes, an `alive` line while the UI draws, a close request and whether it was cancelled, and whether the event loop returned ok or with an error. `log` and `tracing` warnings go there too. A panic writes its backtrace. Past 1 MiB the file is renamed with a `.1` suffix and a new one starts. When stderr is `/dev/null` or closed, it is duplicated onto that file; a redirect or a pipe is left alone. `scripts/e2e.sh` can hold a window open or soak it. The next unexpected close should say which of those lines was last.
+
 ### Later
 
+Held until the [product review](#product-review-2026-10-03) says to pick them up:
+
 - Images from the network (needs a network policy: inkmark makes no network requests today).
-- Updating links in other notes when a note is renamed or moved.
-- Search across the folder; tabs; math and diagrams; screen-reader support (AccessKit) for the editor panes.
+- Updating links in other notes when a note is renamed or moved (after P8, with a preview).
+- Tabs, backlinks, a graph, tags, Mermaid and other diagrams, vim mode, multi-cursor, an LSP, and AccessKit for the editor panes.

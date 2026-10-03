@@ -1317,6 +1317,7 @@ impl App {
     fn editor(&mut self, ui: &mut egui::Ui) {
         self.browser
             .set_current(self.doc.path().map(|path| path.to_path_buf()));
+        self.browser.set_dirty(self.doc.is_dirty());
         if !self.sidebar.visible {
             self.browser.poll_listings(ui.ctx());
             self.panes(ui);
