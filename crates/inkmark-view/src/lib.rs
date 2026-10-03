@@ -4,6 +4,7 @@ mod browser;
 mod code_view;
 mod commands;
 mod images;
+pub mod keys;
 mod lines;
 mod live_layout;
 mod live_view;

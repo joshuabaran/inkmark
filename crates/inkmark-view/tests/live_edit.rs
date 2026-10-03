@@ -273,6 +273,52 @@ fn formatting_shortcuts() {
 }
 
 #[test]
+fn extra_shift_does_not_bold() {
+    // The old match was `Key::B if command`, so Ctrl+Shift+B bolded too.
+    let mut s = Split::new("make this bold\n");
+    s.live.set_selection(Selection {
+        anchor: 10,
+        head: 14,
+    });
+    s.frame(vec![]);
+    s.key(Key::B, Modifiers::COMMAND.plus(Modifiers::SHIFT));
+    assert_eq!(s.text(), "make this bold\n");
+    s.key(Key::B, Modifiers::COMMAND);
+    assert_eq!(s.text(), "make this **bold**\n");
+}
+
+#[test]
+fn a_rebound_chord_replaces_the_default_and_an_empty_list_unbinds() {
+    let mut s = Split::new("make this bold\n");
+    let mut keys = inkmark_view::keys::KeyMap::builtin();
+    keys.set(
+        inkmark_view::keys::Action::Bold,
+        vec![inkmark_view::keys::Chord::parse("Ctrl+G").unwrap()],
+    );
+    s.live.set_keys(keys);
+    s.live.set_selection(Selection {
+        anchor: 10,
+        head: 14,
+    });
+    s.frame(vec![]);
+    s.key(Key::B, Modifiers::COMMAND);
+    assert_eq!(s.text(), "make this bold\n", "Ctrl+B was given away");
+    s.key(Key::G, Modifiers::COMMAND);
+    assert_eq!(s.text(), "make this **bold**\n");
+
+    let mut keys = inkmark_view::keys::KeyMap::builtin();
+    keys.set(inkmark_view::keys::Action::WordRight, vec![]);
+    s.live.set_keys(keys);
+    s.caret(0);
+    s.key(Key::ArrowRight, Modifiers::COMMAND);
+    assert_eq!(
+        s.live.selection().head,
+        1,
+        "an unbound Ctrl+Right moves one character"
+    );
+}
+
+#[test]
 fn undo_is_shared_between_panes() {
     let mut s = Split::new("abc\n");
     s.caret(3);
@@ -857,6 +903,26 @@ fn table_shortcuts_work_in_the_live_pane() {
 }
 
 #[test]
+fn shift_on_insert_column_selects_a_word_instead() {
+    // Review of #34. Ctrl+Alt+Shift+Left is not insert-column, in a table
+    // or out of one. It selects a word, as Ctrl+Shift+Left does.
+    let ctrl_alt_shift = Modifiers::COMMAND
+        .plus(Modifiers::ALT)
+        .plus(Modifiers::SHIFT);
+    let mut s = Split::new("alpha beta gamma\n");
+    s.caret(0);
+    s.key(Key::ArrowRight, ctrl_alt_shift);
+    assert_eq!(s.text(), "alpha beta gamma\n");
+    assert_eq!(s.live.selection().range(), 0..5);
+
+    let mut s = Split::new(TABLE);
+    s.caret(TABLE.find('c').unwrap());
+    let before = s.text().clone();
+    s.key(Key::ArrowLeft, ctrl_alt_shift);
+    assert_eq!(s.text(), before, "Shift does not insert a column");
+}
+
+#[test]
 fn leaving_an_edited_table_re_pads_it_as_its_own_undo_step() {
     let mut s = Split::new(TABLE);
     let c = TABLE.find('c').unwrap();
@@ -919,6 +985,21 @@ fn the_right_click_menu_edits_tables_and_inserts_one() {
     );
     let sel = s.live.selection().range();
     assert_eq!(&s.text()[sel], "Column 1");
+
+    // The menu advertises the chord the table is actually bound to.
+    let mut s = Split::new("Hello.\n");
+    let mut keys = inkmark_view::keys::KeyMap::builtin();
+    keys.set(
+        inkmark_view::keys::Action::InsertTable,
+        vec![inkmark_view::keys::Chord::parse("Ctrl+G").unwrap()],
+    );
+    s.live.set_keys(keys);
+    s.right_click(pos2(LIVE_X + 30.0, 13.0));
+    assert!(
+        s.text_rect("Ctrl+G").is_some(),
+        "the menu should show the rebound chord"
+    );
+    assert!(s.text_rect("Ctrl+Alt+T").is_none());
 }
 
 #[test]

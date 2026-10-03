@@ -16,6 +16,7 @@ use egui::{
 };
 use inkmark_files::{Entry, Pending, Row, Tree, Watch, list_dir};
 
+use crate::keys::{self, Action};
 use crate::theme::{self, Theme};
 
 const ROW_H: f32 = 22.0;
@@ -86,6 +87,8 @@ pub struct FileBrowser {
     watch: Option<Watch>,
     /// Colors, refreshed from the context every frame.
     theme: std::sync::Arc<Theme>,
+    /// Shortcuts, shared with the editor panes and the app shell.
+    keys: keys::KeyMap,
 }
 
 impl FileBrowser {
@@ -112,7 +115,13 @@ impl FileBrowser {
             new_file_rect: None,
             watch: None,
             theme: std::sync::Arc::new(Theme::dark()),
+            keys: keys::KeyMap::builtin(),
         }
+    }
+
+    /// Replaces the shortcuts. The app does this when config.toml changes.
+    pub fn set_keys(&mut self, keys: keys::KeyMap) {
+        self.keys = keys;
     }
 
     pub fn root(&self) -> &Path {
@@ -408,25 +417,29 @@ impl FileBrowser {
         if !ui.memory(|m| m.has_focus(self.id)) {
             return;
         }
-        let (up, down, left, right, enter, rename, delete) = ui.input_mut(|input| {
+        // Rename and Move to Trash come from the key table, matched exactly,
+        // and before the arrow keys. `consume_key` treats extra Shift as a
+        // hit, so a Rename bound to ArrowUp has to be taken first or it
+        // would move the selection instead.
+        let actions = ui.input_mut(|input| self.keys.consume(input, keys::Scope::Browser));
+        if let Some(path) = self.selected_path() {
+            for action in actions {
+                match action {
+                    Action::Rename => output.rename = Some(path.clone()),
+                    Action::MoveToTrash => output.trash = Some(path.clone()),
+                    _ => {}
+                }
+            }
+        }
+        let (up, down, left, right, enter) = ui.input_mut(|input| {
             (
                 input.consume_key(Modifiers::NONE, Key::ArrowUp),
                 input.consume_key(Modifiers::NONE, Key::ArrowDown),
                 input.consume_key(Modifiers::NONE, Key::ArrowLeft),
                 input.consume_key(Modifiers::NONE, Key::ArrowRight),
                 input.consume_key(Modifiers::NONE, Key::Enter),
-                input.consume_key(Modifiers::NONE, Key::F2),
-                input.consume_key(Modifiers::NONE, Key::Delete),
             )
         });
-        if let Some(path) = self.selected_path() {
-            if rename {
-                output.rename = Some(path.clone());
-            }
-            if delete {
-                output.trash = Some(path);
-            }
-        }
         if up {
             self.move_by(-1);
         }

@@ -6,7 +6,6 @@
 
 use std::ops::Range;
 
-use egui::Key;
 use inkmark_buffer::{Document, Edit, EditKind, Selection};
 
 /// Edits to apply in order (each against the result of the previous), and
@@ -513,20 +512,6 @@ pub(crate) fn set_heading(doc: &Document, sel: Selection, level: u8) -> EditPlan
         },
         kind: EditKind::Other,
     }
-}
-
-/// Ctrl+Alt+0..6 set the heading level (0 = paragraph).
-pub(crate) fn heading_level(key: Key) -> Option<u8> {
-    Some(match key {
-        Key::Num0 => 0,
-        Key::Num1 => 1,
-        Key::Num2 => 2,
-        Key::Num3 => 3,
-        Key::Num4 => 4,
-        Key::Num5 => 5,
-        Key::Num6 => 6,
-        _ => return None,
-    })
 }
 
 #[cfg(test)]

@@ -7,7 +7,6 @@
 
 use std::ops::Range;
 
-use egui::{Key, Modifiers};
 use inkmark_buffer::{Document, Edit, EditKind, Selection};
 use inkmark_parse::{BlockKind, ParseOutput};
 
@@ -48,28 +47,25 @@ pub(crate) enum TableCommand {
     Insert,
 }
 
-/// The table shortcuts (PLAN.md, Table editing): Ctrl+Alt+arrows insert,
-/// Ctrl+Alt+(Shift+)Backspace delete, Alt+Shift+arrows move, Ctrl+Alt+F
-/// formats, Ctrl+Alt+T inserts a table.
-pub(crate) fn shortcut(key: Key, m: Modifiers) -> Option<TableCommand> {
-    use TableCommand::{Edit, Insert};
-    use TableOp::*;
-    let ctrl_alt = m.command && m.alt;
-    let alt_shift = m.alt && m.shift && !m.command;
-    Some(match key {
-        Key::F if ctrl_alt && !m.shift => Edit(Format),
-        Key::T if ctrl_alt && !m.shift => Insert,
-        Key::ArrowUp if ctrl_alt && !m.shift => Edit(InsertRowAbove),
-        Key::ArrowDown if ctrl_alt && !m.shift => Edit(InsertRowBelow),
-        Key::ArrowLeft if ctrl_alt && !m.shift => Edit(InsertColumnLeft),
-        Key::ArrowRight if ctrl_alt && !m.shift => Edit(InsertColumnRight),
-        Key::Backspace if ctrl_alt => Edit(if m.shift { DeleteColumn } else { DeleteRow }),
-        Key::ArrowUp if alt_shift => Edit(MoveRowUp),
-        Key::ArrowDown if alt_shift => Edit(MoveRowDown),
-        Key::ArrowLeft if alt_shift => Edit(MoveColumnLeft),
-        Key::ArrowRight if alt_shift => Edit(MoveColumnRight),
+/// The table action on the shared key table, if `action` is one.
+pub(crate) fn command(action: crate::keys::Action) -> Option<TableCommand> {
+    use crate::keys::Action;
+    let op = match action {
+        Action::FormatTable => TableOp::Format,
+        Action::InsertTable => return Some(TableCommand::Insert),
+        Action::InsertRowAbove => TableOp::InsertRowAbove,
+        Action::InsertRowBelow => TableOp::InsertRowBelow,
+        Action::InsertColumnLeft => TableOp::InsertColumnLeft,
+        Action::InsertColumnRight => TableOp::InsertColumnRight,
+        Action::DeleteRow => TableOp::DeleteRow,
+        Action::DeleteColumn => TableOp::DeleteColumn,
+        Action::MoveRowUp => TableOp::MoveRowUp,
+        Action::MoveRowDown => TableOp::MoveRowDown,
+        Action::MoveColumnLeft => TableOp::MoveColumnLeft,
+        Action::MoveColumnRight => TableOp::MoveColumnRight,
         _ => return None,
-    })
+    };
+    Some(TableCommand::Edit(op))
 }
 
 /// Runs `command` at `offset`. `None`: nothing to do (no table there for
