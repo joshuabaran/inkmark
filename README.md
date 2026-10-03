@@ -18,7 +18,7 @@ disk are the only source of truth: no accounts, sync or plugins.
   clickable checkboxes, strikethrough, footnotes, and bare URLs and emails
   linked automatically. Parsed by [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark)
   and checked against every example in the CommonMark and GFM specs.
-- **Per-pane minimaps**, images (PNG, JPEG, GIF, WebP, BMP), recent files.
+- **Per-pane minimaps**, images (PNG, JPEG, GIF, WebP, BMP, SVG), recent files.
 - **Your desktop's look**: on [Omarchy](https://omarchy.org) it uses the
   current theme's colors and follows `omarchy theme set` live; elsewhere it
   picks dark or light to match the desktop. Fonts come from fontconfig

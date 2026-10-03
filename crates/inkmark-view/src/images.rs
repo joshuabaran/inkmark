@@ -146,6 +146,9 @@ fn decode(path: &Path, max_side: u32) -> Result<ColorImage, String> {
     if len > MAX_FILE_BYTES {
         return Err(format!("{} MB is too large to show", len / (1024 * 1024)));
     }
+    if is_svg(path) {
+        return decode_svg(path, max_side);
+    }
     let image = image::ImageReader::open(path)
         .and_then(|r| r.with_guessed_format())
         .map_err(|e| e.to_string())?
@@ -159,6 +162,54 @@ fn decode(path: &Path, max_side: u32) -> Result<ColorImage, String> {
     let rgba = image.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Ok(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+}
+
+/// SVGs go by extension (`.svg`, `.svgz`); the raster decoder guesses
+/// from the bytes.
+fn is_svg(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("svg") || e.eq_ignore_ascii_case("svgz"))
+}
+
+/// Renders an SVG at its own size (scaled down to `max_side`), with text
+/// in the system's fonts. Embedded raster images aren't drawn.
+fn decode_svg(path: &Path, max_side: u32) -> Result<ColorImage, String> {
+    use resvg::{tiny_skia, usvg};
+
+    // Loading the system fonts is slow; once per run is enough.
+    static FONTS: std::sync::OnceLock<Arc<usvg::fontdb::Database>> = std::sync::OnceLock::new();
+    let fontdb = FONTS
+        .get_or_init(|| {
+            let mut db = usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            Arc::new(db)
+        })
+        .clone();
+    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    let options = usvg::Options {
+        resources_dir: path.parent().map(Path::to_path_buf),
+        fontdb,
+        ..Default::default()
+    };
+    let tree =
+        usvg::Tree::from_data(&data, &options).map_err(|e| format!("not a valid SVG: {e}"))?;
+    let size = tree.size();
+    let scale = (max_side as f32 / size.width().max(size.height())).min(1.0);
+    let (w, h) = (
+        (size.width() * scale).ceil().max(1.0) as u32,
+        (size.height() * scale).ceil().max(1.0) as u32,
+    );
+    let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or("the SVG has no size")?;
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    Ok(ColorImage::from_rgba_premultiplied(
+        [w as usize, h as usize],
+        pixmap.data(),
+    ))
 }
 
 #[cfg(test)]
@@ -234,5 +285,29 @@ mod tests {
             cache.get("https://x/y.png", Some(dir.path())),
             ImageSlot::Remote
         ));
+    }
+
+    #[test]
+    fn svgs_render_at_their_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dot.svg");
+        std::fs::write(
+            &path,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="20" height="20" fill="#ff0000"/></svg>"##,
+        )
+        .unwrap();
+        let image = decode(&path, 4096).unwrap();
+        assert_eq!(image.size, [40, 20]);
+        assert_eq!(
+            image.pixels[0],
+            egui::Color32::from_rgb(255, 0, 0),
+            "the rect is drawn"
+        );
+        assert_eq!(image.pixels[39].a(), 0, "the rest is transparent");
+        // Scaled down to fit.
+        assert_eq!(decode(&path, 10).unwrap().size, [10, 5]);
+        // Not SVG at all.
+        std::fs::write(&path, "<html>nope</html>").unwrap();
+        assert!(decode(&path, 4096).unwrap_err().contains("SVG"));
     }
 }
