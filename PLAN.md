@@ -414,6 +414,19 @@ Decided 2026-10-03: follow the OS. No in-app theme picker; fonts are configurabl
 
 **Slices:** T1 one `Theme` for every color, built-in light, contrast test; T2 the OS theme (Omarchy palette, live switch, desktop light/dark); T3 fonts (fontconfig defaults, config file, live re-shaping).
 
+### Table editing
+
+Decided 2026-10-03.
+
+| Question | Decision |
+|---|---|
+| Re-padding | When the caret leaves a table it was editing (in the live pane), the table is re-padded so the pipes line up, as its own undo step. A table you only moved through is left as it is. Typing in a cell still changes only that cell. Ctrl+Alt+F formats the table at the caret in either pane. |
+| Layout | Leading and trailing pipes, one space inside each pipe, cells padded to the column's widest cell by display width (CJK counts double), padding on the side the column's alignment calls for. The delimiter row gets `:` where the alignment needs it. Each line keeps its container prefix (`> `, list indentation). Cell text is never changed, escaped pipes included; extra cells past the header's count are kept. |
+| Rows and columns | A right-click menu on a live-pane cell: insert row above/below, insert column left/right, delete row/column, move row up/down, move column left/right, alignment (left, center, right, none). Shortcuts in both panes: Ctrl+Alt+Up/Down insert a row, Ctrl+Alt+Left/Right a column, Ctrl+Alt+Backspace deletes the row and Ctrl+Alt+Shift+Backspace the column, Alt+Shift+arrows move the row or column. (Ctrl+Alt+Delete is Omarchy's "close all windows".) The header row can't be deleted or moved below the delimiter. |
+| New table | Ctrl+Alt+T, or "Insert table" in the live pane's right-click menu, inserts a 3×3 table with a header row and puts the caret in its first cell. |
+
+**Slices:** TB1 a table model and its operations as pure source edits (`tables.rs`), tested by parsing the result; TB2 the live pane: re-pad on leaving, the right-click menu, shortcuts in both panes; TB3 inserting a new table.
+
 ### Later
 
 - Tables: re-pad columns so pipes stay aligned as you type; add and remove columns.
