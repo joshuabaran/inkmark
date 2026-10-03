@@ -26,7 +26,9 @@ pub struct ParseOutput {
     /// Link reference definitions (`[label]: dest`), keyed by
     /// [`normalize_label`]: the first definition of a label wins, as in
     /// CommonMark. A local reparse replaces the definitions inside its
-    /// region, and drops a label nothing defines any more.
+    /// region and drops a label nothing defines any more. References to a
+    /// label whose definition changed are restyled in that same pass,
+    /// including in blocks the edit did not touch.
     pub link_defs: std::collections::HashMap<String, String>,
     /// Labels of footnote definitions (`[^label]:`), as written.
     pub footnotes: std::collections::BTreeSet<String>,

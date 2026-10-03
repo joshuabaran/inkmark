@@ -459,7 +459,7 @@ From `~/Projects/inkmark/PRODUCT_REVIEW.md`, outside the repo. This is the order
 **Already shipped, so not scheduled again**
 
 - Alt+Right, and cancelling the unsaved-changes prompt restores the history step ([Cleanup](#cleanup), [Notes and links](#notes-and-links)).
-- Deleting a link or footnote definition drops that label on the local reparse (`replace_definitions`). A reference drawn in a block the edit did not touch can still look like a link until the full parse. That paint is the remaining bug.
+- Deleting a link or footnote definition drops that label on the local reparse (`replace_definitions`). References to that label, including in blocks the edit did not touch, are restyled in the same pass ([P1](#product-review-2026-10-03)).
 - Clicking the live pane moves the caret. Ctrl+1 focuses the code pane at that spot.
 
 **Decisions (2026-10-03)**
@@ -489,6 +489,8 @@ From `~/Projects/inkmark/PRODUCT_REVIEW.md`, outside the repo. This is the order
 | **P8** | Search across the folder | Filename search first. Content search second, off the UI thread, the same way the parse is. This is also how a rename finds the references it does not rewrite. |
 
 **P0, as built (0.2.1):** the open file's sidebar row draws ● beside its name while the buffer is dirty, the same mark the footer shows. A saved file does not, and neither does any other row. `the_open_file_shows_the_unsaved_mark` covers a clean file, a dirty file, and the mark going away again. The chrome is Hack, so ●, ▸, and ▾ have glyphs; the document font is unchanged.
+
+**P1, as built:** when a label's resolved definition changes (it starts or stops resolving, or the winning destination changes), every reference to that label is restyled during the local reparse, including references in blocks the edit did not touch. The edited region is parsed with stand-in definitions for labels defined outside it, so a reference next to the caret does not flicker, and any other top-level block that mentions a changed label is re-parsed the same way. A block larger than 64 KiB still waits for the full parse, as every local reparse does. `deleting_a_far_definition_restyles_the_reference` deletes a link definition and a footnote definition that sit past twenty paragraphs and checks the reference spans before any full parse.
 
 **Not this round:** vim mode, multi-cursor, LSP or Marksman-style diagnostics, tabs, backlinks, a graph, tags, Mermaid and other diagrams, images from the network, rewriting links in other notes when one is renamed or moved, screen-reader support (AccessKit). Link rewriting waits on P8 and a change preview. Network images still need a policy: inkmark makes no network requests.
 

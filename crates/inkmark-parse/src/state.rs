@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use inkmark_buffer::{Bias, Change, Document};
 
 use crate::map::SourceMap;
-use crate::{MarkdownParser, ParseOutput};
+use crate::{DefinitionLabel, MarkdownParser, ParseOutput, normalize_label};
 
 /// Quiet time after the last edit before a full background parse starts.
 pub const DEBOUNCE: Duration = Duration::from_millis(24);
@@ -105,18 +105,26 @@ impl ParseOutput {
         if region.is_empty() || region.len() > LOCAL_REPARSE_LIMIT {
             return;
         }
+        let changed = self.splice_parsed(parser, doc, region.clone(), true);
+        // The region above already has the new styles. References in other
+        // blocks still wear the style from the last full parse.
+        self.restyle_references(parser, doc, &region, &changed);
+    }
+
+    /// Parses `region` with stand-in definitions for labels defined outside
+    /// it and splices the spans and blocks back. When `update_defs` is set
+    /// (the edited region, not a later restyle), definitions inside `region`
+    /// are replaced and labels whose resolved definition changed are returned.
+    fn splice_parsed(
+        &mut self,
+        parser: &dyn MarkdownParser,
+        doc: &Document,
+        region: Range<usize>,
+        update_defs: bool,
+    ) -> Vec<DefinitionLabel> {
         let mut text = doc.slice(region.clone()).into_owned();
         let len = text.len();
-        // A footnote reference only parses as one if its definition exists,
-        // and that's usually elsewhere in the file. Stand-in definitions
-        // after the region keep `[^1]` a footnote while its paragraph is
-        // typed in; everything they produce is past `len` and dropped.
-        if !self.footnotes.is_empty() {
-            text.push_str("\n\n");
-            for label in &self.footnotes {
-                text.push_str(&format!("[^{label}]: x\n"));
-            }
-        }
+        self.append_standins(&mut text, &region);
         let mut local = parser.parse(&text);
         let offset = region.start;
         let spans = local
@@ -136,10 +144,144 @@ impl ParseOutput {
                 b
             })
             .collect();
-        self.replace_definitions(&region, len, &mut local);
+        let changed = if update_defs {
+            self.replace_definitions(&region, len, &mut local)
+        } else {
+            Vec::new()
+        };
         self.map.splice(region.clone(), spans);
         self.blocks.splice(region, blocks);
+        changed
     }
+
+    /// Definitions that live outside `region`, written after its bytes so a
+    /// reference inside it still parses as a link or footnote. A deleted
+    /// definition collapses to an empty range and is not revived here.
+    /// Stand-in spans start at `len` and are dropped; a placeholder
+    /// destination is enough, because a reference's spans don't carry the URL.
+    fn append_standins(&self, text: &mut String, region: &Range<usize>) {
+        let mut emitted = false;
+        let mut seen: Vec<&DefinitionLabel> = Vec::new();
+        for def in &self.definitions {
+            if def.range.is_empty() || !strictly_outside(&def.range, region) {
+                continue;
+            }
+            if seen.contains(&&def.label) {
+                continue;
+            }
+            let Some(line) = standin_line(&def.label) else {
+                continue;
+            };
+            if !emitted {
+                text.push_str("\n\n");
+                emitted = true;
+            }
+            text.push_str(&line);
+            seen.push(&def.label);
+        }
+    }
+
+    /// Re-parses top-level blocks outside `region` that mention a label whose
+    /// definition just changed, so their references gain or lose link and
+    /// footnote style without waiting for the full parse. A block over the
+    /// local-reparse limit waits, as an edit inside it would.
+    fn restyle_references(
+        &mut self,
+        parser: &dyn MarkdownParser,
+        doc: &Document,
+        region: &Range<usize>,
+        changed: &[DefinitionLabel],
+    ) {
+        if changed.is_empty() {
+            return;
+        }
+        let blocks: Vec<Range<usize>> = self
+            .blocks
+            .top_level()
+            .filter(|b| strictly_outside(&b.range, region))
+            .map(|b| b.range)
+            .filter(|r| !r.is_empty() && r.len() <= LOCAL_REPARSE_LIMIT)
+            .filter(|r| mentions(&doc.slice(r.clone()), changed))
+            .collect();
+        for range in blocks {
+            // The text of these blocks did not change, so their definitions
+            // stay as `replace_definitions` just left them.
+            let _ = self.splice_parsed(parser, doc, range, false);
+        }
+    }
+}
+
+fn strictly_outside(range: &Range<usize>, region: &Range<usize>) -> bool {
+    range.end <= region.start || range.start >= region.end
+}
+
+fn standin_line(label: &DefinitionLabel) -> Option<String> {
+    let (body, line) = match label {
+        DefinitionLabel::Link(label) => (label.as_str(), format!("[{label}]: x\n")),
+        DefinitionLabel::Footnote(label) => (label.as_str(), format!("[^{label}]: x\n")),
+    };
+    // A newline would escape the stand-in and could be read as part of the
+    // region above it. Anything else is the label as stored.
+    if body.is_empty() || body.contains(['\n', '\r']) {
+        None
+    } else {
+        Some(line)
+    }
+}
+
+/// Whether `text` holds a link or footnote reference to one of `changed`.
+/// An unclosed `[` reparses the block: missing a real reference leaves the
+/// old style up until the full parse.
+fn mentions(text: &str, changed: &[DefinitionLabel]) -> bool {
+    let mut rest = text;
+    while let Some(rel) = rest.find('[') {
+        let after = &rest[rel + 1..];
+        let (footnote, body) = match after.strip_prefix('^') {
+            Some(stripped) => (true, stripped),
+            None => (false, after),
+        };
+        let Some(content) = bracket_body(body) else {
+            return true;
+        };
+        let hit = if footnote {
+            changed.iter().any(|label| match label {
+                DefinitionLabel::Footnote(name) => {
+                    name == content || normalize_label(name) == normalize_label(content)
+                }
+                DefinitionLabel::Link(_) => false,
+            })
+        } else {
+            let norm = normalize_label(content);
+            changed
+                .iter()
+                .any(|label| matches!(label, DefinitionLabel::Link(name) if name == &norm))
+        };
+        if hit {
+            return true;
+        }
+        let consumed = rel + 1 + (after.len() - body.len()) + content.len() + 1;
+        rest = &rest[consumed..];
+    }
+    false
+}
+
+/// The insides of a `[...]` group, or `None` when a nested `[` or the end of
+/// the text makes the group ambiguous.
+fn bracket_body(text: &str) -> Option<&str> {
+    let mut escaped = false;
+    for (i, c) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            ']' => return Some(&text[..i]),
+            '[' => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 impl ParseOutput {
@@ -147,9 +289,16 @@ impl ParseOutput {
     /// are replaced by the ones it has now (from `local`, a parse of its
     /// `len` bytes plus stand-ins after them). A label nothing defines any
     /// more stops resolving, instead of lingering until the full parse.
-    fn replace_definitions(&mut self, region: &Range<usize>, len: usize, local: &mut ParseOutput) {
+    /// Labels whose resolved destination changed are returned so references
+    /// outside `region` can be restyled.
+    fn replace_definitions(
+        &mut self,
+        region: &Range<usize>,
+        len: usize,
+        local: &mut ParseOutput,
+    ) -> Vec<DefinitionLabel> {
         let inside = |r: &Range<usize>| region.start <= r.start && r.end <= region.end;
-        let mut touched: Vec<crate::DefinitionLabel> = Vec::new();
+        let mut touched: Vec<DefinitionLabel> = Vec::new();
         self.definitions.retain(|d| {
             let keep = !inside(&d.range);
             if !keep {
@@ -170,21 +319,56 @@ impl ParseOutput {
         }
         self.definitions.sort_by_key(|d| d.range.start);
         // Each label touched resolves to its earliest remaining definition,
-        // wherever that is, or not at all.
-        for label in touched {
-            let first = self.definitions.iter().find(|d| d.label == label);
-            match (label, first) {
-                (crate::DefinitionLabel::Link(l), Some(d)) => {
-                    self.link_defs.insert(l, d.dest.clone());
+        // wherever that is, or not at all. Unchanged labels are not returned:
+        // an edit that merely widened over a definition must not reparse
+        // every reference to it.
+        let mut seen: Vec<DefinitionLabel> = Vec::new();
+        let mut changed: Vec<DefinitionLabel> = Vec::new();
+        for label in &touched {
+            if seen.contains(label) {
+                continue;
+            }
+            seen.push(label.clone());
+            let previous = self.resolved(label);
+            self.retarget(label);
+            if self.resolved(label) != previous {
+                changed.push(label.clone());
+            }
+        }
+        changed
+    }
+
+    /// The destination a label resolves to, or `None` when it doesn't.
+    /// Footnotes have no destination; presence is an empty string.
+    fn resolved(&self, label: &DefinitionLabel) -> Option<String> {
+        match label {
+            DefinitionLabel::Link(label) => self.link_defs.get(label).cloned(),
+            DefinitionLabel::Footnote(label) => {
+                self.footnotes.contains(label).then_some(String::new())
+            }
+        }
+    }
+
+    fn retarget(&mut self, label: &DefinitionLabel) {
+        let dest = self
+            .definitions
+            .iter()
+            .find(|d| &d.label == label)
+            .map(|d| d.dest.clone());
+        match label {
+            DefinitionLabel::Link(label) => match dest {
+                Some(dest) => {
+                    self.link_defs.insert(label.clone(), dest);
                 }
-                (crate::DefinitionLabel::Link(l), None) => {
-                    self.link_defs.remove(&l);
+                None => {
+                    self.link_defs.remove(label);
                 }
-                (crate::DefinitionLabel::Footnote(l), Some(_)) => {
-                    self.footnotes.insert(l);
-                }
-                (crate::DefinitionLabel::Footnote(l), None) => {
-                    self.footnotes.remove(&l);
+            },
+            DefinitionLabel::Footnote(label) => {
+                if dest.is_some() {
+                    self.footnotes.insert(label.clone());
+                } else {
+                    self.footnotes.remove(label);
                 }
             }
         }
