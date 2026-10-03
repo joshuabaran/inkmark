@@ -59,6 +59,7 @@ Usage: inkmark [FILE | FOLDER]
 Options:
   -h, --help     show this help
   -V, --version  show the version
+  --list-keys    print key bindings, as config.toml
   --             treat what follows as a path, even if it starts with -";
 
 /// What the command line asks for.
@@ -67,6 +68,7 @@ enum Command {
     Run(Option<PathBuf>),
     Help,
     Version,
+    ListKeys,
 }
 
 fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Command, String> {
@@ -78,6 +80,7 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Comm
             "--" if !options_done => options_done = true,
             "-h" | "--help" if !options_done => return Ok(Command::Help),
             "-V" | "--version" if !options_done => return Ok(Command::Version),
+            "--list-keys" if !options_done => return Ok(Command::ListKeys),
             _ if !options_done && text.starts_with('-') && text.len() > 1 => {
                 return Err(format!("unknown option {text}"));
             }
@@ -98,6 +101,16 @@ fn main() -> eframe::Result {
         }
         Ok(Command::Version) => {
             println!("inkmark {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Ok(Command::ListKeys) => {
+            // stdout is pasteable TOML. Problems (a bad file, a bad chord)
+            // go to stderr and don't change the exit status.
+            let (text, problems) = config::list_keys();
+            print!("{text}");
+            for problem in problems {
+                eprintln!("{problem}");
+            }
             return Ok(());
         }
         Err(message) => {
@@ -559,7 +572,14 @@ impl App {
             Some(Err(e)) => Err(e.to_string()),
         };
         match read {
-            Ok(settings) => self.settings = settings.unwrap_or_default(),
+            Ok(settings) => {
+                self.settings = settings.unwrap_or_default();
+                // A bad chord is reported and that action keeps its default.
+                // The rest of the file, fonts included, still applies.
+                problems.extend(self.settings.key_problems.iter().cloned());
+                self.keys = self.settings.keys.clone();
+                self.install_keys();
+            }
             Err(e) => problems.push(format!(
                 "Couldn't read config.toml: {e} (keeping the previous settings)"
             )),
@@ -3141,6 +3161,7 @@ mod tests {
         assert_eq!(parse(&["-h"]), Ok(Command::Help));
         assert_eq!(parse(&["notes.md", "-V"]), Ok(Command::Version));
         assert_eq!(parse(&["--version"]), Ok(Command::Version));
+        assert_eq!(parse(&["--list-keys"]), Ok(Command::ListKeys));
         // A file whose name starts with `-`, after `--`; a lone `-` is a name.
         assert_eq!(
             parse(&["--", "--help"]),
@@ -3303,6 +3324,96 @@ mod tests {
         r.app.code.request_focus(&r.ctx);
         r.key(egui::Key::E, egui::Modifiers::COMMAND);
         assert!(r.app.mode == Mode::Split, "cycle_mode was unbound");
+        assert_eq!(text(&r.app), "**word**\n");
+    }
+
+    fn select_word(r: &mut Run) {
+        let start = text(&r.app).find("word").unwrap();
+        r.app.code.set_selection(inkmark_buffer::Selection {
+            anchor: start,
+            head: start + 4,
+        });
+        r.app.code.request_focus(&r.ctx);
+    }
+
+    #[test]
+    fn config_keys_rebind_live_and_a_bad_file_keeps_the_last_good_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "word\n").unwrap();
+        let config = dir.path().join("config.toml");
+        let mut r = Run::new(dir.path(), Some(path));
+
+        // A chord that doesn't parse is reported; the font still applies
+        // and bold stays on Ctrl+B.
+        fs::write(&config, "[font]\ntext_size = 20\n[keys]\nbold = \"nope\"\n").unwrap();
+        r.app.apply_settings_from(Some(&config), |_| None);
+        assert_eq!(r.app.live.font_size, 20.0);
+        assert!(
+            r.app.error.as_deref().unwrap().contains("keys.bold"),
+            "{:?}",
+            r.app.error
+        );
+        select_word(&mut r);
+        r.key(egui::Key::B, egui::Modifiers::COMMAND);
+        assert_eq!(text(&r.app), "**word**\n");
+
+        // A real rebind replaces it, and an empty list unbinds the mode cycle.
+        r.key(egui::Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(text(&r.app), "word\n");
+        fs::write(&config, "[keys]\nbold = \"Ctrl+G\"\ncycle_mode = []\n").unwrap();
+        r.app.apply_settings_from(Some(&config), |_| None);
+        assert!(r.app.error.is_none(), "{:?}", r.app.error);
+        select_word(&mut r);
+        r.key(egui::Key::B, egui::Modifiers::COMMAND);
+        r.key(egui::Key::E, egui::Modifiers::COMMAND);
+        assert_eq!(text(&r.app), "word\n");
+        assert!(r.app.mode == Mode::Split);
+        r.key(egui::Key::G, egui::Modifiers::COMMAND);
+        assert_eq!(text(&r.app), "**word**\n");
+
+        // Syntax that doesn't parse keeps those bindings.
+        fs::write(&config, "[keys").unwrap();
+        r.app.apply_settings_from(Some(&config), |_| None);
+        assert!(
+            r.app
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("keeping the previous")
+        );
+        select_word(&mut r);
+        r.key(egui::Key::G, egui::Modifiers::COMMAND);
+        assert_eq!(text(&r.app), "word\n");
+
+        // The watched file is re-read, and unbinding bold takes Ctrl+G away.
+        r.app.font_files = vec![Some(config.clone())];
+        r.app.font_stamps = vec![Some(std::time::SystemTime::UNIX_EPOCH)];
+        fs::write(&config, "[keys]\nbold = []\n").unwrap();
+        r.check_disk_now();
+        assert!(r.app.error.is_none(), "{:?}", r.app.error);
+        select_word(&mut r);
+        r.key(egui::Key::G, egui::Modifiers::COMMAND);
+        r.key(egui::Key::B, egui::Modifiers::COMMAND);
+        assert_eq!(text(&r.app), "word\n");
+    }
+
+    #[test]
+    fn a_conflicting_key_keeps_the_default_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "word\n").unwrap();
+        let config = dir.path().join("config.toml");
+        let mut r = Run::new(dir.path(), Some(path));
+        // italic takes link's chord, so it snaps back, and bold can only
+        // sit on Ctrl+I while italic is away.
+        fs::write(&config, "[keys]\nbold = \"Ctrl+I\"\nitalic = \"Ctrl+K\"\n").unwrap();
+        r.app.apply_settings_from(Some(&config), |_| None);
+        let error = r.app.error.as_deref().unwrap();
+        assert!(error.contains("keys.bold"), "{error}");
+        assert!(error.contains("keys.italic"), "{error}");
+        select_word(&mut r);
+        r.key(egui::Key::B, egui::Modifiers::COMMAND);
         assert_eq!(text(&r.app), "**word**\n");
     }
 
