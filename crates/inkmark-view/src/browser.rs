@@ -717,31 +717,74 @@ impl FileBrowser {
         } else {
             self.theme.markup
         };
+        let font = FontId::proportional(13.0);
         ui.painter().text(
             pos2(indent, rect.center().y),
             Align2::LEFT_CENTER,
             marker,
-            FontId::proportional(13.0),
+            font.clone(),
             self.theme.markup,
         );
-        let name = ui.painter().text(
-            pos2(indent + 16.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            FontId::proportional(13.0),
-            color,
-        );
+        let name_x = indent + 16.0;
         if current && self.dirty {
+            // Leave room for ● at the end of the row. A long name otherwise
+            // pushes the mark past the clip, and the row looks saved.
+            let mark_width = ui
+                .painter()
+                .layout_no_wrap("●".to_owned(), font.clone(), color)
+                .size()
+                .x;
+            let gap = 6.0;
+            let name_width = (rect.right() - name_x - gap - mark_width).max(0.0);
+            let name = fit_row_label(ui, label, font.clone(), color, name_width);
+            let name_pos = pos2(name_x, rect.center().y - name.size().y * 0.5);
+            let painted = name.size().x;
+            ui.painter().galley(name_pos, name, color);
+            let mut mark_x = name_x + painted + gap;
+            if mark_x + mark_width > rect.right() {
+                mark_x = (rect.right() - mark_width).max(rect.left());
+            }
             ui.painter().text(
-                pos2(name.right() + 6.0, rect.center().y),
+                pos2(mark_x, rect.center().y),
                 Align2::LEFT_CENTER,
                 "●",
-                FontId::proportional(13.0),
+                font,
+                color,
+            );
+        } else {
+            ui.painter().text(
+                pos2(name_x, rect.center().y),
+                Align2::LEFT_CENTER,
+                label,
+                font,
                 color,
             );
         }
         Some(response)
     }
+}
+
+/// One line, cut with … so a long filename stays within `max_width`.
+fn fit_row_label(
+    ui: &Ui,
+    text: String,
+    font: FontId,
+    color: egui::Color32,
+    max_width: f32,
+) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text,
+        egui::TextFormat {
+            font_id: font,
+            color,
+            ..Default::default()
+        },
+    );
+    job.wrap.max_width = max_width.max(0.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    ui.painter().layout_job(job)
 }
 
 impl Drop for FileBrowser {

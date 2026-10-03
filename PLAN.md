@@ -2,7 +2,7 @@
 
 **Name (working):** `inkmark` · Rust · egui/eframe · Linux/Wayland (Omarchy/Hyprland) first · no Electron/WebView
 
-**Status:** Signed off 2026-10-01. MVP (M1–M6), GFM (G1–G4) and the [file browser](#file-browser-next) (F1–F3) are complete as of 2026-10-02; the first outside review's 21 issues and seven suggestions are fixed, and footnotes are in ([hardening and footnotes](#hardening-and-footnotes-2026-10-02)); [notes and links](#notes-and-links) is in review. [Configurable key bindings](#configurable-key-bindings) are in as of 2026-10-02. v0.2.0 is released, and the silent-exit fix is merged. Next is the [product review](#product-review-2026-10-03). See [Results](#results) for measurements and the [Roadmap](#roadmap) for what's planned. Changes to locked decisions require updating this doc first.
+**Status:** Signed off 2026-10-01. MVP (M1–M6), GFM (G1–G4) and the [file browser](#file-browser-next) (F1–F3) are complete as of 2026-10-02; the first outside review's 21 issues and seven suggestions are fixed, and footnotes are in ([hardening and footnotes](#hardening-and-footnotes-2026-10-02)); [notes and links](#notes-and-links) is in review. [Configurable key bindings](#configurable-key-bindings) are in as of 2026-10-02. v0.2.0 is released, and the silent-exit fix is merged. 0.2.1 is the unsaved mark in the [product review](#product-review-2026-10-03); the rest of that review is what's next. See [Results](#results) for measurements and the [Roadmap](#roadmap) for what's planned. Changes to locked decisions require updating this doc first.
 
 ---
 

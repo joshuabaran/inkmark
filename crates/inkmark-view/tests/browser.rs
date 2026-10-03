@@ -529,3 +529,27 @@ fn the_open_file_shows_the_unsaved_mark() {
     h.frame(vec![]);
     assert!(h.text_rect("●").is_none(), "a saved file was still marked");
 }
+
+#[test]
+fn a_long_name_keeps_the_unsaved_mark_in_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let name = format!("{}.md", "n".repeat(200));
+    let note = dir.path().join(&name);
+    fs::write(&note, "a\n").unwrap();
+    let mut h = Harness::new(dir.path());
+    h.wait_until(|browser| browser.row_rect(&note).is_some());
+
+    h.browser.set_current(Some(note.clone()));
+    h.browser.set_dirty(true);
+    h.frame(vec![]);
+    let row = h.browser.row_rect(&note).expect("row");
+    let mark = h.text_rect("●").expect("unsaved mark");
+    assert!(
+        mark.right() <= row.right(),
+        "mark {mark:?} extends past row {row:?}"
+    );
+    assert!(
+        mark.center().y >= row.top() && mark.center().y <= row.bottom(),
+        "mark {mark:?} is not on row {row:?}"
+    );
+}
