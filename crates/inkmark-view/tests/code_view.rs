@@ -465,6 +465,36 @@ fn ctrl_arrows_and_ctrl_delete_work_by_word() {
 }
 
 #[test]
+fn ctrl_alt_shift_on_a_column_chord_still_edits_by_word() {
+    // Review of #34. Outside a table, Ctrl+Alt+Right moves by word, and
+    // adding Shift selects by word. Ctrl+Alt+Shift+Backspace is
+    // delete-column, which doesn't apply here, so it deletes a word.
+    // Ctrl+Alt+Shift+Delete is not a table chord: extra Alt does not fire
+    // delete-word, so one character goes.
+    let ctrl_alt = CMD.plus(Modifiers::ALT);
+    let ctrl_alt_shift = ctrl_alt.plus(SHIFT);
+    let mut h = Harness::new("alpha beta gamma");
+    h.key(Key::ArrowRight, ctrl_alt);
+    assert_eq!(h.head(), 5, "Ctrl+Alt+Right still moves by word");
+    h.press(Key::Home);
+    h.key(Key::ArrowRight, ctrl_alt_shift);
+    assert_eq!(
+        h.view.selection().range(),
+        0..5,
+        "Ctrl+Alt+Shift+Right selects a word"
+    );
+    h.press(Key::Home);
+    h.key(Key::ArrowRight, CMD);
+    h.key(Key::ArrowRight, CMD);
+    assert_eq!(h.head(), 10);
+    h.key(Key::Backspace, ctrl_alt_shift);
+    assert_eq!(h.text(), "alpha  gamma");
+    let mut h = Harness::new("alpha beta gamma");
+    h.key(Key::Delete, ctrl_alt_shift);
+    assert_eq!(h.text(), "lpha beta gamma");
+}
+
+#[test]
 fn formatting_shortcuts_patch_the_source() {
     let mut h = Harness::new("make this bold\n- [ ] task");
     // Select "this" by word.

@@ -201,11 +201,12 @@ italic = []               # an empty list unbinds; anything left out keeps its d
 ```
 
 `inkmark --list-keys` prints every binding as it stands, ready to paste
-into that table. A name inkmark doesn't know, a chord it can't read, or
-two actions on one chord is reported, and that one keeps its default; the
-rest of the file still applies. Super, Ctrl+Alt+Delete, and Alt+Tab (with
-or without Shift or Ctrl) belong to the desktop: binding one is kept, and
-the error banner says the desktop will take it.
+into that table. A name inkmark doesn't know, a chord it can't read, a
+typing key with no Ctrl, Alt, or Super (it would also insert the
+character), or two actions on one chord is reported, and that one keeps
+its default; the rest of the file still applies. Super, Ctrl+Alt+Delete,
+and Alt+Tab (with or without Shift or Ctrl) belong to the desktop: binding
+one is kept, and the error banner says the desktop will take it.
 
 Colors come from the desktop: Omarchy's current theme if there is one,
 otherwise inkmark's own dark or light theme. `INKMARK_THEME=path/to/colors.toml`

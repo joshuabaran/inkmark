@@ -395,8 +395,82 @@ impl Chord {
         let Some(key) = key else {
             return Err(format!("can't read \"{text}\" as a chord"));
         };
+        // A bare typing key, or Shift plus one, still inserts the character:
+        // egui delivers that as a Text event beside the Key event, and only
+        // the Key event is matched. Ctrl, Alt, or Super suppresses it.
+        let held = modifiers.command || modifiers.ctrl || modifiers.alt || modifiers.mac_cmd;
+        if !held && types_a_character(key) {
+            return Err(format!(
+                "\"{text}\" types a character; it needs Ctrl, Alt, or Super"
+            ));
+        }
         Ok(Self { modifiers, key })
     }
+}
+
+/// Keys that produce a character on their own. Arrows, F-keys, Enter,
+/// Backspace, Delete and the rest do not, so they can be bound bare
+/// (F2 renames, Delete trashes).
+fn types_a_character(key: Key) -> bool {
+    matches!(
+        key,
+        Key::Space
+            | Key::Colon
+            | Key::Comma
+            | Key::Backslash
+            | Key::Slash
+            | Key::Pipe
+            | Key::Questionmark
+            | Key::Exclamationmark
+            | Key::OpenBracket
+            | Key::CloseBracket
+            | Key::OpenCurlyBracket
+            | Key::CloseCurlyBracket
+            | Key::Backtick
+            | Key::Minus
+            | Key::Period
+            | Key::Plus
+            | Key::Equals
+            | Key::Semicolon
+            | Key::Quote
+            | Key::IntlBackslash
+            | Key::Num0
+            | Key::Num1
+            | Key::Num2
+            | Key::Num3
+            | Key::Num4
+            | Key::Num5
+            | Key::Num6
+            | Key::Num7
+            | Key::Num8
+            | Key::Num9
+            | Key::A
+            | Key::B
+            | Key::C
+            | Key::D
+            | Key::E
+            | Key::F
+            | Key::G
+            | Key::H
+            | Key::I
+            | Key::J
+            | Key::K
+            | Key::L
+            | Key::M
+            | Key::N
+            | Key::O
+            | Key::P
+            | Key::Q
+            | Key::R
+            | Key::S
+            | Key::T
+            | Key::U
+            | Key::V
+            | Key::W
+            | Key::X
+            | Key::Y
+            | Key::Z
+    )
 }
 
 fn modifier(part: &str) -> Option<Modifiers> {
@@ -511,6 +585,12 @@ impl KeyMap {
     /// (which is Shift on purpose) was already claimed by the exact match.
     /// Anything else with an extra Shift is not a match, so Ctrl+Shift+B
     /// is not bold.
+    ///
+    /// Shift on a table chord that doesn't name Shift is not that command
+    /// either. Ctrl+Alt+Left inserts a column, so Ctrl+Alt+Shift+Left is
+    /// the ordinary Ctrl+Shift+Left and selects a word. The Alt is what
+    /// made it a table chord; without the table command claiming it, the
+    /// word motion underneath is what's left.
     pub fn editor_gesture(&self, key: Key, modifiers: Modifiers) -> Option<(Action, bool)> {
         if let Some(action) = self.find_editing(key, modifiers) {
             return Some((action, false));
@@ -522,6 +602,20 @@ impl KeyMap {
             shift: false,
             ..modifiers
         };
+        if let Some(action) = self.shifted(key, bare) {
+            return Some(action);
+        }
+        if self.find(key, bare, Scope::Table).is_some() {
+            let without_alt = Modifiers { alt: false, ..bare };
+            return self.shifted(key, without_alt);
+        }
+        None
+    }
+
+    /// Shift added to an editor chord: extend a motion, or ignore it on
+    /// delete-word. `None` when nothing is bound there, or when the action
+    /// doesn't treat Shift that way.
+    fn shifted(&self, key: Key, bare: Modifiers) -> Option<(Action, bool)> {
         let action = self.find(key, bare, Scope::Editor)?;
         if action.extends_with_shift() {
             Some((action, true))
@@ -873,9 +967,28 @@ mod tests {
         assert_eq!(Chord::parse("Ctrl+`").unwrap().key, Key::Backtick);
         assert_eq!(Chord::parse("Ctrl+Alt+0").unwrap().display(), "Ctrl+Alt+0");
         assert!(Chord::parse("Super+B").unwrap().modifiers.mac_cmd);
+        assert!(Chord::parse("Alt+B").is_ok());
+        assert!(Chord::parse("Shift+F2").is_ok());
         for bad in ["", "Ctrl+", "Ctrl++B", "NoSuch", "Ctrl+B+Shift", "Shift"] {
             assert!(Chord::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_typing_key_needs_ctrl_alt_or_super() {
+        // Review of #34: the Key event would run the action and the Text
+        // event would still insert the character. Shift doesn't stop that.
+        for bare in ["B", "Shift+B", "Space", "2", "Backtick", "Shift+Equals"] {
+            let err = Chord::parse(bare).expect_err(bare);
+            assert!(err.contains("types a character"), "{bare}: {err}");
+        }
+        let applied = KeyMap::apply(&[entry("bold", &["B"]), entry("save", &["S"])]);
+        let text = applied.errors.join("\n");
+        assert!(text.contains("keys.bold"), "{text}");
+        assert!(text.contains("keys.save"), "{text}");
+        assert!(text.contains("types a character"), "{text}");
+        assert_eq!(applied.map.shortcut_text(Action::Bold), "Ctrl+B");
+        assert_eq!(applied.map.shortcut_text(Action::Save), "Ctrl+S");
     }
 
     #[test]
@@ -912,6 +1025,38 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn shift_on_a_column_chord_selects_a_word() {
+        // Review of #34. Ctrl+Alt+Left is insert-column, so its Shift
+        // variant is not that command: it is Ctrl+Shift+Left. Backspace's
+        // shifted chord is delete-column itself. Delete was never a table
+        // chord, and extra Alt does not fire delete-word.
+        let map = KeyMap::builtin();
+        let ctrl_alt = Modifiers::COMMAND.plus(Modifiers::ALT);
+        let ctrl_alt_shift = ctrl_alt.plus(Modifiers::SHIFT);
+        assert_eq!(
+            map.editor_gesture(Key::ArrowLeft, ctrl_alt),
+            Some((Action::InsertColumnLeft, false))
+        );
+        assert_eq!(
+            map.editor_gesture(Key::ArrowLeft, ctrl_alt_shift),
+            Some((Action::WordLeft, true))
+        );
+        assert_eq!(
+            map.editor_gesture(Key::ArrowRight, ctrl_alt_shift),
+            Some((Action::WordRight, true))
+        );
+        assert_eq!(
+            map.editor_gesture(Key::Backspace, ctrl_alt_shift),
+            Some((Action::DeleteColumn, false))
+        );
+        // Not a table chord, so extra Alt does not fire delete-word.
+        assert_eq!(map.editor_gesture(Key::Delete, ctrl_alt_shift), None);
+        // Shift on insert-row or format isn't a motion, so nothing claims it.
+        assert_eq!(map.editor_gesture(Key::ArrowUp, ctrl_alt_shift), None);
+        assert_eq!(map.editor_gesture(Key::F, ctrl_alt_shift), None);
     }
 
     #[test]

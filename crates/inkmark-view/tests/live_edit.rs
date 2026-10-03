@@ -903,6 +903,26 @@ fn table_shortcuts_work_in_the_live_pane() {
 }
 
 #[test]
+fn shift_on_insert_column_selects_a_word_instead() {
+    // Review of #34. Ctrl+Alt+Shift+Left is not insert-column, in a table
+    // or out of one. It selects a word, as Ctrl+Shift+Left does.
+    let ctrl_alt_shift = Modifiers::COMMAND
+        .plus(Modifiers::ALT)
+        .plus(Modifiers::SHIFT);
+    let mut s = Split::new("alpha beta gamma\n");
+    s.caret(0);
+    s.key(Key::ArrowRight, ctrl_alt_shift);
+    assert_eq!(s.text(), "alpha beta gamma\n");
+    assert_eq!(s.live.selection().range(), 0..5);
+
+    let mut s = Split::new(TABLE);
+    s.caret(TABLE.find('c').unwrap());
+    let before = s.text().clone();
+    s.key(Key::ArrowLeft, ctrl_alt_shift);
+    assert_eq!(s.text(), before, "Shift does not insert a column");
+}
+
+#[test]
 fn leaving_an_edited_table_re_pads_it_as_its_own_undo_step() {
     let mut s = Split::new(TABLE);
     let c = TABLE.find('c').unwrap();
