@@ -486,3 +486,46 @@ fn the_context_menu_offers_rename_move_trash_and_new_file() {
     assert!(output.new_file);
     assert_eq!(h.browser.new_file_dir(), sub);
 }
+
+#[test]
+fn the_open_file_shows_the_unsaved_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = dir.path().join("note.md");
+    let other = dir.path().join("other.md");
+    fs::write(&note, "a\n").unwrap();
+    fs::write(&other, "b\n").unwrap();
+    let mut h = Harness::new(dir.path());
+    h.wait_until(|browser| browser.row_rect(&note).is_some() && browser.row_rect(&other).is_some());
+
+    h.browser.set_current(Some(note.clone()));
+    h.browser.set_dirty(false);
+    h.frame(vec![]);
+    assert!(h.text_rect("note.md").is_some());
+    assert!(
+        h.text_rect("●").is_none(),
+        "a saved file was marked unsaved"
+    );
+
+    h.browser.set_dirty(true);
+    h.frame(vec![]);
+    let name = h.text_rect("note.md").expect("file name");
+    let mark = h.text_rect("●").expect("unsaved mark");
+    assert!(
+        mark.left() >= name.right() - 1.0,
+        "the mark should sit beside the name"
+    );
+    assert!(
+        (mark.center().y - name.center().y).abs() < 2.0,
+        "the mark should share the file's row"
+    );
+    // The other file has no buffer, so it stays unmarked.
+    let other_name = h.text_rect("other.md").expect("other file");
+    assert!(
+        (mark.center().y - name.center().y).abs() < (mark.center().y - other_name.center().y).abs(),
+        "the mark belongs on the open file"
+    );
+
+    h.browser.set_dirty(false);
+    h.frame(vec![]);
+    assert!(h.text_rect("●").is_none(), "a saved file was still marked");
+}

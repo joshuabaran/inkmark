@@ -73,6 +73,8 @@ pub struct FileBrowser {
     inflight: HashSet<(usize, u64)>,
     selected: Option<PathBuf>,
     current: Option<PathBuf>,
+    /// The open document has unsaved edits. Only that row is marked.
+    dirty: bool,
     focus_next: bool,
     /// The open file was scrolled into view for the current path.
     revealed: bool,
@@ -103,6 +105,7 @@ impl FileBrowser {
             inflight: HashSet::new(),
             selected: None,
             current: None,
+            dirty: false,
             focus_next: false,
             revealed: false,
             id: Id::new("file_browser"),
@@ -140,6 +143,11 @@ impl FileBrowser {
         if let Some(parent) = self.tree.parent_root() {
             self.set_root(parent);
         }
+    }
+
+    /// The open document's unsaved mark, drawn beside its name like the footer.
+    pub fn set_dirty(&mut self, dirty: bool) {
+        self.dirty = dirty;
     }
 
     /// Highlights `path` and expands its parents once they are listed.
@@ -716,13 +724,22 @@ impl FileBrowser {
             FontId::proportional(13.0),
             self.theme.markup,
         );
-        ui.painter().text(
+        let name = ui.painter().text(
             pos2(indent + 16.0, rect.center().y),
             Align2::LEFT_CENTER,
             label,
             FontId::proportional(13.0),
             color,
         );
+        if current && self.dirty {
+            ui.painter().text(
+                pos2(name.right() + 6.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                "●",
+                FontId::proportional(13.0),
+                color,
+            );
+        }
         Some(response)
     }
 }
