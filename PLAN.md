@@ -402,6 +402,18 @@ Decided 2026-10-03: the first release is **v0.1.0** (the version already in `Car
 - The owner pushes the tag after the release PR merges: `git tag v0.1.0 && git push origin v0.1.0`.
 - `inkmark --help` / `--version` exist, and `--` ends options (the desktop entry uses `inkmark -- %f`).
 
+### Theme and fonts
+
+Decided 2026-10-03: follow the OS. No in-app theme picker; fonts are configurable.
+
+| Question | Decision |
+|---|---|
+| Colors | If Omarchy's `~/.local/state/omarchy/current/theme/colors.toml` exists, it's used, and `omarchy theme set` applies live. Otherwise the built-in dark or light theme follows the desktop's light/dark setting. `INKMARK_THEME=<colors.toml>` overrides both (testing, screenshots). |
+| Mapping a palette | Accent for headings and the caret, blue for links, green for code, yellow for emphasis, muted for markup; structural shades blended from background and foreground. Text colors too faint on the background are moved toward the foreground until they reach WCAG contrast (4.5:1 text, 3:1 markup). All 22 bundled Omarchy palettes pass. |
+| Fonts | Default to fontconfig's `monospace` (code) and `sans-serif` (live text), which is what `omarchy font set` changes. `~/.config/inkmark/config.toml` `[font]` overrides family and size for each; the file and `~/.config/fontconfig/fonts.conf` are checked every second and changes apply live. A missing font is reported and the default kept. |
+
+**Slices:** T1 one `Theme` for every color, built-in light, contrast test; T2 the OS theme (Omarchy palette, live switch, desktop light/dark); T3 fonts (fontconfig defaults, config file, live re-shaping).
+
 ### Later
 
 - Tables: re-pad columns so pipes stay aligned as you type; add and remove columns.

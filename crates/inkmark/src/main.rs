@@ -15,6 +15,10 @@ use inkmark_parse::{GfmParser, ParseState};
 use inkmark_text::Fonts;
 use inkmark_view::{BrowserOutput, CodeView, FileBrowser, LiveView, theme};
 
+/// Font sizes, in points, unless config.toml sets them.
+const CODE_SIZE: f32 = 14.0;
+const TEXT_SIZE: f32 = 16.0;
+
 /// How long a key hint stays in the status bar.
 const HINT_TIME: Duration = Duration::from_secs(4);
 
@@ -51,6 +55,7 @@ enum Pane {
     Live,
 }
 
+mod config;
 mod links;
 mod measure;
 mod os_theme;
@@ -247,6 +252,12 @@ struct App {
     trash: Box<dyn Trash>,
     /// The desktop's colors, followed live (fixed in tests).
     os_theme: os_theme::OsTheme,
+    /// The font database both panes share, for applying font settings.
+    fonts: inkmark_text::SharedFonts,
+    /// config.toml and fontconfig's file, watched for font changes (none
+    /// in tests), with their last modification times.
+    font_files: Vec<Option<PathBuf>>,
+    font_stamps: Vec<Option<std::time::SystemTime>>,
     /// A dialog took keyboard focus from the panes last frame.
     modal_was_open: bool,
     /// Tests receive the dialog kind instead of opening a portal window.
@@ -258,6 +269,8 @@ impl App {
     fn new(ctx: &egui::Context, path: Option<PathBuf>) -> Self {
         let mut app = Self::with_recent(ctx, path, recent::Recent::load());
         app.os_theme = os_theme::OsTheme::follow(ctx);
+        app.font_files = vec![config::config_path(), config::fontconfig_path()];
+        app.apply_settings();
         app
     }
 
@@ -275,7 +288,7 @@ impl App {
         let mut app = Self {
             doc: Document::default(),
             code: CodeView::with_fonts(fonts.clone(), egui::Id::new("code_view")),
-            live: LiveView::with_fonts(fonts, egui::Id::new("live_view")),
+            live: LiveView::with_fonts(fonts.clone(), egui::Id::new("live_view")),
             mode: Mode::Split,
             focus: Pane::Code,
             parse: {
@@ -308,6 +321,9 @@ impl App {
             trash_confirm: None,
             trash: Box::new(SystemTrash),
             os_theme: os_theme::OsTheme::fixed(),
+            fonts: fonts.clone(),
+            font_files: Vec::new(),
+            font_stamps: Vec::new(),
             modal_was_open: false,
             #[cfg(test)]
             dialog_hook: None,
@@ -499,10 +515,56 @@ impl App {
         self.dialog = None;
     }
 
+    /// Reads config.toml and the system fonts and applies them: config
+    /// first, then fontconfig's monospace and sans-serif families.
+    fn apply_settings(&mut self) {
+        self.font_stamps = config::stamps(&self.font_files);
+        let path = self.font_files.first().cloned().flatten();
+        self.apply_settings_from(path.as_deref(), config::system_font);
+    }
+
+    fn apply_settings_from(
+        &mut self,
+        config_file: Option<&Path>,
+        system_font: impl Fn(&str) -> Option<String>,
+    ) {
+        let settings = match config_file.map(std::fs::read_to_string) {
+            Some(Ok(text)) => config::parse(&text).unwrap_or_else(|e| {
+                self.error = Some(format!("Couldn't read config.toml: {e}"));
+                config::Settings::default()
+            }),
+            // No config file: defaults.
+            _ => config::Settings::default(),
+        };
+        let code = settings
+            .code_font
+            .clone()
+            .or_else(|| system_font("monospace"));
+        let text = settings
+            .text_font
+            .clone()
+            .or_else(|| system_font("sans-serif"));
+        let missing = self
+            .fonts
+            .borrow_mut()
+            .set_families(code.as_deref(), text.as_deref());
+        if !missing.is_empty() {
+            self.error = Some(format!(
+                "Font not installed: {} (using the default)",
+                missing.join(", ")
+            ));
+        }
+        self.code.font_size = settings.code_size.unwrap_or(CODE_SIZE);
+        self.live.font_size = settings.text_size.unwrap_or(TEXT_SIZE);
+    }
+
     fn check_disk(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         if now >= self.next_disk_check {
             self.next_disk_check = now + DISK_CHECK_INTERVAL;
+            if !self.font_files.is_empty() && config::stamps(&self.font_files) != self.font_stamps {
+                self.apply_settings();
+            }
             self.banner = match self.doc.disk_status() {
                 Ok(DiskStatus::Modified) => Some(Banner::DiskChanged),
                 Ok(DiskStatus::Missing) => Some(Banner::DiskMissing),
@@ -2990,5 +3052,37 @@ mod tests {
                 .contains("--frobnicate")
         );
         assert!(parse(&["a.md", "b.md"]).is_err());
+    }
+
+    #[test]
+    fn font_settings_apply_and_report_missing_fonts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path(), None);
+        let config = dir.path().join("config.toml");
+        fs::write(
+            &config,
+            "[font]\ncode = \"No Such Mono 123\"\ntext_size = 20\n",
+        )
+        .unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+        app.apply_settings_from(Some(&config), |alias| {
+            asked.borrow_mut().push(alias.to_owned());
+            None
+        });
+        assert_eq!(app.live.font_size, 20.0);
+        assert_eq!(app.code.font_size, CODE_SIZE);
+        assert!(
+            app.error.as_deref().unwrap().contains("No Such Mono 123"),
+            "{:?}",
+            app.error
+        );
+        // The config named a code font, so only the text font came from the system.
+        assert_eq!(*asked.borrow(), vec!["sans-serif".to_owned()]);
+
+        app.error = None;
+        fs::write(&config, "[font]\ncode_size = \"big\"\n").unwrap();
+        app.apply_settings_from(Some(&config), |_| None);
+        assert!(app.error.as_deref().unwrap().contains("code_size"));
+        assert_eq!(app.code.font_size, CODE_SIZE, "a bad file means defaults");
     }
 }

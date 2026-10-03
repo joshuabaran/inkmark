@@ -17,6 +17,10 @@ disk are the only source of truth: no accounts, sync or plugins.
   linked automatically. Parsed by [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark)
   and checked against every example in the CommonMark and GFM specs.
 - **Per-pane minimaps**, images (PNG, JPEG, GIF, WebP, BMP), recent files.
+- **Your desktop's look**: on [Omarchy](https://omarchy.org) it uses the
+  current theme's colors and follows `omarchy theme set` live; elsewhere it
+  picks dark or light to match the desktop. Fonts come from fontconfig
+  (Omarchy's `omarchy font set` included) unless you choose your own.
 - **Folder sidebar**: browse a directory of notes; open, create, rename
   and move them (drag and drop works), or move them to the trash.
 - **Links you can follow**: Ctrl+click a link to open another note, jump
@@ -113,6 +117,23 @@ to it. Nothing is ever overwritten: a name that's taken is refused. If
 the open file is renamed or moved, it stays open with your unsaved
 edits. Width and whether the sidebar is showing are remembered under
 `$XDG_STATE_HOME/inkmark`.
+
+### Settings
+
+inkmark reads `~/.config/inkmark/config.toml` (or `$XDG_CONFIG_HOME/inkmark`)
+and applies changes to it while running:
+
+```toml
+[font]
+code = "JetBrains Mono"   # code pane and code spans; default: the system monospace font
+text = "Inter"            # live pane; default: the system sans-serif font
+code_size = 14            # points
+text_size = 16
+```
+
+Colors come from the desktop: Omarchy's current theme if there is one,
+otherwise inkmark's own dark or light theme. `INKMARK_THEME=path/to/colors.toml`
+uses an Omarchy-style palette file instead.
 
 Ctrl+click follows a link in either pane. Links to other Markdown files
 (relative to the open file) open them, through the usual unsaved-changes

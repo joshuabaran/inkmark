@@ -101,6 +101,8 @@ pub struct Fonts {
     atlas: GlyphAtlas,
     /// egui pass the atlas was last prepared for.
     pass: Option<u64>,
+    /// Bumped when the font families change, so renderers re-shape.
+    generation: u64,
 }
 
 pub type SharedFonts = Rc<RefCell<Fonts>>;
@@ -112,7 +114,43 @@ impl Fonts {
             font_system: FontSystem::new(),
             atlas: GlyphAtlas::new(ctx),
             pass: None,
+            generation: 0,
         }))
+    }
+
+    /// Whether a font family with this name is installed (any case).
+    pub fn has_family(&self, name: &str) -> bool {
+        self.font_system.db().faces().any(|face| {
+            face.families
+                .iter()
+                .any(|(family, _)| family.eq_ignore_ascii_case(name))
+        })
+    }
+
+    /// The families plain text and code use (`None` leaves one as it is).
+    /// Names that aren't installed are skipped and returned, so the caller
+    /// can say so.
+    pub fn set_families(&mut self, monospace: Option<&str>, sans: Option<&str>) -> Vec<String> {
+        let mut missing = Vec::new();
+        let mut changed = false;
+        for (name, mono) in [(monospace, true), (sans, false)] {
+            let Some(name) = name else { continue };
+            if !self.has_family(name) {
+                missing.push(name.to_owned());
+                continue;
+            }
+            let db = self.font_system.db_mut();
+            if mono {
+                db.set_monospace_family(name);
+            } else {
+                db.set_sans_serif_family(name);
+            }
+            changed = true;
+        }
+        if changed {
+            self.generation += 1;
+        }
+        missing
     }
 
     /// Prepares the atlas once per egui pass, however many panes draw.
@@ -141,6 +179,8 @@ pub struct TextRenderer {
     avg_advance_px: f32,
     lines: HashMap<u64, CachedLine>,
     frame: u64,
+    /// `Fonts::generation` the cached lines were shaped with.
+    font_generation: u64,
 }
 
 /// One mesh per atlas page, filled by [`TextRenderer::draw_line`].
@@ -179,6 +219,7 @@ impl TextRenderer {
             avg_advance_px: 0.0,
             lines: HashMap::new(),
             frame: 0,
+            font_generation: 0,
         }
     }
 
@@ -186,10 +227,18 @@ impl TextRenderer {
     /// callers must re-estimate their line heights.
     pub fn begin_frame(&mut self, config: TextConfig, pixels_per_point: f32) -> bool {
         self.frame += 1;
-        self.fonts.borrow_mut().begin_pass();
-        if self.config == Some(config) && self.pixels_per_point == pixels_per_point {
+        let generation = {
+            let mut fonts = self.fonts.borrow_mut();
+            fonts.begin_pass();
+            fonts.generation
+        };
+        if self.config == Some(config)
+            && self.pixels_per_point == pixels_per_point
+            && self.font_generation == generation
+        {
             return false;
         }
+        self.font_generation = generation;
         self.config = Some(config);
         self.pixels_per_point = pixels_per_point;
         self.line_height_px = (config.line_height * pixels_per_point).round().max(1.0);
