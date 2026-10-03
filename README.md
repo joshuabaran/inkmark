@@ -5,6 +5,8 @@
 A fast, local Markdown editor for Linux and Wayland. Plain `.md` files on
 disk are the only source of truth: no accounts, sync or plugins.
 
+![inkmark in split view: the notes folder in the sidebar, Markdown on the left and the rendered document on the right, in the Tokyo Night theme](docs/screenshots/split-tokyo-night.png)
+
 - **Three views of one document**: split (raw Markdown left, rendered
   right), code only, or live only. Both panes are editable; one undo history.
 - **Live editing as source patches**: typing in the rendered view edits the
@@ -25,6 +27,27 @@ disk are the only source of truth: no accounts, sync or plugins.
   and move them (drag and drop works), or move them to the trash.
 - **Links you can follow**: Ctrl+click a link to open another note, jump
   to a heading or footnote, or open a web page; Alt+Left goes back.
+
+<table>
+<tr>
+<td><img src="docs/screenshots/live-flexoki-light.png" alt="Live view only, Flexoki Light theme"></td>
+<td><img src="docs/screenshots/code-catppuccin-latte.png" alt="Code view only, Catppuccin Latte theme"></td>
+</tr>
+<tr>
+<td align="center">Live view · Flexoki Light</td>
+<td align="center">Code view · Catppuccin Latte</td>
+</tr>
+<tr>
+<td><img src="docs/screenshots/long-document-rose-pine.png" alt="A 5 MB book in split view with both minimaps, Rosé Pine theme"></td>
+<td><img src="docs/screenshots/split-built-in-dark.png" alt="Split view in inkmark's built-in dark theme"></td>
+</tr>
+<tr>
+<td align="center">A 5 MB book with minimaps · Rosé Pine</td>
+<td align="center">Built-in dark theme</td>
+</tr>
+</table>
+
+The themes are Omarchy's; inkmark follows whichever one is active.
 
 See [PLAN.md](PLAN.md) for the design, measurements and roadmap.
 
