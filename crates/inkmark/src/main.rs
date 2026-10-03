@@ -158,6 +158,17 @@ fn main() -> eframe::Result {
     result
 }
 
+/// egui draws the chrome with Hack, which has the folder and unsaved
+/// marks. Ubuntu Light stays behind it for glyphs Hack lacks, and the
+/// emoji faces stay last. The document is cosmic-text and is not affected.
+fn install_ui_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.insert(0, "Hack".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
 /// The open file's state on disk, when it needs the user's attention.
 /// Errors are shown separately, so one never hides the other.
 enum Banner {
@@ -319,6 +330,7 @@ impl App {
     }
 
     fn with_recent(ctx: &egui::Context, path: Option<PathBuf>, recent: recent::Recent) -> Self {
+        install_ui_font(ctx);
         // One font database and glyph atlas for both panes.
         let fonts = Fonts::shared(ctx);
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1831,6 +1843,63 @@ mod tests {
                 inkmark_buffer::EditKind::Other,
             )
             .unwrap();
+    }
+
+    /// Advance width and atlas size of one proportional glyph.
+    fn glyph_box(ctx: &egui::Context, c: char) -> (f32, f32, f32) {
+        let font = egui::FontId::proportional(13.0);
+        ctx.fonts_mut(|fonts| {
+            let galley = fonts.layout_no_wrap(c.to_string(), font, egui::Color32::WHITE);
+            let glyph = galley.rows[0].glyphs[0];
+            (
+                glyph.advance_width,
+                glyph.uv_rect.size.x,
+                glyph.uv_rect.size.y,
+            )
+        })
+    }
+
+    #[test]
+    fn the_ui_font_draws_the_folder_and_unsaved_marks() {
+        let ctx = egui::Context::default();
+        // The default proportional face is Ubuntu Light. It draws the
+        // letters and replaces the marks with one empty box.
+        let mut first = ctx.run_ui(egui::RawInput::default(), |_| {});
+        first.textures_delta.clear();
+        let ubuntu_letter = glyph_box(&ctx, 'A');
+        let collapsed = glyph_box(&ctx, '▸');
+        let expanded = glyph_box(&ctx, '▾');
+        let unsaved = glyph_box(&ctx, '●');
+        assert!(ubuntu_letter.0 > 0.0);
+        assert_eq!(collapsed.1, expanded.1);
+        assert_eq!(collapsed.2, expanded.2);
+        assert_eq!(collapsed.1, unsaved.1);
+        assert_eq!(collapsed.2, unsaved.2);
+
+        install_ui_font(&ctx);
+        let mut second = ctx.run_ui(egui::RawInput::default(), |_| {});
+        second.textures_delta.clear();
+        ctx.fonts_mut(|fonts| {
+            let family = fonts
+                .definitions()
+                .families
+                .get(&egui::FontFamily::Proportional)
+                .expect("proportional family");
+            assert_eq!(family[0], "Hack");
+            assert!(family.iter().any(|name| name == "Ubuntu-Light"));
+        });
+        // Letters and marks now share Hack's cell, and the marks are
+        // distinct glyphs instead of the empty box.
+        let letter = glyph_box(&ctx, 'A');
+        let collapsed = glyph_box(&ctx, '▸');
+        let expanded = glyph_box(&ctx, '▾');
+        let unsaved = glyph_box(&ctx, '●');
+        assert_ne!(letter.0, ubuntu_letter.0);
+        assert_eq!(letter.0, collapsed.0);
+        assert_eq!(collapsed.0, expanded.0);
+        assert_eq!(collapsed.0, unsaved.0);
+        assert_ne!((collapsed.1, collapsed.2), (unsaved.1, unsaved.2));
+        assert_ne!((expanded.1, expanded.2), (unsaved.1, unsaved.2));
     }
 
     #[test]
