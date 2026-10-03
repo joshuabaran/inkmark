@@ -81,6 +81,7 @@ struct Builder<'a> {
     /// emits none), so every piece of inline content has a leaf block.
     tight: Option<usize>,
     footnotes: std::collections::BTreeSet<String>,
+    definitions: Vec<crate::Definition>,
 }
 
 impl<'a> Builder<'a> {
@@ -94,6 +95,7 @@ impl<'a> Builder<'a> {
             cursor: 0,
             tight: None,
             footnotes: Default::default(),
+            definitions: Vec::new(),
         }
     }
 
@@ -166,16 +168,22 @@ impl<'a> Builder<'a> {
             }
         }
         self.fill_to(self.src.len());
-        let link_defs = events
-            .reference_definitions()
-            .iter()
-            .map(|(label, def)| (crate::normalize_label(label), def.dest.to_string()))
-            .collect();
+        let mut link_defs = std::collections::HashMap::new();
+        for (label, def) in events.reference_definitions().iter() {
+            let label = crate::normalize_label(label);
+            self.definitions.push(crate::Definition {
+                range: def.span.clone(),
+                label: crate::DefinitionLabel::Link(label.clone()),
+            });
+            link_defs.insert(label, def.dest.to_string());
+        }
+        self.definitions.sort_by_key(|d| d.range.start);
         ParseOutput {
             blocks: BlockTree::from_blocks(self.blocks),
             map: SourceMap::from_spans(self.spans),
             link_defs,
             footnotes: self.footnotes,
+            definitions: self.definitions,
         }
     }
 
@@ -263,7 +271,11 @@ impl<'a> Builder<'a> {
             Tag::TableRow => (OpenTag::TableRow, Some(BlockKind::TableRow)),
             Tag::TableCell => (OpenTag::TableCell, Some(BlockKind::TableCell)),
             Tag::FootnoteDefinition(label) => {
-                self.footnotes.insert(label.into_string());
+                self.footnotes.insert(label.to_string());
+                self.definitions.push(crate::Definition {
+                    range: range.clone(),
+                    label: crate::DefinitionLabel::Footnote(label.into_string()),
+                });
                 (
                     OpenTag::FootnoteDefinition,
                     Some(BlockKind::FootnoteDefinition),

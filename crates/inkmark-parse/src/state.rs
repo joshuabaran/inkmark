@@ -24,12 +24,16 @@ impl ParseOutput {
             map: SourceMap::unparsed(len),
             link_defs: Default::default(),
             footnotes: Default::default(),
+            definitions: Vec::new(),
         }
     }
 
     fn rebase(&mut self, change: &Change) {
         self.map.rebase(change);
         self.blocks.rebase(change);
+        for d in &mut self.definitions {
+            d.range = change.map(d.range.start, Bias::Left)..change.map(d.range.end, Bias::Right);
+        }
     }
 
     /// Brings this output (a parse of `doc` at epoch `since`) up to date:
@@ -132,10 +136,66 @@ impl ParseOutput {
                 b
             })
             .collect();
-        self.link_defs.extend(std::mem::take(&mut local.link_defs));
-        self.footnotes.extend(std::mem::take(&mut local.footnotes));
+        self.replace_definitions(&region, len, &mut local);
         self.map.splice(region.clone(), spans);
         self.blocks.splice(region, blocks);
+    }
+}
+
+impl ParseOutput {
+    /// After a local reparse of `region`: the definitions that were in it
+    /// are replaced by the ones it has now (from `local`, a parse of its
+    /// `len` bytes plus stand-ins after them). A label nothing defines any
+    /// more stops resolving, instead of lingering until the full parse.
+    fn replace_definitions(&mut self, region: &Range<usize>, len: usize, local: &mut ParseOutput) {
+        let inside = |r: &Range<usize>| region.start <= r.start && r.end <= region.end;
+        let mut removed = Vec::new();
+        self.definitions.retain(|d| {
+            let keep = !inside(&d.range);
+            if !keep {
+                removed.push(d.label.clone());
+            }
+            keep
+        });
+        let added: Vec<crate::Definition> = std::mem::take(&mut local.definitions)
+            .into_iter()
+            .filter(|d| d.range.start < len)
+            .map(|mut d| {
+                d.range = d.range.start + region.start..d.range.end.min(len) + region.start;
+                d
+            })
+            .collect();
+        for label in removed {
+            if !self
+                .definitions
+                .iter()
+                .chain(&added)
+                .any(|d| d.label == label)
+            {
+                match label {
+                    crate::DefinitionLabel::Link(l) => {
+                        self.link_defs.remove(&l);
+                    }
+                    crate::DefinitionLabel::Footnote(l) => {
+                        self.footnotes.remove(&l);
+                    }
+                }
+            }
+        }
+        for d in &added {
+            match &d.label {
+                crate::DefinitionLabel::Link(l) => {
+                    if let Some(dest) = local.link_defs.get(l) {
+                        self.link_defs.insert(l.clone(), dest.clone());
+                    }
+                }
+                crate::DefinitionLabel::Footnote(l) => {
+                    self.footnotes.insert(l.clone());
+                }
+            }
+        }
+        self.definitions.extend(added);
+        self.definitions.sort_by_key(|d| d.range.start);
     }
 }
 

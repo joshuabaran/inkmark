@@ -377,3 +377,42 @@ fn a_local_reparse_at_the_end_adds_nothing_past_the_document() {
     assert_valid(&out, &doc);
     assert_eq!(out, GfmParser.parse(&whole(&doc)));
 }
+
+#[test]
+fn deleting_a_definition_stops_it_resolving_at_once() {
+    // Before the full parse lands: a local edit that deletes a link or
+    // footnote definition drops its label right away.
+    let src = "See [x][ref] and a note[^n].\n\n[ref]: /url\n\n[^n]: The note.\n\nEnd.\n";
+    let mut doc = Document::from_text(src);
+    let mut out = GfmParser.parse(src);
+    assert!(out.link_defs.contains_key("ref"));
+    assert!(out.footnotes.contains("n"));
+    for line in ["[ref]: /url\n", "[^n]: The note.\n"] {
+        let at = whole(&doc).find(line).unwrap();
+        let since = doc.epoch();
+        doc.apply(
+            vec![Edit::replace(at..at + line.len(), "")],
+            Selection::caret(at),
+            Selection::caret(at),
+            EditKind::Other,
+        )
+        .unwrap();
+        assert!(out.catch_up(&GfmParser, &doc, since));
+        assert_valid(&out, &doc);
+    }
+    assert!(!out.link_defs.contains_key("ref"), "{:?}", out.link_defs);
+    assert!(!out.footnotes.contains("n"), "{:?}", out.footnotes);
+    assert!(out.definitions.is_empty(), "{:?}", out.definitions);
+    // A definition typed back in resolves again.
+    let at = doc.len();
+    let since = doc.epoch();
+    doc.apply(
+        vec![Edit::insert(at, "\n[ref]: /other\n")],
+        Selection::caret(at),
+        Selection::caret(at),
+        EditKind::Other,
+    )
+    .unwrap();
+    assert!(out.catch_up(&GfmParser, &doc, since));
+    assert_eq!(out.link_defs.get("ref").map(String::as_str), Some("/other"));
+}
