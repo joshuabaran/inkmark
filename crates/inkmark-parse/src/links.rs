@@ -91,27 +91,77 @@ pub fn link_at(doc: &Document, out: &ParseOutput, offset: usize) -> Option<Link>
     }))
 }
 
-/// Where `#anchor` points: the start of the heading's text whose GitHub
-/// slug is `anchor`. Repeated headings get `-1`, `-2`… as on GitHub.
-pub fn heading_offset(doc: &Document, out: &ParseOutput, anchor: &str) -> Option<usize> {
-    let anchor = anchor.to_lowercase();
-    let mut seen: HashMap<String, usize> = HashMap::new();
+/// One heading, in document order. `text` is the heading's words, trimmed:
+/// the same characters a GitHub slug is built from. `offset` is the first of
+/// those characters, or the block start when the heading has none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Heading {
+    pub level: u8,
+    pub text: String,
+    pub offset: usize,
+}
+
+/// Every heading in the block tree, including headings inside a list or a
+/// quote. The outline and [`heading_offset`] both walk this list, so a click
+/// and a Ctrl+click land on the same byte.
+pub fn headings(doc: &Document, out: &ParseOutput) -> Vec<Heading> {
+    let doc_len = doc.len();
+    let mut found = Vec::new();
     for block in out.blocks.iter() {
-        let BlockKind::Heading(_) = block.kind else {
+        let BlockKind::Heading(level) = block.kind else {
             continue;
         };
         let spans = out.map.spans_in(block.range.clone());
         let mut text = String::new();
         let mut first_text = None;
+        // Source offset of the first character that survives trimming.
+        let mut content_at = None;
         for s in &spans {
-            match &s.kind {
-                SpanKind::Text => text.push_str(&doc.slice(s.range.clone())),
-                SpanKind::Replaced(r) => text.push_str(r),
-                _ => continue,
+            // A parse that has not caught up can name bytes past the rope.
+            // Skipping them keeps a frame from panicking on the slice.
+            if s.range.start > doc_len || s.range.end > doc_len {
+                continue;
             }
+            let piece = match &s.kind {
+                SpanKind::Text => doc.slice(s.range.clone()),
+                SpanKind::Replaced(rendered) => std::borrow::Cow::Borrowed(rendered.as_ref()),
+                _ => continue,
+            };
             first_text.get_or_insert(s.range.start);
+            if content_at.is_none() {
+                let rest = piece.trim_start();
+                if !rest.is_empty() {
+                    let at = match &s.kind {
+                        // Text is the source bytes, so the trim is a byte shift.
+                        SpanKind::Text => s.range.start + (piece.len() - rest.len()),
+                        // A replacement (an entity) is not the source. The
+                        // caret goes to the start of that span.
+                        _ => s.range.start,
+                    };
+                    content_at = Some(at.min(doc_len));
+                }
+            }
+            text.push_str(&piece);
         }
-        let base = slug(&text);
+        found.push(Heading {
+            level,
+            text: text.trim().to_owned(),
+            offset: content_at
+                .or(first_text)
+                .unwrap_or(block.range.start)
+                .min(doc_len),
+        });
+    }
+    found
+}
+
+/// Where `#anchor` points: the start of the heading's text whose GitHub
+/// slug is `anchor`. Repeated headings get `-1`, `-2`… as on GitHub.
+pub fn heading_offset(doc: &Document, out: &ParseOutput, anchor: &str) -> Option<usize> {
+    let anchor = anchor.to_lowercase();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for heading in headings(doc, out) {
+        let base = slug(&heading.text);
         let count = seen.entry(base.clone()).or_insert(0);
         let id = if *count == 0 {
             base
@@ -120,7 +170,7 @@ pub fn heading_offset(doc: &Document, out: &ParseOutput, anchor: &str) -> Option
         };
         *count += 1;
         if id == anchor {
-            return Some(first_text.unwrap_or(block.range.start));
+            return Some(heading.offset);
         }
     }
     None
@@ -249,5 +299,112 @@ mod tests {
         assert_eq!(footnote_offset(&doc, &out, "none"), None);
         assert_eq!(definition_label("[^a\\]b]: x"), Some("a\\]b"));
         assert_eq!(definition_label("[^a[b]: x"), None);
+    }
+
+    #[test]
+    fn headings_match_the_anchor_offsets() {
+        let src = "# Getting Started!\n\ntext\n\n## Getting started\n\n## Ünïcode *and* `code`\n";
+        let doc = Document::from_text(src);
+        let out = GfmParser.parse(src);
+        let found = headings(&doc, &out);
+        assert_eq!(
+            found
+                .iter()
+                .map(|h| (h.level, h.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "Getting Started!"),
+                (2, "Getting started"),
+                (2, "Ünïcode and code"),
+            ]
+        );
+        assert_eq!(
+            found[0].offset,
+            heading_offset(&doc, &out, "getting-started").unwrap()
+        );
+        assert_eq!(
+            found[1].offset,
+            heading_offset(&doc, &out, "getting-started-1").unwrap()
+        );
+        assert_eq!(found[2].offset, src.find("Ünïcode").unwrap());
+    }
+
+    #[test]
+    fn headings_include_setext_quotes_and_lists() {
+        let src = "Setext title\n============\n\nSub title\n---------\n\n> # Quoted\n\n- item\n\n  ## Listed\n\n```\n# Not a heading\n```\n\n###### Deep\n\n#   \n";
+        let doc = Document::from_text(src);
+        let out = GfmParser.parse(src);
+        let found = headings(&doc, &out);
+        assert_eq!(
+            found
+                .iter()
+                .map(|h| (h.level, h.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "Setext title"),
+                (2, "Sub title"),
+                (1, "Quoted"),
+                (2, "Listed"),
+                (6, "Deep"),
+                (1, ""),
+            ]
+        );
+        assert_eq!(found[0].offset, src.find("Setext title").unwrap());
+        assert_eq!(found[2].offset, src.find("Quoted").unwrap());
+        assert_eq!(found[3].offset, src.find("Listed").unwrap());
+        assert!(found[5].offset < src.len());
+        assert!(found.iter().all(|h| h.text != "Not a heading"));
+    }
+
+    #[test]
+    fn a_heading_offset_skips_leading_space_in_its_text() {
+        let src = "#  Hello\n";
+        let doc = Document::from_text(src);
+        let out = ParseOutput {
+            blocks: crate::tree::BlockTree::from_blocks(vec![crate::tree::Block {
+                kind: BlockKind::Heading(1),
+                range: 0..src.len(),
+                depth: 0,
+            }]),
+            map: crate::map::SourceMap::from_spans(vec![
+                span(0..2, SpanKind::Whitespace),
+                span(2..9, SpanKind::Text),
+                span(9..10, SpanKind::Whitespace),
+            ]),
+            ..ParseOutput::default()
+        };
+        let found = headings(&doc, &out);
+        assert_eq!(found[0].text, "Hello");
+        assert_eq!(found[0].offset, src.find('H').unwrap());
+        assert_eq!(
+            heading_offset(&doc, &out, "hello"),
+            Some(src.find('H').unwrap())
+        );
+    }
+
+    #[test]
+    fn a_span_past_the_document_is_not_sliced() {
+        let doc = Document::from_text("Hi");
+        let out = ParseOutput {
+            blocks: crate::tree::BlockTree::from_blocks(vec![crate::tree::Block {
+                kind: BlockKind::Heading(1),
+                range: 0..20,
+                depth: 0,
+            }]),
+            map: crate::map::SourceMap::from_spans(vec![span(0..20, SpanKind::Text)]),
+            ..ParseOutput::default()
+        };
+        let found = headings(&doc, &out);
+        assert_eq!(found[0].text, "");
+        assert_eq!(found[0].offset, 0);
+    }
+
+    fn span(range: std::ops::Range<usize>, kind: SpanKind) -> crate::map::Span {
+        crate::map::Span {
+            range,
+            kind,
+            style: crate::map::Style::default(),
+            heading: 1,
+        }
     }
 }

@@ -449,6 +449,8 @@ pub struct ParseState {
     /// Bumped by `reset`; jobs and results carry it so a parse of the
     /// previous document still in flight can't land on the new one.
     generation: u64,
+    /// Bumped whenever `output` changes. Callers cache on this.
+    revision: u64,
     jobs: Sender<Job>,
     results: Receiver<(u64, u64, ParseOutput)>,
 }
@@ -488,6 +490,7 @@ impl ParseState {
             requested: None,
             last_change: Instant::now(),
             generation: 0,
+            revision: 0,
             jobs,
             results,
         };
@@ -506,10 +509,17 @@ impl ParseState {
         // Results for the previous document, queued or still being
         // computed, carry the old generation and are ignored.
         self.generation += 1;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn output(&self) -> &ParseOutput {
         &self.output
+    }
+
+    /// Changes whenever [`output`](Self::output) does: a local reparse, a
+    /// full parse landing, or [`reset`](Self::reset).
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Whether `output` comes from a full parse of the current text (as
@@ -532,6 +542,7 @@ impl ParseState {
                 self.output = ParseOutput::unparsed(doc.len());
             }
             self.epoch = doc.epoch();
+            self.revision = self.revision.wrapping_add(1);
             self.last_change = now;
         }
         if self.full_epoch == Some(self.epoch) || self.requested == Some(self.epoch) {
@@ -560,5 +571,46 @@ impl ParseState {
         self.output = output;
         self.epoch = doc.epoch();
         self.full_epoch = Some(epoch);
+        self.revision = self.revision.wrapping_add(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use inkmark_buffer::{Document, Edit, EditKind, Selection};
+
+    use super::*;
+    use crate::GfmParser;
+
+    #[test]
+    fn revision_changes_only_when_the_output_does() {
+        let mut doc = Document::from_text("# A\n");
+        let mut state = ParseState::new(Arc::new(GfmParser), &doc, || {});
+        let opened = state.revision();
+        assert!(opened > 0);
+        // reset already asked for a full parse. Waiting for it replaces
+        // the placeholder output, so the revision moves once.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.revision() == opened {
+            assert!(Instant::now() < deadline, "parse never landed");
+            state.update(&doc);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(state.is_settled());
+        let settled = state.revision();
+        state.update(&doc);
+        assert_eq!(state.revision(), settled);
+        doc.apply(
+            vec![Edit::insert(3, "b")],
+            Selection::caret(3),
+            Selection::caret(4),
+            EditKind::Typing,
+        )
+        .unwrap();
+        state.update(&doc);
+        assert!(state.revision() > settled);
     }
 }

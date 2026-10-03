@@ -47,6 +47,7 @@ mod findbar;
 mod links;
 mod measure;
 mod os_theme;
+mod outline;
 mod recent;
 mod session;
 
@@ -318,6 +319,8 @@ struct App {
     /// Find and replace in the open document. Closed, it still remembers
     /// the query so F3 can repeat it.
     find: FindBar,
+    /// Heading rows for the outline, rebuilt when the parse revision changes.
+    outline: outline::Outline,
     /// The error banner text the settings put up, to take down once fixed.
     settings_error: Option<String>,
     /// A dialog took keyboard focus from the panes last frame.
@@ -398,6 +401,7 @@ impl App {
             settings: config::Settings::default(),
             keys: keys::KeyMap::builtin(),
             find: FindBar::default(),
+            outline: outline::Outline::default(),
             settings_error: None,
             modal_was_open: false,
             #[cfg(test)]
@@ -1432,56 +1436,96 @@ impl App {
 }
 
 impl App {
-    /// Sidebar beside the panes. Hidden, the panes keep the whole width.
+    /// Sidebar on the left, heading outline on the right. Hiding the sidebar
+    /// leaves the outline up.
     fn editor(&mut self, ui: &mut egui::Ui) {
         self.browser
             .set_current(self.doc.path().map(|path| path.to_path_buf()));
         self.browser.set_dirty(self.doc.is_dirty());
         if !self.sidebar.visible {
             self.browser.poll_listings(ui.ctx());
-            self.panes(ui);
-            return;
         }
         let rect = ui.available_rect_before_wrap();
-        let width = self
-            .sidebar
-            .width
-            .clamp(sidebar::MIN_WIDTH, sidebar::MAX_WIDTH)
-            .min((rect.width() - 240.0).max(sidebar::MIN_WIDTH));
-        let gap = 4.0;
-        let left = Rect::from_min_max(rect.min, pos2(rect.left() + width, rect.bottom()));
-        let handle = Rect::from_min_max(
-            pos2(left.right(), rect.top()),
-            pos2(left.right() + gap, rect.bottom()),
+        let gap = outline::GAP;
+        let wanted = self.sidebar.visible.then_some(
+            self.sidebar
+                .width
+                .clamp(sidebar::MIN_WIDTH, sidebar::MAX_WIDTH),
         );
-        let right = Rect::from_min_max(pos2(handle.right(), rect.top()), rect.max);
-        let mut output = BrowserOutput::default();
-        ui.scope_builder(UiBuilder::new().max_rect(left), |ui| {
-            output = self.browser.show(ui);
-        });
-        self.apply_browser(&output);
-        let handle_resp = ui.interact(handle, egui::Id::new("sidebar_split"), egui::Sense::drag());
-        if handle_resp.hovered() || handle_resp.dragged() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        let (sidebar_w, outline_w) = outline::column_widths(rect.width(), wanted);
+        let mut cursor = rect.left();
+        if self.sidebar.visible {
+            let left = Rect::from_min_max(rect.min, pos2(cursor + sidebar_w, rect.bottom()));
+            cursor = left.right();
+            let mut output = BrowserOutput::default();
+            ui.scope_builder(UiBuilder::new().max_rect(left), |ui| {
+                output = self.browser.show(ui);
+            });
+            self.apply_browser(&output);
+            let handle =
+                Rect::from_min_max(pos2(cursor, rect.top()), pos2(cursor + gap, rect.bottom()));
+            cursor = handle.right();
+            let handle_resp =
+                ui.interact(handle, egui::Id::new("sidebar_split"), egui::Sense::drag());
+            if handle_resp.hovered() || handle_resp.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            if handle_resp.dragged() {
+                self.sidebar.width = (self.sidebar.width + handle_resp.drag_delta().x)
+                    .clamp(sidebar::MIN_WIDTH, sidebar::MAX_WIDTH);
+            }
+            // The pointer can move for many frames. Store the width once, on release.
+            if handle_resp.drag_stopped() {
+                self.sidebar.save();
+            }
+            // The gap would otherwise show the window's clear color.
+            let colors = theme::current(ui.ctx());
+            ui.painter().rect_filled(handle, 0.0, colors.background);
+            ui.painter().vline(
+                handle.center().x,
+                handle.y_range(),
+                Stroke::new(1.0, colors.divider),
+            );
         }
-        if handle_resp.dragged() {
-            self.sidebar.width = (self.sidebar.width + handle_resp.drag_delta().x)
-                .clamp(sidebar::MIN_WIDTH, sidebar::MAX_WIDTH);
+
+        let panes_right = if outline_w > 1.0 {
+            rect.right() - outline_w - gap
+        } else {
+            rect.right()
+        };
+        let panes = Rect::from_min_max(pos2(cursor, rect.top()), pos2(panes_right, rect.bottom()));
+        // The panes mirror the caret while they draw. A click is applied
+        // after that, so both panes end the frame on the heading.
+        if panes.width() > 1.0 {
+            ui.scope_builder(UiBuilder::new().max_rect(panes), |ui| self.panes(ui));
         }
-        // The pointer can move for many frames. Store the width once, on release.
-        if handle_resp.drag_stopped() {
-            self.sidebar.save();
-        }
-        // The gap would otherwise show the window's clear color.
-        let colors = theme::current(ui.ctx());
-        ui.painter().rect_filled(handle, 0.0, colors.background);
-        ui.painter().vline(
-            handle.center().x,
-            handle.y_range(),
-            Stroke::new(1.0, colors.divider),
-        );
-        if right.width() > 1.0 {
-            ui.scope_builder(UiBuilder::new().max_rect(right), |ui| self.panes(ui));
+        if outline_w > 1.0 {
+            let divider = Rect::from_min_max(
+                pos2(panes_right, rect.top()),
+                pos2(panes_right + gap, rect.bottom()),
+            );
+            let outline_rect = Rect::from_min_max(pos2(divider.right(), rect.top()), rect.max);
+            let colors = theme::current(ui.ctx());
+            ui.painter().rect_filled(divider, 0.0, colors.background);
+            ui.painter().vline(
+                divider.center().x,
+                divider.y_range(),
+                Stroke::new(1.0, colors.divider),
+            );
+            self.outline
+                .refresh(self.parse.revision(), &self.doc, self.parse.output());
+            let caret = self.selection().head;
+            let clicked = ui
+                .scope_builder(UiBuilder::new().max_rect(outline_rect), |ui| {
+                    outline::show(ui, self.outline.rows(), caret)
+                })
+                .inner;
+            if let Some(offset) = clicked {
+                let here = self.here();
+                self.jump_to(offset);
+                self.remember(here);
+                self.focus_pane(ui.ctx(), self.focus);
+            }
         }
     }
 
@@ -3048,8 +3092,8 @@ mod tests {
             &mut time,
             vec![egui::Event::ModifiersChanged(egui::Modifiers::COMMAND)],
         );
-        // Find the reference in the live pane (right half) by the hand
-        // cursor Ctrl shows over links.
+        // Find the reference in the live pane (right half of the panes, with
+        // the outline beyond it) by the hand cursor Ctrl shows over links.
         let frame_cursor = |app: &mut App, time: &mut f64, pos: egui::Pos2| {
             *time += 1.0 / 60.0;
             let input = egui::RawInput {
@@ -3065,8 +3109,12 @@ mod tests {
             out.platform_output.cursor_icon
         };
         let y = 30.0;
+        let (_, outline_w) = outline::column_widths(1000.0, None);
+        let panes_right = 1000.0 - outline_w - outline::GAP;
+        let live_left = (panes_right / 2.0) as i32 + 16;
+        let live_right = panes_right as i32 - 8;
         let mut found = None;
-        for x in (520..900).step_by(3) {
+        for x in (live_left..live_right).step_by(3) {
             for y in [y - 20.0, y - 10.0, y, y + 10.0] {
                 let pos = egui::pos2(x as f32, y);
                 if frame_cursor(&mut app, &mut time, pos) == egui::CursorIcon::PointingHand {
@@ -3819,5 +3867,91 @@ mod tests {
         app.go_forward();
         assert_eq!(app.forward, vec![gone]);
         assert!(app.back.is_empty());
+    }
+
+    #[test]
+    fn clicking_an_outline_heading_jumps_both_panes_and_goes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "# Alpha\n\nbody\n\n## Beta\n\nend\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        let start = run.app.selection().head;
+        let alpha = text(&run.app).find("Alpha").unwrap();
+        let beta = text(&run.app).find("Beta").unwrap();
+        let beta_row = run.text_rect("Beta").expect("Beta");
+        assert!(
+            beta_row.left() > 700.0,
+            "the outline draws Beta, {beta_row:?}"
+        );
+
+        run.click_text("Beta");
+        assert_eq!(run.app.code.selection(), Selection::caret(beta));
+        assert_eq!(run.app.live.selection(), Selection::caret(beta));
+
+        run.click_text("Alpha");
+        assert_eq!(run.app.code.selection(), Selection::caret(alpha));
+        assert_eq!(run.app.live.selection(), Selection::caret(alpha));
+
+        run.key(egui::Key::ArrowLeft, egui::Modifiers::ALT);
+        assert_eq!(run.app.code.selection(), Selection::caret(beta));
+        assert_eq!(run.app.live.selection(), Selection::caret(beta));
+        run.key(egui::Key::ArrowLeft, egui::Modifiers::ALT);
+        assert_eq!(run.app.code.selection(), Selection::caret(start));
+        assert_eq!(run.app.live.selection(), Selection::caret(start));
+
+        run.click_text("Beta");
+        run.frame(vec![egui::Event::Text("Q".into())]);
+        assert!(text(&run.app).contains("QBeta"), "{}", text(&run.app));
+        let edited = run.text_rect("QBeta").expect("QBeta");
+        assert!(
+            edited.left() > 700.0,
+            "the outline shows the edited heading, {edited:?}"
+        );
+    }
+
+    #[test]
+    fn the_outline_stays_when_the_sidebar_is_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "# Alpha\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        run.app.sidebar.visible = false;
+        run.frame(vec![]);
+        let title = run.text_rect("Outline").expect("Outline");
+        let row = run.text_rect("Alpha").expect("Alpha");
+        assert!(title.left() > 700.0, "{title:?}");
+        assert!(row.left() > 700.0, "{row:?}");
+    }
+
+    #[test]
+    fn an_empty_file_says_it_has_no_headings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "just text\n").unwrap();
+        let run = Run::new(dir.path(), Some(path));
+        let title = run.text_rect("Outline").expect("Outline");
+        let empty = run.text_rect("No headings").expect("No headings");
+        assert!(title.left() > 700.0, "{title:?}");
+        assert!(empty.left() > 700.0, "{empty:?}");
+    }
+
+    #[test]
+    fn clicking_an_empty_heading_jumps_to_its_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "intro\n\n#\n\nbody\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        let found = inkmark_parse::headings(&run.app.doc, run.app.parse.output());
+        assert_eq!(found[0].text, "");
+        run.click_text("Empty heading");
+        assert_eq!(run.app.code.selection(), Selection::caret(found[0].offset));
+        assert_eq!(run.app.live.selection(), Selection::caret(found[0].offset));
+    }
+
+    #[test]
+    fn outline_keeps_its_width_beside_the_sidebar() {
+        assert_eq!(outline::column_widths(1000.0, Some(240.0)), (240.0, 200.0));
+        assert_eq!(outline::column_widths(1000.0, None), (0.0, 200.0));
+        assert_eq!(outline::column_widths(400.0, Some(240.0)), (160.0, 120.0));
     }
 }
