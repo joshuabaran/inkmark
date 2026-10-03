@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{
     self, Key, Modifiers, Rect, RichText, Stroke, UiBuilder, ViewportCommand, pos2,
 };
-use inkmark_buffer::{DiskStatus, Document, LineEnding, OpenError};
+use inkmark_buffer::{DiskStatus, Document, LineEnding, OpenError, Selection};
 use inkmark_files::{
     Launch, NewFileError, SystemTrash, Trash, choose_root, create_new_file, move_into, rename,
 };
@@ -43,11 +43,14 @@ enum Pane {
 }
 
 mod config;
+mod findbar;
 mod links;
 mod measure;
 mod os_theme;
 mod recent;
 mod session;
+
+use findbar::FindBar;
 mod sidebar;
 
 const USAGE: &str = "\
@@ -312,6 +315,9 @@ struct App {
     settings: config::Settings,
     /// Shortcuts for the window, the sidebar and both panes.
     keys: keys::KeyMap,
+    /// Find and replace in the open document. Closed, it still remembers
+    /// the query so F3 can repeat it.
+    find: FindBar,
     /// The error banner text the settings put up, to take down once fixed.
     settings_error: Option<String>,
     /// A dialog took keyboard focus from the panes last frame.
@@ -391,6 +397,7 @@ impl App {
             font_stamps: Vec::new(),
             settings: config::Settings::default(),
             keys: keys::KeyMap::builtin(),
+            find: FindBar::default(),
             settings_error: None,
             modal_was_open: false,
             #[cfg(test)]
@@ -793,7 +800,106 @@ impl App {
                 }
             }
             Action::NewFile => self.begin_new_file(),
+            Action::Find => self.open_find(ctx, false),
+            Action::Replace => self.open_find(ctx, true),
+            Action::FindNext => self.find_move(true),
+            Action::FindPrevious => self.find_move(false),
             _ => {}
+        }
+    }
+
+    /// Ctrl+F / Ctrl+H. A dialog already owns the keyboard, so find waits.
+    fn open_find(&mut self, ctx: &egui::Context, replace: bool) {
+        if self.modal_open() {
+            return;
+        }
+        let selection = self.selection();
+        let range = selection.range();
+        let seed = FindBar::seed(self.doc.slice(range.clone()).as_ref());
+        self.find.open(range.start, seed, replace);
+        // The bar takes the keys; the caret comes back when it closes.
+        self.code.release_focus(ctx);
+        self.live.release_focus(ctx);
+    }
+
+    fn find_move(&mut self, next: bool) {
+        let selection = self.selection();
+        let moved = if next {
+            self.find.goto_next(&self.doc, selection)
+        } else {
+            self.find.goto_prev(&self.doc, selection)
+        };
+        if let Some(sel) = moved {
+            self.show_match(sel);
+        }
+    }
+
+    fn modal_open(&self) -> bool {
+        self.recent_list.is_some()
+            || self.confirm.is_some()
+            || self.new_file.is_some()
+            || self.rename.is_some()
+            || self.trash_confirm.is_some()
+            || self.dialog.is_some()
+    }
+
+    /// Ctrl+Z and Ctrl+Y while the bar holds the keyboard. A field would
+    /// undo its own text, and a button click leaves the panes unfocused.
+    fn find_history_keys(&mut self, ctx: &egui::Context) {
+        if !self.find.is_open() || self.modal_open() {
+            return;
+        }
+        let field = self.find.field_focused(ctx);
+        let pane = self.code.has_focus(ctx) || self.live.has_focus(ctx);
+        if pane && !field {
+            return;
+        }
+        let actions = ctx.input_mut(|input| {
+            let mut found = Vec::new();
+            input.events.retain(|event| {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    return true;
+                };
+                match self.keys.find(*key, *modifiers, Scope::Editor) {
+                    Some(action @ (Action::Undo | Action::Redo)) => {
+                        found.push(action);
+                        false
+                    }
+                    _ => true,
+                }
+            });
+            found
+        });
+        for action in actions {
+            let restored = match action {
+                Action::Undo => self.doc.undo(),
+                Action::Redo => self.doc.redo(),
+                _ => None,
+            };
+            if let Some(selection) = restored {
+                self.show_match(selection);
+                self.find.sync_count(&self.doc, selection);
+            }
+        }
+    }
+
+    /// Selects `selection` in the focused pane and mirrors it to the other.
+    fn show_match(&mut self, selection: Selection) {
+        match self.focus {
+            Pane::Code => {
+                self.code.set_selection(selection);
+                self.live.mirror_selection(selection);
+            }
+            Pane::Live => {
+                self.live.set_selection(selection);
+                self.code.mirror_selection(selection);
+            }
         }
     }
 
@@ -1712,6 +1818,24 @@ impl App {
             egui::Panel::top("banner").show(ui, |ui| self.banner_ui(ui));
         }
         egui::Panel::bottom("status").show(ui, |ui| self.status_ui(ui));
+        if self.find.is_open() {
+            self.find_history_keys(&ctx);
+            let selection = self.selection();
+            let modal = self.modal_open();
+            let step = {
+                let find = &mut self.find;
+                let doc = &mut self.doc;
+                egui::Panel::bottom("find")
+                    .show(ui, |ui| find.show(ui, doc, selection, modal))
+                    .inner
+            };
+            if step.closed {
+                self.focus_pane(&ctx, self.focus);
+            }
+            if let Some(sel) = step.selection {
+                self.show_match(sel);
+            }
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.editor(ui));
@@ -3104,6 +3228,58 @@ mod tests {
             self.app.next_disk_check = Instant::now();
             self.frame(vec![]);
         }
+    }
+
+    #[test]
+    fn find_selects_a_match_and_replace_all_is_one_undo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "one cat\ntwo cat\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        run.key(egui::Key::F, egui::Modifiers::COMMAND);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("cat".into())]);
+        run.frame(vec![]);
+        assert_eq!(text(&run.app), "one cat\ntwo cat\n");
+        assert_eq!(run.app.code.selection().range(), 4..7);
+        assert_eq!(run.app.find.match_count(), 2);
+        assert_eq!(run.app.find.match_index(), Some(1));
+
+        run.app.find.set_replacement("dog");
+        run.click_text("Replace all");
+        assert_eq!(text(&run.app), "one dog\ntwo dog\n");
+        run.key(egui::Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(text(&run.app), "one cat\ntwo cat\n");
+        assert!(!run.app.doc.can_undo());
+    }
+
+    #[test]
+    fn find_next_click_moves_on_the_frame_the_query_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "one cat\ntwo cat\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        run.key(egui::Key::F, egui::Modifiers::COMMAND);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("c".into())]);
+        run.frame(vec![]);
+        let at = run.text_rect("Next").expect("Next").center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // The query becomes "cat" and Next is clicked in this frame.
+        run.frame(vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::Text("at".into()),
+            button(true),
+            button(false),
+        ]);
+        run.frame(vec![]);
+        assert_eq!(run.app.code.selection().range(), 12..15);
+        assert_eq!(run.app.find.match_index(), Some(2));
     }
 
     #[test]

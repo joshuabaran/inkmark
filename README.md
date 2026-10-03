@@ -158,6 +158,10 @@ inkmark               # browses the current directory and shows recent files
 | Alt+Shift+Right | Move the table column right (`move_column_right`) |
 | Ctrl+Alt+F | Line up the table's pipes (`format_table`) |
 | Ctrl+Alt+T | Insert a 3×3 table (`insert_table`) |
+| Ctrl+F | Find in this file (`find`) |
+| Ctrl+H | Replace in this file (`replace`) |
+| F3 | Find the next match (`find_next`) |
+| Shift+F3 | Find the previous match (`find_previous`) |
 
 Arrows, Home, End, Page Up, Page Down, Backspace, Delete, Enter and Tab edit
 as usual, and holding Shift extends a selection. Those keys are not in the
