@@ -4,8 +4,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Key, KeyboardShortcut, Modifiers, Rect, RichText, Stroke, UiBuilder, ViewportCommand,
-    pos2,
+    self, Key, Modifiers, Rect, RichText, Stroke, UiBuilder, ViewportCommand, pos2,
 };
 use inkmark_buffer::{DiskStatus, Document, LineEnding, OpenError};
 use inkmark_files::{
@@ -13,6 +12,7 @@ use inkmark_files::{
 };
 use inkmark_parse::{GfmParser, ParseState};
 use inkmark_text::Fonts;
+use inkmark_view::keys::{self, Action, Scope};
 use inkmark_view::{BrowserOutput, CodeView, FileBrowser, LiveView, theme};
 
 /// Font sizes, in points, unless config.toml sets them, and line height as
@@ -28,23 +28,6 @@ const HINT_TIME: Duration = Duration::from_secs(4);
 /// How often we look for changes made to the file by other programs.
 const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd", "txt"];
-
-const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
-const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
-const SAVE_AS: KeyboardShortcut =
-    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S);
-const CYCLE_MODE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::E);
-const FOCUS_CODE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num1);
-const FOCUS_LIVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num2);
-const TOGGLE_MINIMAP: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::M);
-const RECENT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
-const OPEN_FOLDER: KeyboardShortcut =
-    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::O);
-const TOGGLE_BROWSER: KeyboardShortcut =
-    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::E);
-const NEW_FILE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
-const BACK: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowLeft);
-const FORWARD: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowRight);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -279,6 +262,8 @@ struct App {
     font_stamps: Vec<Option<std::time::SystemTime>>,
     /// The last config.toml that read cleanly, kept through a bad read.
     settings: config::Settings,
+    /// Shortcuts for the window, the sidebar and both panes.
+    keys: keys::KeyMap,
     /// The error banner text the settings put up, to take down once fixed.
     settings_error: Option<String>,
     /// A dialog took keyboard focus from the panes last frame.
@@ -350,6 +335,7 @@ impl App {
             font_files: Vec::new(),
             font_stamps: Vec::new(),
             settings: config::Settings::default(),
+            keys: keys::KeyMap::builtin(),
             settings_error: None,
             modal_was_open: false,
             #[cfg(test)]
@@ -366,8 +352,16 @@ impl App {
                 }
             }
         }
+        app.install_keys();
         app.code.request_focus(ctx);
         app
+    }
+
+    /// Copies the current shortcuts onto the sidebar and both panes.
+    fn install_keys(&mut self) {
+        self.code.set_keys(self.keys.clone());
+        self.live.set_keys(self.keys.clone());
+        self.browser.set_keys(self.keys.clone());
     }
 
     /// Opens `path`, asking first if there are unsaved changes.
@@ -685,88 +679,59 @@ impl App {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (browser, cycle, code, live, minimap, recent) = ctx.input_mut(|i| {
-            // egui ignores extra Shift and Alt when matching, so the shifted
-            // browser shortcut has to be consumed before Ctrl+E.
-            // Ctrl+Alt+digit sets headings.
-            let alt = i.modifiers.alt;
-            (
-                i.consume_shortcut(&TOGGLE_BROWSER),
-                i.consume_shortcut(&CYCLE_MODE),
-                !alt && i.consume_shortcut(&FOCUS_CODE),
-                !alt && i.consume_shortcut(&FOCUS_LIVE),
-                i.consume_shortcut(&TOGGLE_MINIMAP),
-                i.consume_shortcut(&RECENT),
-            )
-        });
-        if browser {
-            self.sidebar.visible = !self.sidebar.visible;
-            self.sidebar.save();
-            if self.sidebar.visible {
-                self.browser.request_focus();
-            } else {
-                self.focus_pane(ctx, self.focus);
-            }
+        // App chords are taken before a pane sees the key. Matching is
+        // exact, so a pane chord that adds Shift or Alt (Ctrl+Alt+1 is a
+        // heading, Alt+Shift+Left moves a table column) is left for the pane.
+        let actions = ctx.input_mut(|i| self.keys.consume(i, Scope::App));
+        for action in actions {
+            self.run_app_action(ctx, action);
         }
-        if recent {
-            self.recent_list = match self.recent_list {
-                Some(_) => None,
-                None => {
-                    self.new_file = None;
-                    Some(0)
+    }
+
+    fn run_app_action(&mut self, ctx: &egui::Context, action: Action) {
+        match action {
+            Action::ToggleSidebar => {
+                self.sidebar.visible = !self.sidebar.visible;
+                self.sidebar.save();
+                if self.sidebar.visible {
+                    self.browser.request_focus();
+                } else {
+                    self.focus_pane(ctx, self.focus);
                 }
-            };
-        }
-        if minimap {
-            // Each pane keeps its own minimap setting.
-            match self.focus {
-                Pane::Code => self.code.show_minimap ^= true,
-                Pane::Live => self.live.show_minimap ^= true,
             }
-        }
-        if cycle {
-            self.cycle_mode(ctx);
-        } else if code {
-            self.focus_pane(ctx, Pane::Code);
-        } else if live {
-            self.focus_pane(ctx, Pane::Live);
-        }
-        let (open_folder, save_as, save, open, new_file, back, forward) = ctx.input_mut(|i| {
-            (
-                // Ctrl+Shift+O before Ctrl+O: extra Shift still matches Open.
-                i.consume_shortcut(&OPEN_FOLDER),
-                i.consume_shortcut(&SAVE_AS),
-                i.consume_shortcut(&SAVE),
-                i.consume_shortcut(&OPEN),
-                i.consume_shortcut(&NEW_FILE),
-                // Exactly Alt+Left: egui's shortcut matching would also
-                // take Alt+Shift+Left, which moves a table column.
-                consume_exact(i, BACK.modifiers, BACK.logical_key),
-                consume_exact(i, FORWARD.modifiers, FORWARD.logical_key),
-            )
-        });
-        if back {
-            self.go_back();
-        }
-        if forward {
-            self.go_forward();
-        }
-        if open_folder {
-            self.spawn_dialog(DialogKind::Folder);
-        } else if save_as {
-            self.spawn_dialog(DialogKind::SaveAs);
-        } else if save {
-            self.save();
-        }
-        if open {
-            if self.doc.is_dirty() {
-                self.confirm = Some(Confirm::Open);
-            } else {
-                self.spawn_dialog(DialogKind::Open);
+            Action::RecentFiles => {
+                self.recent_list = match self.recent_list {
+                    Some(_) => None,
+                    None => {
+                        self.new_file = None;
+                        Some(0)
+                    }
+                };
             }
-        }
-        if new_file {
-            self.begin_new_file();
+            Action::ToggleMinimap => {
+                // Each pane keeps its own minimap setting.
+                match self.focus {
+                    Pane::Code => self.code.show_minimap ^= true,
+                    Pane::Live => self.live.show_minimap ^= true,
+                }
+            }
+            Action::CycleMode => self.cycle_mode(ctx),
+            Action::FocusCode => self.focus_pane(ctx, Pane::Code),
+            Action::FocusLive => self.focus_pane(ctx, Pane::Live),
+            Action::Back => self.go_back(),
+            Action::Forward => self.go_forward(),
+            Action::OpenFolder => self.spawn_dialog(DialogKind::Folder),
+            Action::SaveAs => self.spawn_dialog(DialogKind::SaveAs),
+            Action::Save => self.save(),
+            Action::OpenFile => {
+                if self.doc.is_dirty() {
+                    self.confirm = Some(Confirm::Open);
+                } else {
+                    self.spawn_dialog(DialogKind::Open);
+                }
+            }
+            Action::NewFile => self.begin_new_file(),
+            _ => {}
         }
     }
 
@@ -1669,25 +1634,6 @@ impl App {
             }
         }
     }
-}
-
-/// Takes a press of `key` with exactly `modifiers` (egui's own matching
-/// ignores extra Shift and Alt).
-fn consume_exact(i: &mut egui::InputState, modifiers: Modifiers, key: Key) -> bool {
-    let mut found = false;
-    i.events.retain(|e| match e {
-        egui::Event::Key {
-            key: k,
-            pressed: true,
-            modifiers: m,
-            ..
-        } if !found && *k == key && *m == modifiers => {
-            found = true;
-            false
-        }
-        _ => true,
-    });
-    found
 }
 
 /// A file or folder's name for messages.
@@ -3311,6 +3257,53 @@ mod tests {
         app.apply_settings_from(Some(&config), system);
         assert_eq!(app.live.font_size, TEXT_SIZE);
         assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn extra_shift_does_not_fire_a_shorter_app_shortcut() {
+        // consume_shortcut treated Ctrl+Shift+M as Ctrl+M, and Ctrl+Shift+1
+        // as Ctrl+1. Exact matching leaves both alone.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "word\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(path));
+        assert!(r.app.code.show_minimap);
+        r.key(
+            egui::Key::M,
+            egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+        );
+        assert!(r.app.code.show_minimap);
+        r.key(egui::Key::M, egui::Modifiers::COMMAND);
+        assert!(!r.app.code.show_minimap);
+
+        r.app.focus_pane(&r.ctx, Pane::Live);
+        r.key(
+            egui::Key::Num1,
+            egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+        );
+        assert!(r.app.focus == Pane::Live);
+        r.key(egui::Key::Num1, egui::Modifiers::COMMAND);
+        assert!(r.app.focus == Pane::Code);
+    }
+
+    #[test]
+    fn a_pane_chord_on_a_former_app_key_is_not_eaten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "word\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(path));
+        let mut keys = keys::KeyMap::builtin();
+        keys.set(Action::Bold, vec![keys::Chord::parse("Ctrl+E").unwrap()]);
+        keys.set(Action::CycleMode, vec![]);
+        r.app.keys = keys;
+        r.app.install_keys();
+        r.app
+            .code
+            .set_selection(inkmark_buffer::Selection { anchor: 0, head: 4 });
+        r.app.code.request_focus(&r.ctx);
+        r.key(egui::Key::E, egui::Modifiers::COMMAND);
+        assert!(r.app.mode == Mode::Split, "cycle_mode was unbound");
+        assert_eq!(text(&r.app), "**word**\n");
     }
 
     #[test]

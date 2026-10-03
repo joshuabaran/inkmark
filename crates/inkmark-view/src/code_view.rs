@@ -15,6 +15,7 @@ use inkmark_parse::{ParseOutput, ParseState};
 use inkmark_text::{GlyphMeshes, ScrollAnchor, SharedFonts, TextConfig, TextRenderer};
 
 use crate::commands::{self, EditPlan};
+use crate::keys::{self, Action};
 use crate::lines::SCROLLBAR_WIDTH;
 use crate::lines::{LineIndex, ScrollPos, Synced};
 use crate::motion;
@@ -78,6 +79,8 @@ pub struct CodeView {
     hit_upstream: bool,
     pub font_size: f32,
     pub line_height: f32,
+    /// Shortcuts, shared with the other pane and the app shell.
+    keys: keys::KeyMap,
 }
 
 /// Where the text area sits this frame.
@@ -119,7 +122,13 @@ impl CodeView {
             hit_upstream: false,
             font_size: 14.0,
             line_height: 21.0,
+            keys: keys::KeyMap::builtin(),
         }
+    }
+
+    /// Replaces the shortcuts. The app does this when config.toml changes.
+    pub fn set_keys(&mut self, keys: keys::KeyMap) {
+        self.keys = keys;
     }
 
     pub fn selection(&self) -> Selection {
@@ -643,35 +652,39 @@ impl CodeView {
                     modifiers,
                     ..
                 } if self.preedit.is_empty() => {
-                    // Table commands need the parse to find the table.
-                    if let Some(command) = tables::shortcut(key, modifiers)
-                        && let Some(parse) = parse
-                    {
-                        match tables::run(doc, parse, self.selection.head, command) {
-                            (Some(plan), _) => {
-                                self.apply_plan(doc, plan);
-                                continue;
-                            }
-                            (None, true) => continue,
-                            (None, false) => {}
-                        }
-                    }
-                    self.handle_key(doc, key, modifiers, viewport)
+                    self.handle_key(doc, key, modifiers, viewport, parse)
                 }
                 _ => {}
             }
         }
     }
 
-    fn handle_key(&mut self, doc: &mut Document, key: Key, modifiers: Modifiers, viewport: f32) {
-        let (cmd, shift) = (modifiers.command, modifiers.shift);
+    fn handle_key(
+        &mut self,
+        doc: &mut Document,
+        key: Key,
+        modifiers: Modifiers,
+        viewport: f32,
+        parse: Option<&ParseOutput>,
+    ) {
+        let shift = modifiers.shift;
+        let mut from_table = false;
+        if let Some((action, extend)) = self.keys.editor_gesture(key, modifiers)
+            && self.run_editor_action(doc, parse, action, extend, &mut from_table)
+        {
+            return;
+        }
+        // A table chord that doesn't apply (no table here) keeps the key's
+        // ordinary meaning, so Ctrl+Alt+Left still moves by word. An unbound
+        // Ctrl chord does not: word motion is itself a binding.
+        let word = from_table && modifiers.command;
         let range = self.selection.range();
         let head = self.selection.head;
         match key {
             Key::ArrowLeft if !shift && !range.is_empty() => self.move_to(doc, range.start, false),
             Key::ArrowRight if !shift && !range.is_empty() => self.move_to(doc, range.end, false),
             Key::ArrowLeft => {
-                let target = if cmd {
+                let target = if word {
                     motion::prev_word(doc, head)
                 } else {
                     motion::prev_grapheme(doc, head)
@@ -679,7 +692,7 @@ impl CodeView {
                 self.move_to(doc, target, shift);
             }
             Key::ArrowRight => {
-                let target = if cmd {
+                let target = if word {
                     motion::next_word(doc, head)
                 } else {
                     motion::next_grapheme(doc, head)
@@ -693,8 +706,6 @@ impl CodeView {
                 let rows = if key == Key::PageUp { -rows } else { rows };
                 self.move_vertical(doc, rows, shift);
             }
-            Key::Home if cmd => self.move_to(doc, 0, shift),
-            Key::End if cmd => self.move_to(doc, doc.len(), shift),
             Key::Home => {
                 let (target, _) = self.row_edge(doc, false);
                 self.move_to(doc, target, shift);
@@ -707,7 +718,7 @@ impl CodeView {
             Key::Backspace if !range.is_empty() => self.delete(doc, range, EditKind::Deleting),
             Key::Delete if !range.is_empty() => self.delete(doc, range, EditKind::Deleting),
             Key::Backspace => {
-                let start = if cmd {
+                let start = if word {
                     motion::prev_word(doc, head)
                 } else {
                     motion::prev_grapheme(doc, head)
@@ -715,54 +726,100 @@ impl CodeView {
                 self.delete(doc, start..head, EditKind::Deleting);
             }
             Key::Delete => {
-                let end = if cmd {
+                let end = if word {
                     motion::next_word(doc, head)
                 } else {
                     motion::next_grapheme(doc, head)
                 };
                 self.delete(doc, head..end, EditKind::Deleting);
             }
-            Key::Enter if cmd => {
-                self.apply_plan(doc, commands::toggle_task(doc, self.selection));
-            }
-            Key::X if cmd && shift => {
-                self.apply_plan(
-                    doc,
-                    commands::toggle_wrap(doc, self.selection, "~~", &["~"]),
-                );
-            }
             Key::Enter => self.insert(doc, "\n", EditKind::Typing),
             Key::Tab if shift => self.outdent(doc),
             Key::Tab if self.selected_lines(doc).len() > 1 => self.indent(doc),
             Key::Tab => self.insert(doc, INDENT, EditKind::Typing),
-            Key::A if cmd => {
+            Key::Escape if !range.is_empty() => self.move_to(doc, head, false),
+            _ => {}
+        }
+    }
+
+    /// Runs a chord from the key table. False when a table action doesn't
+    /// apply, so the key falls through; `from_table` says that's why.
+    fn run_editor_action(
+        &mut self,
+        doc: &mut Document,
+        parse: Option<&ParseOutput>,
+        action: Action,
+        extend: bool,
+        from_table: &mut bool,
+    ) -> bool {
+        if let Some(command) = tables::command(action) {
+            let Some(parse) = parse else {
+                *from_table = true;
+                return false;
+            };
+            match tables::run(doc, parse, self.selection.head, command) {
+                (Some(plan), _) => {
+                    self.apply_plan(doc, plan);
+                    return true;
+                }
+                (None, true) => return true,
+                (None, false) => {
+                    *from_table = true;
+                    return false;
+                }
+            }
+        }
+        let sel = self.selection;
+        let range = sel.range();
+        let head = sel.head;
+        if let Some(level) = action.heading_level() {
+            self.apply_plan(doc, commands::set_heading(doc, sel, level));
+            return true;
+        }
+        match action {
+            Action::Undo => self.undo(doc),
+            Action::Redo => self.redo(doc),
+            Action::Bold => self.apply_plan(doc, commands::toggle_wrap(doc, sel, "**", &["__"])),
+            Action::Italic => self.apply_plan(doc, commands::toggle_wrap(doc, sel, "*", &["_"])),
+            Action::Code => self.apply_plan(doc, commands::toggle_wrap(doc, sel, "`", &[])),
+            Action::Strikethrough => {
+                self.apply_plan(doc, commands::toggle_wrap(doc, sel, "~~", &["~"]))
+            }
+            Action::Link => self.apply_plan(doc, commands::insert_link(doc, sel)),
+            Action::ToggleTask => self.apply_plan(doc, commands::toggle_task(doc, sel)),
+            Action::SelectAll => {
                 self.selection = Selection {
                     anchor: 0,
                     head: doc.len(),
                 };
                 doc.seal_undo_step();
             }
-            Key::B if cmd => self.apply_plan(
-                doc,
-                commands::toggle_wrap(doc, self.selection, "**", &["__"]),
-            ),
-            Key::I if cmd => {
-                self.apply_plan(doc, commands::toggle_wrap(doc, self.selection, "*", &["_"]))
+            // Ctrl+Left with a selection collapses it, same as Left. The
+            // word jump waits until the caret is alone.
+            Action::WordLeft | Action::WordRight if !extend && !range.is_empty() => {
+                let at = if action == Action::WordLeft {
+                    range.start
+                } else {
+                    range.end
+                };
+                self.move_to(doc, at, false);
             }
-            Key::Backtick if cmd => {
-                self.apply_plan(doc, commands::toggle_wrap(doc, self.selection, "`", &[]))
+            Action::WordLeft => self.move_to(doc, motion::prev_word(doc, head), extend),
+            Action::WordRight => self.move_to(doc, motion::next_word(doc, head), extend),
+            Action::DeleteWordLeft | Action::DeleteWordRight if !range.is_empty() => {
+                self.delete(doc, range, EditKind::Deleting);
             }
-            Key::K if cmd => self.apply_plan(doc, commands::insert_link(doc, self.selection)),
-            _ if cmd && modifiers.alt && commands::heading_level(key).is_some() => {
-                let level = commands::heading_level(key).expect("checked");
-                self.apply_plan(doc, commands::set_heading(doc, self.selection, level));
+            Action::DeleteWordLeft => {
+                self.delete(doc, motion::prev_word(doc, head)..head, EditKind::Deleting);
             }
-            Key::Z if cmd && shift => self.redo(doc),
-            Key::Z if cmd => self.undo(doc),
-            Key::Y if cmd => self.redo(doc),
-            Key::Escape if !range.is_empty() => self.move_to(doc, head, false),
-            _ => {}
+            Action::DeleteWordRight => {
+                self.delete(doc, head..motion::next_word(doc, head), EditKind::Deleting);
+            }
+            Action::DocumentStart => self.move_to(doc, 0, extend),
+            Action::DocumentEnd => self.move_to(doc, doc.len(), extend),
+            _ => return false,
         }
+        true
     }
 
     /// Document offset under a screen position.

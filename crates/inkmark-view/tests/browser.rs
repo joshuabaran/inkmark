@@ -364,6 +364,39 @@ fn f2_and_delete_ask_about_the_selected_row() {
 }
 
 #[test]
+fn shift_delete_does_not_trash_and_a_rebind_wins_over_the_arrow_keys() {
+    // consume_key treated Shift+Delete as Delete. Exact matching does not.
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.md");
+    let b = dir.path().join("b.md");
+    fs::write(&a, "a\n").unwrap();
+    fs::write(&b, "b\n").unwrap();
+    let mut h = Harness::new(dir.path());
+    h.wait_until(|browser| browser.row_rect(&b).is_some());
+    h.click(h.browser.row_rect(&b).unwrap().center());
+    let output = h.frame(vec![Event::Key {
+        key: Key::Delete,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::SHIFT,
+    }]);
+    assert!(output.trash.is_none());
+
+    // Rename bound to Up has to be taken before Up moves the selection.
+    let mut keys = inkmark_view::keys::KeyMap::builtin();
+    keys.set(
+        inkmark_view::keys::Action::Rename,
+        vec![inkmark_view::keys::Chord::parse("ArrowUp").unwrap()],
+    );
+    h.browser.set_keys(keys);
+    let output = h.press(Key::ArrowUp);
+    assert_eq!(output.rename, Some(b));
+    let output = h.press(Key::F2);
+    assert!(output.rename.is_none(), "F2 was given away");
+}
+
+#[test]
 fn dragging_a_row_onto_a_folder_drops_it_there() {
     let dir = tempfile::tempdir().unwrap();
     let sub = dir.path().join("sub");

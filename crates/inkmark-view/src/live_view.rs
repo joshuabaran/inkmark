@@ -19,6 +19,7 @@ use inkmark_text::{
 
 use crate::commands::{self, EditPlan, EnterContext};
 use crate::images::{ImageCache, ImageSlot};
+use crate::keys::{self, Action};
 use crate::lines::{LineIndex, SCROLLBAR_WIDTH, ScrollPos, Synced};
 use crate::live_layout::{self, LeafLayout, LeafStyle, Reveal};
 use crate::motion;
@@ -276,6 +277,8 @@ pub struct LiveView {
     images: Option<ImageCache>,
     pub font_size: f32,
     pub line_height: f32,
+    /// Shortcuts, shared with the code pane and the app shell.
+    keys: keys::KeyMap,
 }
 
 impl LiveView {
@@ -309,7 +312,13 @@ impl LiveView {
             images: None,
             font_size: 16.0,
             line_height: 26.0,
+            keys: keys::KeyMap::builtin(),
         }
+    }
+
+    /// Replaces the shortcuts. The app does this when config.toml changes.
+    pub fn set_keys(&mut self, keys: keys::KeyMap) {
+        self.keys = keys;
     }
 
     /// The offset of a link Ctrl+clicked since the last call.
@@ -1204,47 +1213,58 @@ impl LiveView {
                 }
             };
             use tables::{Align, TableCommand::*, TableOp::*};
+            let hint = |action: Action| self.keys.shortcut_text(action);
             if in_table {
-                item(ui, "Insert row above", "Ctrl+Alt+Up", Edit(InsertRowAbove));
+                item(
+                    ui,
+                    "Insert row above",
+                    &hint(Action::InsertRowAbove),
+                    Edit(InsertRowAbove),
+                );
                 item(
                     ui,
                     "Insert row below",
-                    "Ctrl+Alt+Down",
+                    &hint(Action::InsertRowBelow),
                     Edit(InsertRowBelow),
                 );
                 item(
                     ui,
                     "Insert column left",
-                    "Ctrl+Alt+Left",
+                    &hint(Action::InsertColumnLeft),
                     Edit(InsertColumnLeft),
                 );
                 item(
                     ui,
                     "Insert column right",
-                    "Ctrl+Alt+Right",
+                    &hint(Action::InsertColumnRight),
                     Edit(InsertColumnRight),
                 );
                 ui.separator();
-                item(ui, "Delete row", "Ctrl+Alt+Backspace", Edit(DeleteRow));
+                item(ui, "Delete row", &hint(Action::DeleteRow), Edit(DeleteRow));
                 item(
                     ui,
                     "Delete column",
-                    "Ctrl+Alt+Shift+Backspace",
+                    &hint(Action::DeleteColumn),
                     Edit(DeleteColumn),
                 );
                 ui.separator();
-                item(ui, "Move row up", "Alt+Shift+Up", Edit(MoveRowUp));
-                item(ui, "Move row down", "Alt+Shift+Down", Edit(MoveRowDown));
+                item(ui, "Move row up", &hint(Action::MoveRowUp), Edit(MoveRowUp));
+                item(
+                    ui,
+                    "Move row down",
+                    &hint(Action::MoveRowDown),
+                    Edit(MoveRowDown),
+                );
                 item(
                     ui,
                     "Move column left",
-                    "Alt+Shift+Left",
+                    &hint(Action::MoveColumnLeft),
                     Edit(MoveColumnLeft),
                 );
                 item(
                     ui,
                     "Move column right",
-                    "Alt+Shift+Right",
+                    &hint(Action::MoveColumnRight),
                     Edit(MoveColumnRight),
                 );
                 ui.separator();
@@ -1254,9 +1274,9 @@ impl LiveView {
                     item(ui, "Right", "", Edit(Align(Align::Right)));
                     item(ui, "None", "", Edit(Align(Align::None)));
                 });
-                item(ui, "Format table", "Ctrl+Alt+F", Edit(Format));
+                item(ui, "Format table", &hint(Action::FormatTable), Edit(Format));
             } else {
-                item(ui, "Insert table", "Ctrl+Alt+T", Insert);
+                item(ui, "Insert table", &hint(Action::InsertTable), Insert);
             }
         });
         let Some(command) = chosen else {
@@ -1500,34 +1520,38 @@ impl LiveView {
         key: Key,
         modifiers: Modifiers,
     ) -> bool {
-        let (cmd, shift, alt) = (modifiers.command, modifiers.shift, modifiers.alt);
-        let sel = self.selection;
-        let range = sel.range();
-        if let Some(command) = tables::shortcut(key, modifiers) {
-            match tables::run(doc, parse, sel.head, command) {
-                (Some(plan), _) => return self.apply_plan(doc, plan),
-                (None, true) => return false,
-                // Not in a table: the key does what it usually does.
-                (None, false) => {}
-            }
+        let mut from_table = false;
+        if let Some((action, extend)) = self.keys.editor_gesture(key, modifiers)
+            && let Some(edited) =
+                self.run_editor_action(doc, parse, action, extend, &mut from_table)
+        {
+            return edited;
         }
-        if !cmd
-            && !alt
+        // A table chord that doesn't apply keeps the key's ordinary meaning,
+        // so Ctrl+Alt+Left still moves by word. An unbound Ctrl chord does
+        // not: word motion is itself a binding.
+        let word = from_table && modifiers.command;
+        let shift = modifiers.shift;
+        // Plain Tab and Enter move between table cells. Their Ctrl and Alt
+        // chords are actions, so they were already handled above.
+        if !modifiers.command
+            && !modifiers.alt
             && matches!(key, Key::Tab | Key::Enter)
             && let Some(edited) = self.table_key(doc, parse, key, shift)
         {
             return edited;
         }
+        let sel = self.selection;
+        let range = sel.range();
         match key {
-            // Editing.
             Key::Backspace | Key::Delete if !range.is_empty() => {
                 return self.delete(doc, range, EditKind::Deleting);
             }
             Key::Backspace => {
-                if !cmd && let Some(plan) = commands::smart_backspace(doc, sel) {
+                if !word && let Some(plan) = commands::smart_backspace(doc, sel) {
                     return self.apply_plan(doc, plan);
                 }
-                let start = self.step(doc, parse, false, cmd);
+                let start = self.step(doc, parse, false, word);
                 // In a table, deleting stops at the cell's edge: past it are
                 // pipes, which would break the row.
                 if let Some(text) = self.cell_text_range(doc, parse)
@@ -1538,17 +1562,13 @@ impl LiveView {
                 return self.delete(doc, start..sel.head, EditKind::Deleting);
             }
             Key::Delete => {
-                let end = self.step(doc, parse, true, cmd);
+                let end = self.step(doc, parse, true, word);
                 if let Some(text) = self.cell_text_range(doc, parse)
                     && end > text.end
                 {
                     return false;
                 }
                 return self.delete(doc, sel.head..end, EditKind::Deleting);
-            }
-            Key::Enter if cmd => return self.apply_plan(doc, commands::toggle_task(doc, sel)),
-            Key::X if cmd && shift => {
-                return self.apply_plan(doc, commands::toggle_wrap(doc, sel, "~~", &["~"]));
             }
             Key::Enter if shift => return self.apply_plan(doc, commands::hard_break(doc, sel)),
             Key::Enter => {
@@ -1563,35 +1583,16 @@ impl LiveView {
                 }
                 return !shift && self.replace_selection(doc, "    ", EditKind::Typing);
             }
-            Key::B if cmd => {
-                return self.apply_plan(doc, commands::toggle_wrap(doc, sel, "**", &["__"]));
-            }
-            Key::I if cmd => {
-                return self.apply_plan(doc, commands::toggle_wrap(doc, sel, "*", &["_"]));
-            }
-            Key::Backtick if cmd => {
-                return self.apply_plan(doc, commands::toggle_wrap(doc, sel, "`", &[]));
-            }
-            Key::K if cmd => return self.apply_plan(doc, commands::insert_link(doc, sel)),
-            _ if cmd && alt && commands::heading_level(key).is_some() => {
-                let level = commands::heading_level(key).expect("checked");
-                return self.apply_plan(doc, commands::set_heading(doc, sel, level));
-            }
-            Key::Z if cmd => return self.undo(doc, shift),
-            Key::Y if cmd => return self.undo(doc, true),
-            // Navigation.
             Key::ArrowLeft if !shift && !range.is_empty() => self.move_to(range.start, false),
             Key::ArrowRight if !shift && !range.is_empty() => self.move_to(range.end, false),
             Key::ArrowLeft | Key::ArrowRight => {
-                let target = self.step(doc, parse, key == Key::ArrowRight, cmd);
+                let target = self.step(doc, parse, key == Key::ArrowRight, word);
                 self.move_to(target, shift);
             }
             Key::ArrowUp => self.move_vertical(doc, parse, frame, -1.0, shift),
             Key::ArrowDown => self.move_vertical(doc, parse, frame, 1.0, shift),
             Key::PageUp => self.move_vertical(doc, parse, frame, -frame.rect.height(), shift),
             Key::PageDown => self.move_vertical(doc, parse, frame, frame.rect.height(), shift),
-            Key::Home if cmd => self.move_to(0, shift),
-            Key::End if cmd => self.move_to(doc.len(), shift),
             Key::Home => {
                 let (target, _) = self.row_edge(doc, parse, frame, false);
                 self.move_to(target, shift);
@@ -1601,16 +1602,111 @@ impl LiveView {
                 self.move_to(target, shift);
                 self.upstream_at = upstream.then_some(target);
             }
-            Key::A if cmd => {
-                self.selection = Selection {
-                    anchor: 0,
-                    head: doc.len(),
-                };
-            }
             Key::Escape if !range.is_empty() => self.move_to(sel.head, false),
             _ => {}
         }
         false
+    }
+
+    /// Runs a chord from the key table. `None` when a table action doesn't
+    /// apply, so the key falls through; `from_table` says that's why.
+    /// `Some` is whether the document changed (moving the caret does not).
+    fn run_editor_action(
+        &mut self,
+        doc: &mut Document,
+        parse: &ParseOutput,
+        action: Action,
+        extend: bool,
+        from_table: &mut bool,
+    ) -> Option<bool> {
+        if let Some(command) = tables::command(action) {
+            return match tables::run(doc, parse, self.selection.head, command) {
+                (Some(plan), _) => Some(self.apply_plan(doc, plan)),
+                (None, true) => Some(false),
+                (None, false) => {
+                    *from_table = true;
+                    None
+                }
+            };
+        }
+        let sel = self.selection;
+        let range = sel.range();
+        let head = sel.head;
+        if let Some(level) = action.heading_level() {
+            return Some(self.apply_plan(doc, commands::set_heading(doc, sel, level)));
+        }
+        match action {
+            Action::Undo => Some(self.undo(doc, false)),
+            Action::Redo => Some(self.undo(doc, true)),
+            Action::Bold => {
+                Some(self.apply_plan(doc, commands::toggle_wrap(doc, sel, "**", &["__"])))
+            }
+            Action::Italic => {
+                Some(self.apply_plan(doc, commands::toggle_wrap(doc, sel, "*", &["_"])))
+            }
+            Action::Code => Some(self.apply_plan(doc, commands::toggle_wrap(doc, sel, "`", &[]))),
+            Action::Strikethrough => {
+                Some(self.apply_plan(doc, commands::toggle_wrap(doc, sel, "~~", &["~"])))
+            }
+            Action::Link => Some(self.apply_plan(doc, commands::insert_link(doc, sel))),
+            Action::ToggleTask => Some(self.apply_plan(doc, commands::toggle_task(doc, sel))),
+            Action::SelectAll => {
+                self.selection = Selection {
+                    anchor: 0,
+                    head: doc.len(),
+                };
+                Some(false)
+            }
+            // Ctrl+Left with a selection collapses it, same as Left. The
+            // word jump waits until the caret is alone.
+            Action::WordLeft | Action::WordRight if !extend && !range.is_empty() => {
+                let at = if action == Action::WordLeft {
+                    range.start
+                } else {
+                    range.end
+                };
+                self.move_to(at, false);
+                Some(false)
+            }
+            Action::WordLeft => {
+                self.move_to(self.step(doc, parse, false, true), extend);
+                Some(false)
+            }
+            Action::WordRight => {
+                self.move_to(self.step(doc, parse, true, true), extend);
+                Some(false)
+            }
+            Action::DeleteWordLeft | Action::DeleteWordRight if !range.is_empty() => {
+                Some(self.delete(doc, range, EditKind::Deleting))
+            }
+            Action::DeleteWordLeft => {
+                let start = self.step(doc, parse, false, true);
+                if let Some(text) = self.cell_text_range(doc, parse)
+                    && start < text.start
+                {
+                    return Some(false);
+                }
+                Some(self.delete(doc, start..head, EditKind::Deleting))
+            }
+            Action::DeleteWordRight => {
+                let end = self.step(doc, parse, true, true);
+                if let Some(text) = self.cell_text_range(doc, parse)
+                    && end > text.end
+                {
+                    return Some(false);
+                }
+                Some(self.delete(doc, head..end, EditKind::Deleting))
+            }
+            Action::DocumentStart => {
+                self.move_to(0, extend);
+                Some(false)
+            }
+            Action::DocumentEnd => {
+                self.move_to(doc.len(), extend);
+                Some(false)
+            }
+            _ => None,
+        }
     }
 
     fn handle_pointer(

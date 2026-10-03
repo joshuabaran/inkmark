@@ -455,10 +455,7 @@ impl Default for KeyMap {
 
 impl KeyMap {
     pub fn builtin() -> Self {
-        let chords = Action::ALL
-            .into_iter()
-            .map(default_chords)
-            .collect();
+        let chords = Action::ALL.into_iter().map(default_chords).collect();
         Self { chords }
     }
 

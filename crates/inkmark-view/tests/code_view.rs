@@ -500,6 +500,25 @@ fn formatting_shortcuts_patch_the_source() {
 }
 
 #[test]
+fn extra_shift_does_not_bold_in_the_code_pane() {
+    // The old match was `Key::B if command`, so Ctrl+Shift+B bolded too.
+    let mut h = Harness::new("make this bold\n");
+    h.key(Key::ArrowRight, CMD);
+    h.press(Key::ArrowRight);
+    h.key(Key::ArrowRight, CMD.plus(SHIFT));
+    h.key(Key::B, CMD.plus(SHIFT));
+    assert_eq!(h.text(), "make this bold\n");
+    h.key(Key::B, CMD);
+    assert_eq!(h.text(), "make **this** bold\n");
+
+    let mut keys = inkmark_view::keys::KeyMap::builtin();
+    keys.set(inkmark_view::keys::Action::Bold, vec![]);
+    h.view.set_keys(keys);
+    h.key(Key::B, CMD);
+    assert_eq!(h.text(), "make **this** bold\n", "bold is unbound");
+}
+
+#[test]
 fn dragging_past_the_bottom_edge_scrolls_and_extends_the_selection() {
     let text: String = (0..400).map(|i| format!("line {i}\n")).collect();
     let mut h = Harness::new(&text);
