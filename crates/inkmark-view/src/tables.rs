@@ -10,7 +10,6 @@ use std::ops::Range;
 use egui::{Key, Modifiers};
 use inkmark_buffer::{Document, Edit, EditKind, Selection};
 use inkmark_parse::{BlockKind, ParseOutput};
-use unicode_width::UnicodeWidthStr;
 
 use crate::commands::EditPlan;
 
@@ -83,7 +82,11 @@ pub(crate) fn run(
     command: TableCommand,
 ) -> (Option<EditPlan>, bool) {
     match command {
-        TableCommand::Insert => (Some(insert_table(doc, offset)), true),
+        // In a table, the new one goes after it rather than splitting it.
+        TableCommand::Insert => {
+            let at = Table::at(doc, parse, offset).map_or(offset, |(t, _)| t.range.end);
+            (Some(insert_table(doc, at)), true)
+        }
         TableCommand::Edit(op) => {
             let in_table = Table::at(doc, parse, offset).is_some();
             (table_edit(doc, parse, offset, op), in_table)
@@ -123,13 +126,19 @@ impl Table {
     /// The table holding `offset`, and the cell the offset is in (the
     /// delimiter row counts as the header's).
     pub fn at(doc: &Document, parse: &ParseOutput, offset: usize) -> Option<(Self, Cell)> {
-        let block = parse.blocks.iter().find(|b| {
-            matches!(b.kind, BlockKind::Table { .. })
-                && b.range.start <= offset
-                && offset <= b.range.end
-        })?;
-        let first = doc.byte_to_line(block.range.start);
-        let last = doc.byte_to_line(block.range.end.saturating_sub(1).max(block.range.start));
+        // By line: the table's range ends after its last newline, which is
+        // the next line's start, and a container prefix before the table
+        // (`> `, a list marker) is on the table's line but not in its block.
+        let line = doc.byte_to_line(offset);
+        let lines = |b: &inkmark_parse::Block| {
+            doc.byte_to_line(b.range.start)
+                ..=doc.byte_to_line(b.range.end.saturating_sub(1).max(b.range.start))
+        };
+        let block = parse
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Table { .. }) && lines(b).contains(&line))?;
+        let (first, last) = lines(&block).into_inner();
         let range = doc.line_to_byte(first)..doc.line_range(last).end;
         let text = doc.slice(range.clone()).into_owned();
         let table = Self::parse(&text, range.clone())?;
@@ -139,7 +148,7 @@ impl Table {
         let line_text = text.lines().nth(line).unwrap_or_default();
         let line_start = text.lines().take(line).map(|l| l.len() + 1).sum::<usize>();
         let within = offset - range.start - line_start;
-        let prefix = prefix_len(line_text);
+        let prefix = prefix_len(line_text, line == 0);
         let col = if within <= prefix {
             0
         } else {
@@ -159,12 +168,16 @@ impl Table {
         }
         let prefixes = lines
             .iter()
-            .map(|l| l[..prefix_len(l)].to_owned())
+            .enumerate()
+            .map(|(i, l)| l[..prefix_len(l, i == 0)].to_owned())
             .collect();
-        let cells = |l: &str| split_cells(&l[prefix_len(l)..]);
-        let aligns: Vec<Align> = cells(lines[1]).iter().map(|c| parse_align(c)).collect();
-        let mut rows = vec![cells(lines[0])];
-        rows.extend(lines[2..].iter().map(|l| cells(l)));
+        let cells = |l: &str, first: bool| split_cells(&l[prefix_len(l, first)..]);
+        let aligns: Vec<Align> = cells(lines[1], false)
+            .iter()
+            .map(|c| parse_align(c))
+            .collect();
+        let mut rows = vec![cells(lines[0], true)];
+        rows.extend(lines[2..].iter().map(|l| cells(l, false)));
         let table = Self {
             range,
             prefixes,
@@ -198,8 +211,13 @@ impl Table {
                     row + 1
                 };
                 self.rows.insert(at, vec![String::new(); cols]);
-                let prefix = self.prefixes.last().cloned().unwrap_or_default();
-                self.prefixes.push(prefix);
+                // The new line copies the prefix of the row it's next to (the
+                // delimiter's under the header: the header's may hold a list
+                // marker), at its own place among the lines.
+                let source = if row == 0 { 1 } else { row + 1 };
+                let prefix = self.prefixes.get(source).cloned().unwrap_or_default();
+                let line = (at + 1).min(self.prefixes.len());
+                self.prefixes.insert(line, prefix);
                 Some((at, col))
             }
             TableOp::InsertColumnLeft | TableOp::InsertColumnRight => {
@@ -221,7 +239,9 @@ impl Table {
             TableOp::DeleteRow if row == 0 => None,
             TableOp::DeleteRow => {
                 self.rows.remove(row);
-                self.prefixes.pop();
+                if row + 1 < self.prefixes.len() {
+                    self.prefixes.remove(row + 1);
+                }
                 Some((row.min(self.rows.len() - 1), col))
             }
             TableOp::DeleteColumn if cols == 1 => None,
@@ -276,16 +296,28 @@ impl Table {
     /// (offsets into the text, by row and column).
     fn render(&self) -> (String, Vec<Vec<usize>>) {
         let cols = self.columns();
-        let width = |c: usize| {
-            self.rows
+        let line_of = |row: usize| if row == 0 { 0 } else { row + 1 };
+        // Column widths, left to right: a cell with a tab is as wide as the
+        // tab stops it crosses, which depend on where the column starts.
+        let mut widths: Vec<usize> = Vec::with_capacity(cols);
+        for c in 0..cols {
+            let w = self
+                .rows
                 .iter()
-                .filter_map(|r| r.get(c))
-                .map(|s| s.width())
+                .enumerate()
+                .filter_map(|(r, cells)| {
+                    let prefix = self
+                        .prefixes
+                        .get(line_of(r))
+                        .map_or(0, |p| text_width(p, 0));
+                    let start = prefix + 2 + widths.iter().map(|w| w + 3).sum::<usize>();
+                    cells.get(c).map(|s| text_width(s, start))
+                })
                 .max()
                 .unwrap_or(0)
-                .max(3)
-        };
-        let widths: Vec<usize> = (0..cols).map(width).collect();
+                .max(3);
+            widths.push(w);
+        }
         let align = |c: usize| self.aligns.get(c).copied().unwrap_or(Align::None);
         let mut out = String::new();
         let mut starts = Vec::new();
@@ -313,9 +345,14 @@ impl Table {
             let mut row_starts = Vec::new();
             for c in 0..cells.len().max(cols) {
                 let text = cells.get(c).map(String::as_str).unwrap_or("");
-                let w = widths.get(c).copied().unwrap_or_else(|| text.width());
-                let pad = w.saturating_sub(text.width());
+                let start = text_width(&out[out.rfind('\n').map_or(0, |i| i + 1)..], 0) + 1;
+                let width = text_width(text, start);
+                let w = widths.get(c).copied().unwrap_or(width);
+                let pad = w.saturating_sub(width);
+                // Padding before a tab would move its tab stop: cells with
+                // tabs are padded after.
                 let (before, after) = match align(c) {
+                    _ if text.contains('\t') => (0, pad),
                     Align::Right => (pad, 0),
                     Align::Center => (pad / 2, pad - pad / 2),
                     Align::None | Align::Left => (0, pad),
@@ -457,7 +494,7 @@ fn cell_offset(doc: &Document, table: &Table, (row, col): Cell, offset: usize) -
     // Find this cell's text on its source line, then the offset within it.
     let line_range = doc.line_range(line);
     let source = doc.slice(line_range.clone()).into_owned();
-    let prefix = prefix_len(&source);
+    let prefix = prefix_len(&source, row == 0);
     let Some(span) = cell_spans(&source[prefix..]).into_iter().nth(col) else {
         return 0;
     };
@@ -467,20 +504,62 @@ fn cell_offset(doc: &Document, table: &Table, (row, col): Cell, offset: usize) -
     offset.saturating_sub(text_start).min(text.len())
 }
 
-/// `> `, `>> `, indentation: the container markup before a table line.
-fn prefix_len(line: &str) -> usize {
-    let mut i = 0;
+/// The container markup before a table line: `> `, indentation, and on
+/// the table's first line a list marker (`- `, `1. `, `- [x] `) for a table
+/// that starts a list item.
+fn prefix_len(line: &str, first: bool) -> usize {
     let bytes = line.as_bytes();
-    loop {
+    let spaces = |mut i: usize| {
         while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
             i += 1;
         }
-        if i < bytes.len() && bytes[i] == b'>' {
-            i += 1;
-            continue;
-        }
+        i
+    };
+    let mut i = spaces(0);
+    while i < bytes.len() && bytes[i] == b'>' {
+        i = spaces(i + 1);
+    }
+    if !first {
         return i;
     }
+    // A list marker needs a space after it, so `-` alone isn't one.
+    let digits = bytes[i..].iter().take_while(|b| b.is_ascii_digit()).count();
+    let marker = match bytes.get(i) {
+        Some(b'-' | b'*' | b'+') => 1,
+        _ if (1..=9).contains(&digits) && matches!(bytes.get(i + digits), Some(b'.' | b')')) => {
+            digits + 1
+        }
+        _ => 0,
+    };
+    if marker == 0 || !matches!(bytes.get(i + marker), Some(b' ' | b'\t')) {
+        return i;
+    }
+    i = spaces(i + marker);
+    // A task box after the marker.
+    if bytes.len() >= i + 3
+        && bytes[i] == b'['
+        && matches!(bytes[i + 1], b' ' | b'x' | b'X')
+        && bytes[i + 2] == b']'
+        && matches!(bytes.get(i + 3), Some(b' ' | b'\t'))
+    {
+        i = spaces(i + 3);
+    }
+    i
+}
+
+/// Columns `s` takes when it starts at column `start`: CJK counts double,
+/// combining marks nothing, and a tab runs to the next stop (every 4
+/// columns, as the panes lay tabs out).
+fn text_width(s: &str, start: usize) -> usize {
+    const TAB: usize = 4;
+    let mut col = start;
+    for c in s.chars() {
+        col += match c {
+            '\t' => TAB - col % TAB,
+            c => unicode_width::UnicodeWidthChar::width(c).unwrap_or(0),
+        };
+    }
+    col - start
 }
 
 /// Unescaped `|` in `s`.
@@ -725,5 +804,115 @@ mod tests {
         out.replace_range(plan.edits[0].range.clone(), &plan.edits[0].insert);
         assert!(out.starts_with("Intro.\n\n| Column 1 |"), "{out}");
         assert!(out.ends_with("|\n\nEnd.\n"), "{out}");
+    }
+
+    /// Display columns of every `|` on each line, tabs expanded from the
+    /// line's start (to check the pipes line up).
+    fn pipe_columns(text: &str) -> Vec<Vec<usize>> {
+        text.lines()
+            .map(|l| {
+                let mut col = 0;
+                let mut out = Vec::new();
+                for c in l.chars() {
+                    if c == '|' {
+                        out.push(col);
+                    }
+                    col += if c == '\t' { 4 - col % 4 } else { 1 };
+                }
+                out
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_line_after_a_table_is_outside_it() {
+        // Review of #32: the table's range ends at the next line's start.
+        let src = "| a | b |\n|---|---|\n| c | d |\n\nAfter.\n";
+        let doc = Document::from_text(src);
+        let parse = GfmParser.parse(src);
+        let blank = src.find("\n\n").unwrap() + 1;
+        assert!(Table::at(&doc, &parse, blank).is_none());
+        assert!(
+            Table::at(&doc, &parse, blank - 1).is_some(),
+            "the end of the last cell is in"
+        );
+        // Without a final newline, the end of the file is still in the table.
+        let src = "| a | b |\n|---|---|\n| c | d |";
+        let doc = Document::from_text(src);
+        let parse = GfmParser.parse(src);
+        assert!(Table::at(&doc, &parse, src.len()).is_some());
+    }
+
+    #[test]
+    fn a_table_starting_a_list_item_keeps_its_marker() {
+        // Review of #32: the marker isn't a cell.
+        for (src, want) in [
+            (
+                "- | a | b |\n  |---|---|\n  | c | d |\n",
+                "- | a   | b   |\n  | --- | --- |\n  | c   | d   |\n",
+            ),
+            (
+                "1. | a | b |\n   |---|---|\n   | c | d |\n",
+                "1. | a   | b   |\n   | --- | --- |\n   | c   | d   |\n",
+            ),
+            (
+                "> - | a | b |\n>   |---|---|\n>   | c | d |\n",
+                "> - | a   | b   |\n>   | --- | --- |\n>   | c   | d   |\n",
+            ),
+        ] {
+            let (out, _) = run(src, "| c", TableOp::Format).unwrap();
+            assert_eq!(out, want);
+            assert_eq!(cells(&out), cells(src), "{src:?}");
+            let parse = GfmParser.parse(&out);
+            assert!(
+                parse.blocks.iter().any(|b| b.kind == BlockKind::Item),
+                "still a list item: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rows_keep_their_own_indentation() {
+        // Review of #32: prefixes belong to lines.
+        let src = "| a | b |\n|---|---|\n| c | d |\n  | e | f |\n";
+        let (out, _) = run(src, "| c", TableOp::DeleteRow).unwrap();
+        assert!(out.ends_with("\n  | e   | f   |\n"), "{out:?}");
+        let (out, _) = run(src, "| c", TableOp::InsertRowBelow).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(
+            lines[3].starts_with("| "),
+            "the new row copies c's: {out:?}"
+        );
+        assert!(lines[4].starts_with("  | e"), "e keeps its indent: {out:?}");
+    }
+
+    #[test]
+    fn inserting_a_table_in_a_table_puts_it_after() {
+        // Review of #32: not in between its rows.
+        let doc = Document::from_text(T);
+        let parse = GfmParser.parse(T);
+        let (plan, _) = run_command(&doc, &parse, 2);
+        let mut out = T.to_owned();
+        out.replace_range(plan.edits[0].range.clone(), &plan.edits[0].insert);
+        assert!(out.starts_with(T.trim_end()), "{out}");
+        assert_eq!(cells(&out), cells(T), "the first table is whole");
+        assert!(out.contains("\n\n| Column 1 |"), "{out}");
+    }
+
+    fn run_command(doc: &Document, parse: &ParseOutput, at: usize) -> (EditPlan, bool) {
+        let (plan, in_table) = super::run(doc, parse, at, TableCommand::Insert);
+        (plan.unwrap(), in_table)
+    }
+
+    #[test]
+    fn cells_with_tabs_line_up_at_their_tab_stops() {
+        // Review of #32: a tab is as wide as the stops it crosses.
+        // `ab<tab>c` from column 2: the tab runs to column 8, so the cell
+        // is 7 wide, not the 4 its characters count.
+        let src = "| ab\tc | x |\n|---|---|\n| ddddd | e |\n";
+        let (out, _) = run(src, "| d", TableOp::Format).unwrap();
+        let cols = pipe_columns(&out);
+        assert!(cols.windows(2).all(|w| w[0] == w[1]), "{out:?} {cols:?}");
+        assert!(out.contains("ab\tc"), "the tab is kept: {out:?}");
     }
 }

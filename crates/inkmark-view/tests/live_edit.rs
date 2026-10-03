@@ -950,3 +950,44 @@ fn table_shortcuts_work_in_the_code_pane_too() {
 fn tables_row(text: &str, at: usize) -> bool {
     text[..at].matches('\n').count() >= 2 && text[at..].contains("After.")
 }
+
+#[test]
+fn a_quoted_table_is_re_padded_on_leaving() {
+    // Review of #32: the visit was keyed by an offset before the block.
+    let src = "> | a | b |\n> |---|---|\n> | c | d |\n\nAfter.\n";
+    let mut s = Split::new(src);
+    s.caret(src.find('c').unwrap() + 1);
+    s.type_text("ell");
+    s.key(Key::End, Modifiers::COMMAND);
+    assert_eq!(
+        s.text(),
+        "> | a    | b   |\n> | ---- | --- |\n> | cell | d   |\n\nAfter.\n"
+    );
+}
+
+#[test]
+fn editing_a_table_in_the_code_pane_doesnt_re_pad_it() {
+    // Review of #32: the live pane re-pads only what it edited itself.
+    let mut s = Split::new(TABLE);
+    s.code.request_focus(&s.ctx);
+    // As the app does in split mode: the live pane mirrors the code caret.
+    let frame = |s: &mut Split, events: Vec<Event>| {
+        s.frame(events);
+        s.live.mirror_selection(s.code.selection());
+    };
+    s.code
+        .set_selection(Selection::caret(TABLE.find('c').unwrap() + 1));
+    // Two frames: the live pane sees the caret (mirrored) in the table
+    // before the code pane edits it.
+    frame(&mut s, vec![]);
+    frame(&mut s, vec![]);
+    frame(&mut s, vec![Event::Text("ell".into())]);
+    s.code.set_selection(Selection::caret(0));
+    for _ in 0..3 {
+        frame(
+            &mut s,
+            vec![Event::PointerMoved(pos2(LIVE_X + 50.0, 300.0))],
+        );
+    }
+    assert_eq!(s.text(), TABLE.replace("| c |", "| cell |"));
+}

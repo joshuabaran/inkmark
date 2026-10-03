@@ -1275,6 +1275,12 @@ impl LiveView {
     /// undone don't count) and re-pads that table, as an undo step of its
     /// own. A table only moved through is left as it is.
     fn repad_left_table(&mut self, doc: &mut Document, state: &mut ParseState) {
+        // Only while this pane has the keyboard: a caret mirrored from the
+        // code pane, and edits made there, aren't the live pane's.
+        if !self.focused {
+            self.table_visit = None;
+            return;
+        }
         let parse = state.output();
         let here = tables::table_start(doc, parse, self.selection.head);
         let visit = self.table_visit.take();
