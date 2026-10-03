@@ -427,9 +427,9 @@ Decided 2026-10-03.
 
 **Slices:** TB1 a table model and its operations as pure source edits (`tables.rs`), tested by parsing the result; TB2 the live pane: re-pad on leaving, the right-click menu, shortcuts in both panes; TB3 inserting a new table.
 
-### Cleanup (next)
+### Cleanup
 
-Small items left from earlier rounds. Decided 2026-10-03:
+Small items left from earlier rounds, done 2026-10-03 on branch `cleanup`. Decided 2026-10-03:
 
 - **Wide characters in the code pane** take exactly two monospace cells (box drawing and symbols already snap to one), so mixed CJK and Latin columns line up.
 - **SVG images** render in the live pane like the other formats.
@@ -437,7 +437,7 @@ Small items left from earlier rounds. Decided 2026-10-03:
 - **Alt+Right** goes forward again after Alt+Left.
 - **Links to non-Markdown files** open in the default app (`xdg-open`) only for an allowlist of safe types: images, PDF, plain text, audio, video, office documents. Anything else (scripts, `.desktop`, unknown types), and any file with an executable bit, is refused with a status-bar message.
 
-### Configurable key bindings (after cleanup)
+### Configurable key bindings (next)
 
 Every shortcut can be rebound. Proposed 2026-10-03, to confirm when the round starts:
 

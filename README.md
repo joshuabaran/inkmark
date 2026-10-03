@@ -115,7 +115,7 @@ inkmark               # browses the current directory and shows recent files
 | Ctrl+N | New Markdown file in the selected folder, or the folder you have open |
 | F2, Delete (sidebar) | Rename, or move to the trash, the selected file or folder |
 | Ctrl+click | Follow a link: a note, `#heading`, footnote, or web page |
-| Alt+Left | Back to where you followed the last link from |
+| Alt+Left, Alt+Right | Back to where you followed the last link from, and forward again |
 | Ctrl+R | Recent files |
 | Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y | Undo, redo (shared by both panes) |
 | Ctrl+B, Ctrl+I, Ctrl+\` | Toggle bold, italic, code |
@@ -170,7 +170,9 @@ Ctrl+click follows a link in either pane. Links to other Markdown files
 (relative to the open file) open them, through the usual unsaved-changes
 prompt; `#heading` jumps by GitHub's anchor rules; a footnote reference
 jumps to its note; `http`, `https` and `mailto` links open in your
-default app. Other links aren't opened; the status bar says why.
+default app, and so do links to images, PDFs, plain text, audio, video
+and office documents. Anything else (scripts, `.desktop` files, any file
+marked executable) isn't opened; the status bar says why.
 
 inkmark keeps your line endings (LF/CRLF) and byte-order mark, saves
 atomically, and never overwrites changes made by other programs without

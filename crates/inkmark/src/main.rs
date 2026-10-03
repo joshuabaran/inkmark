@@ -44,6 +44,7 @@ const TOGGLE_BROWSER: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::E);
 const NEW_FILE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
 const BACK: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowLeft);
+const FORWARD: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowRight);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -228,6 +229,8 @@ struct App {
     hint: Option<(String, Instant)>,
     /// Where followed links were clicked, most recent last (Alt+Left).
     back: Vec<Place>,
+    /// Places gone back from, most recent last (Alt+Right).
+    forward: Vec<Place>,
     /// Where to put the caret once the file being opened has been parsed.
     pending_jump: Option<(PathBuf, Jump)>,
     /// Tests record URLs here instead of starting a browser.
@@ -309,6 +312,7 @@ impl App {
             error: None,
             hint: None,
             back: Vec::new(),
+            forward: Vec::new(),
             pending_jump: None,
             #[cfg(test)]
             opened_urls: Vec::new(),
@@ -713,7 +717,7 @@ impl App {
         } else if live {
             self.focus_pane(ctx, Pane::Live);
         }
-        let (open_folder, save_as, save, open, new_file, back) = ctx.input_mut(|i| {
+        let (open_folder, save_as, save, open, new_file, back, forward) = ctx.input_mut(|i| {
             (
                 // Ctrl+Shift+O before Ctrl+O: extra Shift still matches Open.
                 i.consume_shortcut(&OPEN_FOLDER),
@@ -724,10 +728,14 @@ impl App {
                 // Exactly Alt+Left: egui's shortcut matching would also
                 // take Alt+Shift+Left, which moves a table column.
                 consume_exact(i, BACK.modifiers, BACK.logical_key),
+                consume_exact(i, FORWARD.modifiers, FORWARD.logical_key),
             )
         });
         if back {
             self.go_back();
+        }
+        if forward {
+            self.go_forward();
         }
         if open_folder {
             self.spawn_dialog(DialogKind::Folder);
@@ -1165,7 +1173,7 @@ impl App {
                 };
             }
         };
-        for place in &mut self.back {
+        for place in self.back.iter_mut().chain(self.forward.iter_mut()) {
             if let Some(path) = &mut place.path {
                 follow(path);
             }
@@ -1328,7 +1336,7 @@ impl App {
             inkmark_parse::Link::Footnote(label) => {
                 match inkmark_parse::footnote_offset(&self.doc, self.parse.output(), &label) {
                     Some(offset) => {
-                        self.back.push(here);
+                        self.remember(here);
                         self.jump_to(offset);
                     }
                     None => self.show_hint(format!("No note [^{label}] in this file")),
@@ -1344,21 +1352,24 @@ impl App {
             .map_or_else(|| self.browser.root().to_path_buf(), Path::to_path_buf);
         match links::resolve(&dest, &base) {
             links::Target::External(url) => self.open_external(url),
+            links::Target::Document(path) => {
+                self.open_external(path.to_string_lossy().into_owned());
+            }
             links::Target::Anchor(anchor) => {
                 if self.jump_to_anchor(&anchor) {
-                    self.back.push(here);
+                    self.remember(here);
                 }
             }
             links::Target::File { path, anchor } if Some(path.as_path()) == self.doc.path() => {
                 if anchor.is_none_or(|a| self.jump_to_anchor(&a)) {
-                    self.back.push(here);
+                    self.remember(here);
                 }
             }
             links::Target::File { path, .. } if !path.exists() => {
                 self.show_hint(format!("{} doesn't exist", display_name(&path)));
             }
             links::Target::File { path, anchor } => {
-                self.back.push(here);
+                self.remember(here);
                 self.pending_jump = anchor.map(|a| (path.clone(), Jump::Anchor(a)));
                 self.request_open(path);
             }
@@ -1366,11 +1377,42 @@ impl App {
         }
     }
 
+    /// Where the caret is now, as a place to come back to.
+    fn here(&self) -> Place {
+        Place {
+            path: self.doc.path().map(Path::to_path_buf),
+            offset: self.selection().head,
+        }
+    }
+
+    /// Records `here` before following a link: a new path forward, so the
+    /// places gone back from are dropped.
+    fn remember(&mut self, here: Place) {
+        self.back.push(here);
+        self.forward.clear();
+    }
+
     /// Alt+Left: back to where the last followed link was clicked.
     fn go_back(&mut self) {
         let Some(place) = self.back.pop() else {
             return;
         };
+        let here = self.here();
+        self.forward.push(here);
+        self.go_to(place);
+    }
+
+    /// Alt+Right: forward again to where Alt+Left came from.
+    fn go_forward(&mut self) {
+        let Some(place) = self.forward.pop() else {
+            return;
+        };
+        let here = self.here();
+        self.back.push(here);
+        self.go_to(place);
+    }
+
+    fn go_to(&mut self, place: Place) {
         match place.path {
             // Gone since (deleted, or moved by another program): say so
             // rather than open an empty new file in its place.
@@ -3238,5 +3280,53 @@ mod tests {
         );
         assert_eq!(r.app.back.len(), 1, "Back wasn't taken");
         assert!(text(&r.app).contains("| d   | c   |"), "{}", text(&r.app));
+    }
+
+    #[test]
+    fn alt_right_goes_forward_again_until_a_new_link_is_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "Claim[^1] and[^2].\n\n[^1]: One.\n\n[^2]: Two.\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a));
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        app.jump_to(2);
+        app.follow(offset_of(&app, "[^1]"));
+        let note = offset_of(&app, "One.");
+        assert_eq!(app.selection().head, note);
+        let alt = |key| shortcut(key, egui::Modifiers::ALT);
+        drive(&ctx, &mut app, &mut time, vec![alt(egui::Key::ArrowLeft)]);
+        assert_eq!(app.selection().head, 2);
+        drive(&ctx, &mut app, &mut time, vec![alt(egui::Key::ArrowRight)]);
+        assert_eq!(app.selection().head, note, "forward to the note again");
+        drive(&ctx, &mut app, &mut time, vec![alt(egui::Key::ArrowLeft)]);
+        // Following another link drops the way forward.
+        app.follow(offset_of(&app, "[^2]"));
+        assert!(app.forward.is_empty());
+        drive(&ctx, &mut app, &mut time, vec![alt(egui::Key::ArrowRight)]);
+        assert_eq!(app.selection().head, offset_of(&app, "Two."));
+    }
+
+    #[test]
+    fn a_link_to_a_safe_document_opens_in_the_default_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "[chart](chart.pdf) [tool](tool.sh)\n").unwrap();
+        fs::write(dir.path().join("chart.pdf"), "").unwrap();
+        fs::write(dir.path().join("tool.sh"), "").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        app.follow(offset_of(&app, "chart"));
+        assert_eq!(
+            app.opened_urls,
+            vec![dir.path().join("chart.pdf").display().to_string()]
+        );
+        app.follow(offset_of(&app, "tool"));
+        assert_eq!(app.opened_urls.len(), 1, "a script isn't opened");
+        assert!(app.hint.as_ref().unwrap().0.contains("tool.sh"));
+        assert_eq!(app.doc.path(), Some(a.as_path()));
     }
 }
