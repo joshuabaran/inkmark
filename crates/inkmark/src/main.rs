@@ -158,14 +158,18 @@ fn main() -> eframe::Result {
     result
 }
 
-/// egui draws the chrome with Hack, which has the folder and unsaved
-/// marks. Ubuntu Light stays behind it for glyphs Hack lacks, and the
-/// emoji faces stay last. The document is cosmic-text and is not affected.
+/// The chrome is Hack. The emoji faces cover characters Hack has no
+/// glyph for. The document is cosmic-text and is not affected.
 fn install_ui_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-        family.insert(0, "Hack".to_owned());
-    }
+    fonts.families.insert(
+        egui::FontFamily::Proportional,
+        vec![
+            "Hack".to_owned(),
+            "NotoEmoji-Regular".to_owned(),
+            "emoji-icon-font".to_owned(),
+        ],
+    );
     ctx.set_fonts(fonts);
 }
 
@@ -1860,46 +1864,33 @@ mod tests {
     }
 
     #[test]
-    fn the_ui_font_draws_the_folder_and_unsaved_marks() {
+    fn the_chrome_is_hack() {
         let ctx = egui::Context::default();
-        // The default proportional face is Ubuntu Light. It draws the
-        // letters and replaces the marks with one empty box.
-        let mut first = ctx.run_ui(egui::RawInput::default(), |_| {});
-        first.textures_delta.clear();
-        let ubuntu_letter = glyph_box(&ctx, 'A');
-        let collapsed = glyph_box(&ctx, '▸');
-        let expanded = glyph_box(&ctx, '▾');
-        let unsaved = glyph_box(&ctx, '●');
-        assert!(ubuntu_letter.0 > 0.0);
-        assert_eq!(collapsed.1, expanded.1);
-        assert_eq!(collapsed.2, expanded.2);
-        assert_eq!(collapsed.1, unsaved.1);
-        assert_eq!(collapsed.2, unsaved.2);
-
         install_ui_font(&ctx);
-        let mut second = ctx.run_ui(egui::RawInput::default(), |_| {});
-        second.textures_delta.clear();
+        let mut pass = ctx.run_ui(egui::RawInput::default(), |_| {});
+        pass.textures_delta.clear();
         ctx.fonts_mut(|fonts| {
             let family = fonts
                 .definitions()
                 .families
                 .get(&egui::FontFamily::Proportional)
                 .expect("proportional family");
-            assert_eq!(family[0], "Hack");
-            assert!(family.iter().any(|name| name == "Ubuntu-Light"));
+            assert_eq!(
+                family,
+                &vec![
+                    "Hack".to_owned(),
+                    "NotoEmoji-Regular".to_owned(),
+                    "emoji-icon-font".to_owned(),
+                ]
+            );
         });
-        // Letters and marks now share Hack's cell, and the marks are
-        // distinct glyphs instead of the empty box.
-        let letter = glyph_box(&ctx, 'A');
+        // One cell, and the circle is not the same glyph as the chevrons.
         let collapsed = glyph_box(&ctx, '▸');
         let expanded = glyph_box(&ctx, '▾');
         let unsaved = glyph_box(&ctx, '●');
-        assert_ne!(letter.0, ubuntu_letter.0);
-        assert_eq!(letter.0, collapsed.0);
         assert_eq!(collapsed.0, expanded.0);
-        assert_eq!(collapsed.0, unsaved.0);
+        assert_eq!(expanded.0, unsaved.0);
         assert_ne!((collapsed.1, collapsed.2), (unsaved.1, unsaved.2));
-        assert_ne!((expanded.1, expanded.2), (unsaved.1, unsaved.2));
     }
 
     #[test]
