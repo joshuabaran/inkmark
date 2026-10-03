@@ -1,6 +1,8 @@
 //! The find bar. Its fields hold the query and the replacement; the
 //! document stays in the rope.
 
+use std::ops::Range;
+
 use eframe::egui::{self, Key, Modifiers, RichText, TextEdit};
 use inkmark_buffer::find::{Finder, SearchOptions};
 use inkmark_buffer::{Document, Selection};
@@ -11,6 +13,10 @@ const REPLACE: &str = "find_replace";
 
 /// A selection copied into the query has to stay a single short line.
 const MAX_SEED: usize = 256;
+
+/// Past this many matches the list is dropped. A pattern that hits on
+/// every byte is counted, and each step searches again.
+const MATCH_LIST_LIMIT: usize = 50_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
@@ -50,6 +56,12 @@ pub struct FindBar {
     /// Re-run the search even when the query text is unchanged.
     force: bool,
     finder: Option<Finder>,
+    matches: Vec<Range<usize>>,
+    matches_epoch: u64,
+    matches_complete: bool,
+    matches_ready: bool,
+    /// The match `index` refers to. Cleared when the document changes.
+    indexed: Option<Range<usize>>,
     count: usize,
     index: Option<usize>,
 }
@@ -81,16 +93,11 @@ impl FindBar {
 
     /// Recounts after an undo or redo that happened outside the bar.
     pub fn sync_count(&mut self, doc: &Document, selection: Selection) {
-        let Some(finder) = &self.finder else {
-            self.count = 0;
-            self.index = None;
-            return;
-        };
+        self.matches_ready = false;
+        self.refresh(doc);
         let range = selection.range();
-        let current = finder.covers(doc.rope(), &range).then_some(range);
-        let (count, index) = finder.census(doc.rope(), current.as_ref());
-        self.count = count;
-        self.index = index;
+        self.index = self.index_of(doc, &range);
+        self.indexed = self.index.is_some().then_some(range);
     }
 
     /// Opens the bar. A short single-line selection becomes the query when
@@ -166,7 +173,7 @@ impl FindBar {
             };
         }
 
-        let mut command = if query_focused && enter {
+        let command = if query_focused && enter {
             Command::Next
         } else if shift_enter {
             Command::Prev
@@ -210,13 +217,14 @@ impl FindBar {
             selection_out = self.goto_prev(doc, working);
         }
 
+        let mut button = Command::None;
         ui.horizontal(|ui| {
             ui.label(self.label());
             if ui.button("Previous").clicked() {
-                command = Command::Prev;
+                button = Command::Prev;
             }
             if ui.button("Next").clicked() {
-                command = Command::Next;
+                button = Command::Next;
             }
             ui.label("Replace");
             TextEdit::singleline(&mut self.replacement)
@@ -224,10 +232,10 @@ impl FindBar {
                 .desired_width(280.0)
                 .show(ui);
             if ui.button("Replace one").clicked() {
-                command = Command::ReplaceOne;
+                button = Command::ReplaceOne;
             }
             if ui.button("Replace all").clicked() {
-                command = Command::ReplaceAll;
+                button = Command::ReplaceAll;
             }
         });
         if let Some(error) = &self.error {
@@ -235,13 +243,14 @@ impl FindBar {
         }
         self.focus_pending(ui);
 
-        // Buttons are reported as the row is drawn, so they apply after it.
+        // A click still moves when this frame's re-search already selected
+        // a match. The key handled above is not applied twice.
         let working = selection_out.unwrap_or(selection);
-        match command {
-            Command::Next if selection_out.is_none() => {
+        match button {
+            Command::Next if command != Command::Next => {
                 selection_out = self.goto_next(doc, working);
             }
-            Command::Prev if selection_out.is_none() => {
+            Command::Prev if command != Command::Prev => {
                 selection_out = self.goto_prev(doc, working);
             }
             Command::ReplaceOne => selection_out = self.replace_one(doc, working),
@@ -257,49 +266,46 @@ impl FindBar {
     /// F3, including while the bar is closed.
     pub fn goto_next(&mut self, doc: &Document, selection: Selection) -> Option<Selection> {
         self.ensure(doc);
-        let found = {
-            let finder = self.finder.as_ref()?;
-            let range = selection.range();
-            let from = if finder.covers(doc.rope(), &range) {
-                step_past(doc, &range)
-            } else {
-                range.start
-            };
-            finder.next(doc.rope(), from).or_else(|| {
-                if from > 0 {
-                    finder.next(doc.rope(), 0)
-                } else {
-                    None
-                }
-            })
+        self.refresh(doc);
+        self.finder.as_ref()?;
+        let range = selection.range();
+        let on_match = self.indexed.as_ref() == Some(&range) || self.contains(doc, &range);
+        let from = if on_match {
+            step_past(doc, &range)
+        } else {
+            range.start
         };
-        self.note(doc, found)
+        let mut found = self.locate_next(doc, from);
+        let mut wrapped = false;
+        if found.is_none() && from > 0 {
+            found = self.locate_next(doc, 0);
+            wrapped = found.is_some();
+        }
+        self.moved(doc, &range, found, true, wrapped)
     }
 
     /// Shift+F3.
     pub fn goto_prev(&mut self, doc: &Document, selection: Selection) -> Option<Selection> {
         self.ensure(doc);
-        let found = {
-            let finder = self.finder.as_ref()?;
-            let range = selection.range();
-            let before = if finder.covers(doc.rope(), &range) {
-                range.start
-            } else {
-                range.end
-            };
-            finder
-                .prev(doc.rope(), before)
-                .or_else(|| finder.last(doc.rope()))
-        };
-        self.note(doc, found)
+        self.refresh(doc);
+        self.finder.as_ref()?;
+        let range = selection.range();
+        let on_match = self.indexed.as_ref() == Some(&range) || self.contains(doc, &range);
+        let before = if on_match { range.start } else { range.end };
+        let mut found = self.locate_prev(doc, before);
+        let mut wrapped = false;
+        if found.is_none() && self.count > 0 {
+            found = self.locate_last(doc);
+            wrapped = found.is_some();
+        }
+        self.moved(doc, &range, found, false, wrapped)
     }
 
     fn research(&mut self, doc: &Document) -> Option<Selection> {
         if self.query.is_empty() {
             self.finder = None;
             self.error = None;
-            self.count = 0;
-            self.index = None;
+            self.clear_matches();
             return None;
         }
         let finder = match Finder::compile(&self.query, self.options()) {
@@ -307,18 +313,19 @@ impl FindBar {
             Err(error) => {
                 self.finder = None;
                 self.error = Some(error);
-                self.count = 0;
-                self.index = None;
+                self.clear_matches();
                 return None;
             }
         };
         self.error = None;
-        let found = finder.next(doc.rope(), self.origin.min(doc.len()));
-        let (count, index) = finder.census(doc.rope(), found.as_ref());
-        self.count = count;
-        self.index = index;
+        let origin = self.origin.min(doc.len());
+        let list = finder.collect_matches(doc.rope(), MATCH_LIST_LIMIT, origin);
+        let probed = list.probed.clone();
         self.finder = Some(finder);
-        found.map(selection_of)
+        self.install(doc, list);
+        self.index = probed.as_ref().map(|(_, index)| *index);
+        self.indexed = probed.as_ref().map(|(range, _)| range.clone());
+        probed.map(|(range, _)| selection_of(range))
     }
 
     fn replace_one(&mut self, doc: &mut Document, selection: Selection) -> Option<Selection> {
@@ -375,20 +382,117 @@ impl FindBar {
     }
 
     fn recount(&mut self, doc: &Document) {
-        if let Some(finder) = &self.finder {
-            let (count, _) = finder.census(doc.rope(), None);
-            self.count = count;
+        self.matches_ready = false;
+        self.refresh(doc);
+        self.index = None;
+        self.indexed = None;
+    }
+
+    fn clear_matches(&mut self) {
+        self.matches.clear();
+        self.matches_complete = false;
+        self.matches_ready = false;
+        self.indexed = None;
+        self.count = 0;
+        self.index = None;
+    }
+
+    fn install(&mut self, doc: &Document, list: inkmark_buffer::find::MatchList) {
+        self.count = list.count;
+        self.matches = list.matches;
+        self.matches_complete = list.complete;
+        self.matches_epoch = doc.epoch();
+        self.matches_ready = true;
+    }
+
+    /// Rebuilds the match list when the document has changed.
+    fn refresh(&mut self, doc: &Document) {
+        let Some(finder) = self.finder.as_ref() else {
+            self.clear_matches();
+            return;
+        };
+        if self.matches_ready && self.matches_epoch == doc.epoch() {
+            return;
+        }
+        let had = self.matches_ready;
+        let list = finder.collect_matches(doc.rope(), MATCH_LIST_LIMIT, 0);
+        self.install(doc, list);
+        if had {
             self.index = None;
+            self.indexed = None;
         }
     }
 
-    fn note(&mut self, doc: &Document, found: Option<std::ops::Range<usize>>) -> Option<Selection> {
-        if let Some(finder) = &self.finder {
-            let (count, index) = finder.census(doc.rope(), found.as_ref());
-            self.count = count;
-            self.index = index;
+    fn contains(&self, doc: &Document, range: &Range<usize>) -> bool {
+        if self.matches_complete {
+            return index_in(&self.matches, range).is_some();
         }
+        self.finder
+            .as_ref()
+            .is_some_and(|finder| finder.covers(doc.rope(), range))
+    }
+
+    fn locate_next(&self, doc: &Document, from: usize) -> Option<Range<usize>> {
+        if self.matches_complete {
+            let i = self.matches.partition_point(|m| m.start < from);
+            return self.matches.get(i).cloned();
+        }
+        self.finder.as_ref()?.next(doc.rope(), from)
+    }
+
+    fn locate_prev(&self, doc: &Document, before: usize) -> Option<Range<usize>> {
+        if self.matches_complete {
+            let i = self.matches.partition_point(|m| m.start < before);
+            return (i > 0).then(|| self.matches[i - 1].clone());
+        }
+        self.finder.as_ref()?.prev(doc.rope(), before)
+    }
+
+    fn locate_last(&self, doc: &Document) -> Option<Range<usize>> {
+        if self.matches_complete {
+            return self.matches.last().cloned();
+        }
+        self.finder.as_ref()?.last(doc.rope())
+    }
+
+    fn index_of(&self, doc: &Document, range: &Range<usize>) -> Option<usize> {
+        if self.matches_complete {
+            return index_in(&self.matches, range);
+        }
+        self.finder.as_ref()?.census(doc.rope(), Some(range)).1
+    }
+
+    /// `on` is the match we stepped from, when the index names it.
+    fn moved(
+        &mut self,
+        doc: &Document,
+        on: &Range<usize>,
+        found: Option<Range<usize>>,
+        forward: bool,
+        wrapped: bool,
+    ) -> Option<Selection> {
+        let known = self.indexed.as_ref() == Some(on) && self.index.is_some();
+        if known && found.is_some() && !self.matches_complete {
+            self.bump_index(forward, wrapped);
+            if self.index.is_some() {
+                self.indexed = found.clone();
+                return found.map(selection_of);
+            }
+        }
+        self.index = found.as_ref().and_then(|range| self.index_of(doc, range));
+        self.indexed = self.index.is_some().then(|| found.clone()).flatten();
         found.map(selection_of)
+    }
+
+    fn bump_index(&mut self, forward: bool, wrapped: bool) {
+        let Some(index) = self.index else { return };
+        self.index = if wrapped {
+            (self.count > 0).then_some(if forward { 1 } else { self.count })
+        } else if forward {
+            Some(index + 1).filter(|i| *i <= self.count)
+        } else {
+            index.checked_sub(1).filter(|i| *i > 0)
+        };
     }
 
     fn options(&self) -> SearchOptions {
@@ -429,13 +533,24 @@ fn selection_of(range: std::ops::Range<usize>) -> Selection {
     }
 }
 
-fn step_past(doc: &Document, range: &std::ops::Range<usize>) -> usize {
+fn step_past(doc: &Document, range: &Range<usize>) -> usize {
     if range.is_empty() {
         let next = doc.next_char_boundary(range.start);
-        if next == range.start { doc.len() } else { next }
+        if next == range.start {
+            // The empty match at the end. One past it, so the next search
+            // does not land there again.
+            doc.len().saturating_add(1)
+        } else {
+            next
+        }
     } else {
         range.end
     }
+}
+
+fn index_in(matches: &[Range<usize>], range: &Range<usize>) -> Option<usize> {
+    let i = matches.partition_point(|m| m.start < range.start);
+    matches.get(i).filter(|m| *m == range).map(|_| i + 1)
 }
 
 fn select_all(
@@ -451,4 +566,46 @@ fn select_all(
         CCursor::new(chars),
     )));
     state.store(ctx, id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f3_steps_and_wraps_without_losing_the_index() {
+        let doc = Document::from_text("a\na\n");
+        let mut bar = FindBar::default();
+        bar.open(0, Some("a".into()), false);
+        let first = bar.goto_next(&doc, Selection::caret(0)).unwrap();
+        assert_eq!(first.range(), 0..1);
+        assert_eq!(bar.match_index(), Some(1));
+        assert_eq!(bar.match_count(), 2);
+        let second = bar.goto_next(&doc, first).unwrap();
+        assert_eq!(second.range(), 2..3);
+        assert_eq!(bar.match_index(), Some(2));
+        let wrapped = bar.goto_next(&doc, second).unwrap();
+        assert_eq!(wrapped.range(), 0..1);
+        assert_eq!(bar.match_index(), Some(1));
+        let back = bar.goto_prev(&doc, wrapped).unwrap();
+        assert_eq!(back.range(), 2..3);
+        assert_eq!(bar.match_index(), Some(2));
+    }
+
+    #[test]
+    fn f3_reaches_the_empty_match_at_the_end_and_wraps() {
+        let doc = Document::from_text("ab");
+        let mut bar = FindBar {
+            regex: true,
+            ..FindBar::default()
+        };
+        bar.open(0, Some("$".into()), false);
+        let end = bar.goto_next(&doc, Selection::caret(0)).unwrap();
+        assert_eq!(end.range(), 2..2);
+        assert_eq!(bar.match_index(), Some(1));
+        assert_eq!(bar.match_count(), 1);
+        let again = bar.goto_next(&doc, end).unwrap();
+        assert_eq!(again.range(), 2..2);
+        assert_eq!(bar.match_index(), Some(1));
+    }
 }

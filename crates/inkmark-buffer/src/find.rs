@@ -8,6 +8,7 @@ use std::ops::Range;
 use regex_cursor::engines::meta::Regex;
 use regex_cursor::regex_automata::Anchored;
 use regex_cursor::regex_automata::util::captures::Captures;
+use regex_cursor::regex_automata::util::interpolate;
 use regex_cursor::regex_automata::util::syntax;
 use regex_cursor::{Input, RopeyCursor};
 use ropey::Rope;
@@ -24,8 +25,9 @@ pub struct SearchOptions {
 }
 
 /// A compiled query. Plain text is a literal pattern, so a replacement
-/// is inserted unchanged; a regex replacement expands `$1`, `$0`,
-/// `${name}` and `$$`.
+/// is inserted unchanged. A regex replacement uses the regex crate's
+/// `$` syntax: `$1`, `${1}`, `$name`, `${name}` and `$$`. `$1a` is the
+/// group named `1a`, not group 1 followed by `a`.
 pub struct Finder {
     regex: Regex,
     literal: bool,
@@ -57,13 +59,12 @@ impl Finder {
     }
 
     /// The first match that starts at or after `from`.
+    ///
+    /// `from == len` still searches, so an empty match at the end (`$`)
+    /// is reachable. `from > len` is past that match and finds nothing.
     pub fn next(&self, rope: &Rope, from: usize) -> Option<Range<usize>> {
         let len = rope.len_bytes();
-        let from = from.min(len);
-        if len == 0 {
-            return self.match_in(rope, 0..0);
-        }
-        if from == len {
+        if from > len {
             return None;
         }
         self.match_in(rope, from..len)
@@ -91,6 +92,37 @@ impl Finder {
         self.next(rope, range.start).as_ref() == Some(range)
     }
 
+    /// Every match in one pass, stopping the stored list at `limit`.
+    /// The count still covers the whole rope. `origin` picks `probed`:
+    /// the first match at or after that offset.
+    pub fn collect_matches(&self, rope: &Rope, limit: usize, origin: usize) -> MatchList {
+        let mut matches = Vec::new();
+        let mut count = 0;
+        let mut probed = None;
+        let mut truncated = false;
+        for range in self.iter(rope, 0) {
+            count += 1;
+            if probed.is_none() && range.start >= origin {
+                probed = Some((range.clone(), count));
+            }
+            if truncated {
+                continue;
+            }
+            if matches.len() == limit {
+                truncated = true;
+                matches.clear();
+            } else {
+                matches.push(range);
+            }
+        }
+        MatchList {
+            matches,
+            count,
+            complete: !truncated,
+            probed,
+        }
+    }
+
     /// How many matches, and the 1-based index of `current` when it is one.
     pub fn census(&self, rope: &Rope, current: Option<&Range<usize>>) -> (usize, Option<usize>) {
         let mut count = 0;
@@ -110,7 +142,17 @@ impl Finder {
             return template.to_string();
         }
         let caps = self.captures(rope, range);
-        expand_template(template, |group| group_text(rope, &caps, range, group))
+        let mut out = String::new();
+        interpolate::string(
+            template,
+            |index, dst| dst.push_str(&group_text(rope, &caps, range, index)),
+            |name| {
+                let pattern = caps.pattern()?;
+                caps.group_info().to_index(pattern, name)
+            },
+            &mut out,
+        );
+        out
     }
 
     /// Replaces `range` and leaves the caret after the new text.
@@ -201,59 +243,23 @@ impl Finder {
     }
 }
 
-enum Group<'a> {
-    Index(usize),
-    Name(&'a str),
+/// One pass over the rope's matches.
+pub struct MatchList {
+    /// Every match, or empty when there were more than the limit.
+    pub matches: Vec<Range<usize>>,
+    pub count: usize,
+    /// `matches` holds every match.
+    pub complete: bool,
+    /// The first match at or after the probe offset, and its 1-based index.
+    pub probed: Option<(Range<usize>, usize)>,
 }
 
-fn group_text(rope: &Rope, caps: &Captures, whole: &Range<usize>, group: Group<'_>) -> String {
-    let span = match group {
-        Group::Index(0) if !caps.is_match() => return rope.byte_slice(whole.clone()).to_string(),
-        Group::Index(n) => caps.get_group(n),
-        Group::Name(name) => caps.get_group_by_name(name),
-    };
-    match span {
+fn group_text(rope: &Rope, caps: &Captures, whole: &Range<usize>, index: usize) -> String {
+    match caps.get_group(index) {
         Some(span) => rope.byte_slice(span.start..span.end).to_string(),
+        None if index == 0 => rope.byte_slice(whole.clone()).to_string(),
         None => String::new(),
     }
-}
-
-/// `$1`, `$0`, `${name}` and `$$`. A missing group inserts nothing.
-fn expand_template(template: &str, mut group: impl FnMut(Group<'_>) -> String) -> String {
-    let mut out = String::new();
-    let mut rest = template;
-    while let Some(i) = rest.find('$') {
-        out.push_str(&rest[..i]);
-        rest = &rest[i + 1..];
-        if rest.is_empty() {
-            out.push('$');
-            break;
-        }
-        if let Some(stripped) = rest.strip_prefix('$') {
-            out.push('$');
-            rest = stripped;
-            continue;
-        }
-        if let Some(stripped) = rest.strip_prefix('{') {
-            if let Some(end) = stripped.find('}') {
-                out.push_str(&group(Group::Name(&stripped[..end])));
-                rest = &stripped[end + 1..];
-                continue;
-            }
-            out.push('$');
-            continue;
-        }
-        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-        if digits == 0 {
-            out.push('$');
-            continue;
-        }
-        let n: usize = rest[..digits].parse().unwrap_or(0);
-        out.push_str(&group(Group::Index(n)));
-        rest = &rest[digits..];
-    }
-    out.push_str(rest);
-    out
 }
 
 fn escape_literal(text: &str) -> String {
@@ -355,7 +361,14 @@ mod tests {
         assert_eq!(finder.next(&rope, 0), Some(0..2));
         assert_eq!(finder.next(&rope, 2), Some(3..5));
         assert_eq!(finder.replacement(&rope, &(0..2), "[$1]"), "[1]");
+        assert_eq!(finder.replacement(&rope, &(0..2), "${1}"), "1");
+        assert_eq!(finder.replacement(&rope, &(0..2), "${1}0"), "10");
+        // `$1a` names the group `1a`. This pattern has no such group.
+        assert_eq!(finder.replacement(&rope, &(0..2), "$1a"), "");
         assert_eq!(finder.replacement(&rope, &(0..2), "$$0"), "$0");
+        let grouped = regex("(a)b");
+        let ab = Rope::from_str("ab");
+        assert_eq!(grouped.replacement(&ab, &(0..2), "${1}x"), "ax");
         assert!(
             Finder::compile(
                 "(",
@@ -424,6 +437,22 @@ mod tests {
         assert_eq!(finder.next(&rope, 2), Some(2..4));
         // The search starts at 1, so the match that begins there wins.
         assert_eq!(finder.next(&rope, 1), Some(1..3));
+    }
+
+    #[test]
+    fn an_empty_match_at_the_end_is_reachable() {
+        let rope = rope("ab");
+        let finder = regex("$");
+        assert_eq!(finder.next(&rope, 0), Some(2..2));
+        assert_eq!(finder.next(&rope, 2), Some(2..2));
+        assert_eq!(finder.next(&rope, 3), None);
+        assert!(finder.covers(&rope, &(2..2)));
+        let (count, index) = finder.census(&rope, Some(&(2..2)));
+        assert_eq!((count, index), (1, Some(1)));
+        assert_eq!(finder.last(&rope), Some(2..2));
+
+        let empty = Rope::from_str("");
+        assert_eq!(regex("$").next(&empty, 0), Some(0..0));
     }
 
     #[test]

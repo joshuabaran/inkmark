@@ -3254,6 +3254,35 @@ mod tests {
     }
 
     #[test]
+    fn find_next_click_moves_on_the_frame_the_query_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "one cat\ntwo cat\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        run.key(egui::Key::F, egui::Modifiers::COMMAND);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("c".into())]);
+        run.frame(vec![]);
+        let at = run.text_rect("Next").expect("Next").center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // The query becomes "cat" and Next is clicked in this frame.
+        run.frame(vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::Text("at".into()),
+            button(true),
+            button(false),
+        ]);
+        run.frame(vec![]);
+        assert_eq!(run.app.code.selection().range(), 12..15);
+        assert_eq!(run.app.find.match_index(), Some(2));
+    }
+
+    #[test]
     fn closing_with_unsaved_changes_asks_and_cancel_keeps_the_window() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.md");
