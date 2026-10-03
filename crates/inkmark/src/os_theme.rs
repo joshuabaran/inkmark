@@ -275,6 +275,26 @@ mod tests {
     }
 
     #[test]
+    fn an_open_or_a_read_is_not_a_palette_change() {
+        use notify::EventKind;
+        use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind};
+
+        assert!(!palette_changed(EventKind::Access(AccessKind::Open(
+            AccessMode::Read
+        ))));
+        assert!(!palette_changed(EventKind::Access(AccessKind::Read)));
+        assert!(!palette_changed(EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(palette_changed(EventKind::Modify(ModifyKind::Any)));
+        assert!(palette_changed(EventKind::Create(CreateKind::File)));
+        assert!(palette_changed(EventKind::Remove(RemoveKind::File)));
+        assert!(palette_changed(EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+    }
+
+    #[test]
     fn a_deadline_that_has_passed_has_no_time_left() {
         let started = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
         assert_eq!(time_left(started, Duration::from_secs(1)), None);
