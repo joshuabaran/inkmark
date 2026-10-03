@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+unicode-width.workspace = true
 egui.workspace = true
 image.workspace = true
 inkmark-buffer.workspace = true

@@ -127,8 +127,16 @@ inkmark               # browses the current directory and shows recent files
 | Shift+Enter (live) | Hard line break |
 | Tab / Shift+Tab | Indent / outdent list items (or selected lines in code); in a table, next / previous cell |
 | Enter (live table) | Cell below; in the last row, a new row |
+| Ctrl+Alt+Up / Down | Insert a table row above / below |
+| Ctrl+Alt+Left / Right | Insert a table column left / right |
+| Ctrl+Alt+Backspace, +Shift | Delete the table row, column |
+| Alt+Shift+arrows | Move the table row or column |
+| Ctrl+Alt+F | Line up the table's pipes |
+| Ctrl+Alt+T | Insert a 3×3 table |
 
-In the live pane, click a task's checkbox to tick it.
+In the live pane, click a task's checkbox to tick it. Right-click a table cell for the
+row, column and alignment commands. When you leave a table you edited,
+its columns are padded so the pipes line up again (one undo step).
 
 The sidebar sits to the left of the panes. Up moves to the parent folder,
 Open Folder… picks a new root, and Refresh re-reads the folders that are

@@ -8,6 +8,7 @@ mod lines;
 mod live_layout;
 mod live_view;
 pub mod motion;
+mod tables;
 pub mod theme;
 
 pub use browser::{BrowserOutput, FileBrowser};

@@ -22,6 +22,7 @@ use crate::images::{ImageCache, ImageSlot};
 use crate::lines::{LineIndex, SCROLLBAR_WIDTH, ScrollPos, Synced};
 use crate::live_layout::{self, LeafLayout, LeafStyle, Reveal};
 use crate::motion;
+use crate::tables;
 use crate::theme::{self, Theme};
 
 const PADDING: f32 = 28.0;
@@ -252,6 +253,9 @@ pub struct LiveView {
     hint: Option<&'static str>,
     /// A link was Ctrl+clicked at this offset; the app follows it.
     follow: Option<usize>,
+    /// The table the caret is in: its start, and its text when the caret
+    /// came in. Leaving it changed re-pads it.
+    table_visit: Option<(usize, String)>,
     /// Colors, refreshed from the context every frame.
     theme: std::sync::Arc<Theme>,
     /// The caret at this offset is at the end of a row that wrapped
@@ -295,6 +299,7 @@ impl LiveView {
             seal_undo: false,
             hint: None,
             follow: None,
+            table_visit: None,
             theme: std::sync::Arc::new(Theme::dark()),
             upstream_at: None,
             hit_upstream: false,
@@ -559,6 +564,11 @@ impl LiveView {
             None if !box_clicked => self.handle_pointer(ui, &response, doc, parse, frame),
             None => {}
         }
+        if self.context_menu(&response, doc, state, frame) {
+            ui.ctx().request_repaint();
+        }
+        self.repad_left_table(doc, state);
+        let parse = state.output();
         let mut minimap_hovered = false;
         if let Some(r) = minimap {
             let (scrolled, hovered) = self.lines.minimap_input(ui, self.id, r, rect.height());
@@ -1163,6 +1173,163 @@ impl LiveView {
         true
     }
 
+    /// Right-click: the caret moves to the pointer (unless it's inside the
+    /// selection), then a menu offers table commands. Returns whether an
+    /// edit was made.
+    fn context_menu(
+        &mut self,
+        response: &Response,
+        doc: &mut Document,
+        state: &mut ParseState,
+        frame: Frame,
+    ) -> bool {
+        if response.secondary_clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let at = self.offset_at(doc, state.output(), frame, pos);
+            if !self.selection.range().contains(&at) {
+                self.move_to(at, false);
+            }
+        }
+        let in_table = tables::table_start(doc, state.output(), self.selection.head).is_some();
+        let mut chosen = None;
+        response.context_menu(|ui| {
+            let mut item = |ui: &mut Ui, label: &str, hint: &str, command| {
+                if ui
+                    .add(egui::Button::new(label).shortcut_text(hint))
+                    .clicked()
+                {
+                    chosen = Some(command);
+                    ui.close();
+                }
+            };
+            use tables::{Align, TableCommand::*, TableOp::*};
+            if in_table {
+                item(ui, "Insert row above", "Ctrl+Alt+Up", Edit(InsertRowAbove));
+                item(
+                    ui,
+                    "Insert row below",
+                    "Ctrl+Alt+Down",
+                    Edit(InsertRowBelow),
+                );
+                item(
+                    ui,
+                    "Insert column left",
+                    "Ctrl+Alt+Left",
+                    Edit(InsertColumnLeft),
+                );
+                item(
+                    ui,
+                    "Insert column right",
+                    "Ctrl+Alt+Right",
+                    Edit(InsertColumnRight),
+                );
+                ui.separator();
+                item(ui, "Delete row", "Ctrl+Alt+Backspace", Edit(DeleteRow));
+                item(
+                    ui,
+                    "Delete column",
+                    "Ctrl+Alt+Shift+Backspace",
+                    Edit(DeleteColumn),
+                );
+                ui.separator();
+                item(ui, "Move row up", "Alt+Shift+Up", Edit(MoveRowUp));
+                item(ui, "Move row down", "Alt+Shift+Down", Edit(MoveRowDown));
+                item(
+                    ui,
+                    "Move column left",
+                    "Alt+Shift+Left",
+                    Edit(MoveColumnLeft),
+                );
+                item(
+                    ui,
+                    "Move column right",
+                    "Alt+Shift+Right",
+                    Edit(MoveColumnRight),
+                );
+                ui.separator();
+                ui.menu_button("Align column", |ui| {
+                    item(ui, "Left", "", Edit(Align(Align::Left)));
+                    item(ui, "Center", "", Edit(Align(Align::Center)));
+                    item(ui, "Right", "", Edit(Align(Align::Right)));
+                    item(ui, "None", "", Edit(Align(Align::None)));
+                });
+                item(ui, "Format table", "Ctrl+Alt+F", Edit(Format));
+            } else {
+                item(ui, "Insert table", "Ctrl+Alt+T", Insert);
+            }
+        });
+        let Some(command) = chosen else {
+            return false;
+        };
+        let (plan, _) = tables::run(doc, state.output(), self.selection.head, command);
+        let Some(plan) = plan else { return false };
+        let edited = self.apply_plan(doc, plan);
+        if edited {
+            state.update(doc);
+        }
+        edited
+    }
+
+    /// Notices the caret leaving a table whose text it changed (edits
+    /// undone don't count) and re-pads that table, as an undo step of its
+    /// own. A table only moved through is left as it is.
+    fn repad_left_table(&mut self, doc: &mut Document, state: &mut ParseState) {
+        // Only while this pane has the keyboard: a caret mirrored from the
+        // code pane, and edits made there, aren't the live pane's.
+        if !self.focused {
+            self.table_visit = None;
+            return;
+        }
+        let parse = state.output();
+        let here = tables::table_start(doc, parse, self.selection.head);
+        let visit = self.table_visit.take();
+        let enter = |doc: &Document, start: usize| {
+            tables::table_text(doc, parse, start).map(|text| (start, text))
+        };
+        let Some((start, entered)) = visit else {
+            self.table_visit = here.and_then(|s| enter(doc, s));
+            return;
+        };
+        if here == Some(start) {
+            self.table_visit = Some((start, entered));
+            return;
+        }
+        let changed = tables::table_text(doc, parse, start).is_some_and(|now| now != entered);
+        let format = if changed {
+            tables::format_table(doc, parse, start)
+        } else {
+            None
+        };
+        if let Some((edit, grew)) = format {
+            let table_end = edit.range.end;
+            let shift = |at: usize| {
+                if at >= table_end {
+                    (at as isize + grew).max(0) as usize
+                } else {
+                    at
+                }
+            };
+            let after = Selection {
+                anchor: shift(self.selection.anchor),
+                head: shift(self.selection.head),
+            };
+            doc.seal_undo_step();
+            if doc
+                .apply(vec![edit], self.selection, after, EditKind::Other)
+                .is_ok()
+            {
+                doc.seal_undo_step();
+                self.selection = after;
+                self.after_edit(doc);
+                state.update(doc);
+            }
+        }
+        let parse = state.output();
+        self.table_visit = tables::table_start(doc, parse, self.selection.head)
+            .and_then(|s| tables::table_text(doc, parse, s).map(|t| (s, t)));
+    }
+
     /// Replaces the selection with `text` (a source patch of exactly that).
     fn replace_selection(&mut self, doc: &mut Document, text: &str, kind: EditKind) -> bool {
         let range = self.selection.range();
@@ -1336,6 +1503,14 @@ impl LiveView {
         let (cmd, shift, alt) = (modifiers.command, modifiers.shift, modifiers.alt);
         let sel = self.selection;
         let range = sel.range();
+        if let Some(command) = tables::shortcut(key, modifiers) {
+            match tables::run(doc, parse, sel.head, command) {
+                (Some(plan), _) => return self.apply_plan(doc, plan),
+                (None, true) => return false,
+                // Not in a table: the key does what it usually does.
+                (None, false) => {}
+            }
+        }
         if !cmd
             && !alt
             && matches!(key, Key::Tab | Key::Enter)
