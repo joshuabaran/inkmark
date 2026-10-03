@@ -158,18 +158,15 @@ fn main() -> eframe::Result {
     result
 }
 
-/// The chrome is Hack. The emoji faces cover characters Hack has no
-/// glyph for. The document is cosmic-text and is not affected.
+/// The chrome is Hack, which has the folder and unsaved marks. Hack is
+/// inserted in front of egui's own proportional list, so those fallback
+/// faces stay whatever this egui version ships. The document is
+/// cosmic-text and is not affected.
 fn install_ui_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    fonts.families.insert(
-        egui::FontFamily::Proportional,
-        vec![
-            "Hack".to_owned(),
-            "NotoEmoji-Regular".to_owned(),
-            "emoji-icon-font".to_owned(),
-        ],
-    );
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.insert(0, "Hack".to_owned());
+    }
     ctx.set_fonts(fonts);
 }
 
@@ -1864,33 +1861,28 @@ mod tests {
     }
 
     #[test]
-    fn the_chrome_is_hack() {
+    fn the_chrome_draws_the_folder_and_unsaved_marks() {
         let ctx = egui::Context::default();
+        // Default proportional faces replace all three marks with one box.
+        let mut first = ctx.run_ui(egui::RawInput::default(), |_| {});
+        first.textures_delta.clear();
+        let missing = glyph_box(&ctx, '▸');
+        assert_eq!(glyph_box(&ctx, '▾').1, missing.1);
+        assert_eq!(glyph_box(&ctx, '▾').2, missing.2);
+        assert_eq!(glyph_box(&ctx, '●').1, missing.1);
+        assert_eq!(glyph_box(&ctx, '●').2, missing.2);
+
         install_ui_font(&ctx);
-        let mut pass = ctx.run_ui(egui::RawInput::default(), |_| {});
-        pass.textures_delta.clear();
-        ctx.fonts_mut(|fonts| {
-            let family = fonts
-                .definitions()
-                .families
-                .get(&egui::FontFamily::Proportional)
-                .expect("proportional family");
-            assert_eq!(
-                family,
-                &vec![
-                    "Hack".to_owned(),
-                    "NotoEmoji-Regular".to_owned(),
-                    "emoji-icon-font".to_owned(),
-                ]
+        let mut second = ctx.run_ui(egui::RawInput::default(), |_| {});
+        second.textures_delta.clear();
+        for mark in ['▸', '▾', '●'] {
+            let drawn = glyph_box(&ctx, mark);
+            assert_ne!(
+                (drawn.1, drawn.2),
+                (missing.1, missing.2),
+                "{mark} still uses the missing-glyph box"
             );
-        });
-        // One cell, and the circle is not the same glyph as the chevrons.
-        let collapsed = glyph_box(&ctx, '▸');
-        let expanded = glyph_box(&ctx, '▾');
-        let unsaved = glyph_box(&ctx, '●');
-        assert_eq!(collapsed.0, expanded.0);
-        assert_eq!(expanded.0, unsaved.0);
-        assert_ne!((collapsed.1, collapsed.2), (unsaved.1, unsaved.2));
+        }
     }
 
     #[test]
