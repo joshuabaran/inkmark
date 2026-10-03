@@ -403,6 +403,7 @@ fn deleting_a_definition_stops_it_resolving_at_once() {
     assert!(!out.link_defs.contains_key("ref"), "{:?}", out.link_defs);
     assert!(!out.footnotes.contains("n"), "{:?}", out.footnotes);
     assert!(out.definitions.is_empty(), "{:?}", out.definitions);
+    assert_eq!(out, GfmParser.parse(&whole(&doc)));
     // A definition typed back in resolves again.
     let at = doc.len();
     let since = doc.epoch();
@@ -415,6 +416,7 @@ fn deleting_a_definition_stops_it_resolving_at_once() {
     .unwrap();
     assert!(out.catch_up(&GfmParser, &doc, since));
     assert_eq!(out.link_defs.get("ref").map(String::as_str), Some("/other"));
+    assert_eq!(out, GfmParser.parse(&whole(&doc)));
 }
 
 #[test]
@@ -438,15 +440,13 @@ fn the_first_definition_of_a_label_wins_through_local_edits() {
         .unwrap();
         assert!(out.catch_up(&GfmParser, doc, since));
         assert_valid(out, doc);
-        // The definitions agree with a full parse. (A reference far from
-        // its definition still waits for the full parse to style as a link:
-        // a local reparse can't see definitions outside its region.)
-        let full = GfmParser.parse(&whole(doc));
+        // Definitions and reference spans both agree with a full parse,
+        // including a reference this edit did not touch.
         assert_eq!(
-            out.definitions, full.definitions,
+            *out,
+            GfmParser.parse(&whole(doc)),
             "after {from:?} -> {to:?}"
         );
-        assert_eq!(out.link_defs, full.link_defs, "after {from:?} -> {to:?}");
     };
     // Editing the later duplicate doesn't take over.
     replace(&mut doc, &mut out, "/second", "/edited");
@@ -462,4 +462,192 @@ fn the_first_definition_of_a_label_wins_through_local_edits() {
         "[x][ref]\n\n[ref]: /new\n",
     );
     assert_eq!(dest(&out), Some("/new".into()));
+}
+
+fn reference_spans(out: &ParseOutput, doc: &Document, needle: &str) -> Vec<inkmark_parse::Span> {
+    let text = whole(doc);
+    let at = text
+        .find(needle)
+        .unwrap_or_else(|| panic!("missing {needle:?}"));
+    out.map.spans_in(at..at + needle.len())
+}
+
+fn assert_reference(out: &ParseOutput, doc: &Document, needle: &str) {
+    let full = GfmParser.parse(&whole(doc));
+    assert_eq!(
+        reference_spans(out, doc, needle),
+        reference_spans(&full, doc, needle),
+        "{needle:?}"
+    );
+}
+
+#[test]
+fn deleting_a_far_definition_restyles_the_reference() {
+    // Twenty paragraphs sit between the references and the definitions, so
+    // the edited block's neighbours do not include the references. catch_up
+    // is only the local reparse: no full parse runs.
+    let filler = "Some text.\n\n".repeat(20);
+    let src = format!(
+        "See [x][Ref], ![pic][Ref] and a note[^n].\n\n{filler}[ref]: /url\n\n[^n]: The note.\n"
+    );
+    let mut doc = Document::from_text(&src);
+    let mut out = GfmParser.parse(&src);
+    assert!(
+        reference_spans(&out, &doc, "[x][Ref]")
+            .iter()
+            .any(|s| s.style.contains(inkmark_parse::Style::LINK))
+    );
+    assert!(
+        reference_spans(&out, &doc, "[^n]")
+            .iter()
+            .any(|s| s.style.contains(inkmark_parse::Style::FOOTNOTE))
+    );
+    assert!(
+        reference_spans(&out, &doc, "![pic][Ref]")
+            .iter()
+            .any(|s| s.style.contains(inkmark_parse::Style::IMAGE))
+    );
+
+    for line in ["[ref]: /url\n", "[^n]: The note.\n"] {
+        let at = whole(&doc).find(line).unwrap();
+        let since = doc.epoch();
+        doc.apply(
+            vec![Edit::replace(at..at + line.len(), "")],
+            Selection::caret(at),
+            Selection::caret(at),
+            EditKind::Other,
+        )
+        .unwrap();
+        assert!(out.catch_up(&GfmParser, &doc, since));
+        assert_valid(&out, &doc);
+        assert_eq!(
+            out,
+            GfmParser.parse(&whole(&doc)),
+            "after deleting {line:?}"
+        );
+    }
+    assert!(
+        reference_spans(&out, &doc, "[x][Ref]")
+            .iter()
+            .all(|s| !s.style.contains(inkmark_parse::Style::LINK))
+    );
+    // No definition remains, so the references are plain text again. An
+    // undefined `[^n]` is several text spans, not one replaced footnote.
+    let note = reference_spans(&out, &doc, "[^n]");
+    assert!(
+        note.iter().all(|s| {
+            s.kind == SpanKind::Text && !s.style.contains(inkmark_parse::Style::FOOTNOTE)
+        }),
+        "{note:?}"
+    );
+    assert!(
+        reference_spans(&out, &doc, "![pic][Ref]")
+            .iter()
+            .all(|s| !s.style.contains(inkmark_parse::Style::IMAGE))
+    );
+    assert_reference(&out, &doc, "[x][Ref]");
+    assert_reference(&out, &doc, "[^n]");
+}
+
+#[test]
+fn adding_a_far_definition_styles_the_reference() {
+    let filler = "Some text.\n\n".repeat(20);
+    let src = format!("See [ref] and [^n].\n\n{filler}End.\n");
+    let mut doc = Document::from_text(&src);
+    let mut out = GfmParser.parse(&src);
+    assert!(
+        reference_spans(&out, &doc, "[ref]")
+            .iter()
+            .all(|s| !s.style.contains(inkmark_parse::Style::LINK))
+    );
+    assert!(
+        reference_spans(&out, &doc, "[^n]")
+            .iter()
+            .all(|s| !s.style.contains(inkmark_parse::Style::FOOTNOTE))
+    );
+
+    let at = doc.len();
+    let since = doc.epoch();
+    doc.apply(
+        vec![Edit::insert(at, "\n[ref]: /url\n\n[^n]: The note.\n")],
+        Selection::caret(at),
+        Selection::caret(at),
+        EditKind::Other,
+    )
+    .unwrap();
+    assert!(out.catch_up(&GfmParser, &doc, since));
+    assert_valid(&out, &doc);
+    assert_eq!(out, GfmParser.parse(&whole(&doc)));
+    assert!(
+        reference_spans(&out, &doc, "[ref]")
+            .iter()
+            .any(|s| s.style.contains(inkmark_parse::Style::LINK))
+    );
+    assert_eq!(
+        reference_spans(&out, &doc, "[^n]")
+            .iter()
+            .find(|s| s.style.contains(inkmark_parse::Style::FOOTNOTE))
+            .map(|s| s.kind.clone()),
+        Some(SpanKind::Replaced("[n]".into()))
+    );
+}
+
+#[test]
+fn typing_beside_a_link_reference_keeps_it_a_link() {
+    // Both definitions are twenty paragraphs away, outside the reparsed
+    // block. Each reference in the block has to keep its own stand-in.
+    let filler = "Other text.\n\n".repeat(20);
+    let src = format!("See [ref] and [other] here.\n\n{filler}[ref]: /url\n\n[other]: /two\n");
+    let mut doc = Document::from_text(&src);
+    let mut out = GfmParser.parse(&src);
+    let at = src.find("See ").unwrap() + "See ".len();
+    let since = doc.epoch();
+    doc.apply(
+        vec![Edit::insert(at, "a")],
+        Selection::caret(at),
+        Selection::caret(at + 1),
+        EditKind::Typing,
+    )
+    .unwrap();
+    assert!(out.catch_up(&GfmParser, &doc, since));
+    assert_valid(&out, &doc);
+    assert_eq!(out, GfmParser.parse(&whole(&doc)));
+    assert!(
+        reference_spans(&out, &doc, "[ref]")
+            .iter()
+            .any(|s| s.style.contains(inkmark_parse::Style::LINK))
+    );
+    assert!(
+        reference_spans(&out, &doc, "[other]")
+            .iter()
+            .any(|s| s.style.contains(inkmark_parse::Style::LINK))
+    );
+}
+
+#[test]
+fn changing_a_far_destination_keeps_the_reference_a_link() {
+    // The URL is not stored on the reference span. Editing it updates
+    // where a click goes and leaves the reference's spans alone.
+    let filler = "Some text.\n\n".repeat(20);
+    let src = format!("See [x][ref].\n\n{filler}[ref]: /url\n");
+    let mut doc = Document::from_text(&src);
+    let mut out = GfmParser.parse(&src);
+    let at = whole(&doc).find("/url").unwrap();
+    let since = doc.epoch();
+    doc.apply(
+        vec![Edit::replace(at..at + "/url".len(), "/other")],
+        Selection::caret(at),
+        Selection::caret(at),
+        EditKind::Other,
+    )
+    .unwrap();
+    assert!(out.catch_up(&GfmParser, &doc, since));
+    assert_valid(&out, &doc);
+    assert_eq!(out.link_defs.get("ref").map(String::as_str), Some("/other"));
+    assert_eq!(out, GfmParser.parse(&whole(&doc)));
+    assert!(
+        reference_spans(&out, &doc, "[x][ref]")
+            .iter()
+            .any(|s| s.style.contains(inkmark_parse::Style::LINK))
+    );
 }
