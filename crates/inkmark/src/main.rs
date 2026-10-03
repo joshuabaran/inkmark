@@ -4160,4 +4160,84 @@ mod tests {
         run.frame(vec![]);
         assert!(run.app.code.hidden_ranges().is_empty());
     }
+
+    #[test]
+    fn enter_above_a_fold_keeps_it_and_shows_the_new_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "# Alpha\nbody line\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        run.click_code_mark("▾");
+        run.app.code.request_focus(&run.ctx);
+        run.frame(vec![]);
+        run.key(egui::Key::End, egui::Modifiers::NONE);
+        run.key(egui::Key::Enter, egui::Modifiers::NONE);
+        run.frame(vec![]);
+        assert_eq!(text(&run.app), "# Alpha\n\nbody line\n");
+        let hidden = run.app.code.hidden_ranges().to_vec();
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        assert!(
+            run.app.code.measured_height(1) > 0.0,
+            "the new line is drawn"
+        );
+        assert_eq!(run.app.code.measured_height(2), 0.0);
+        let in_code = |rect: &egui::Rect| rect.left() > 220.0 && rect.left() < 520.0;
+        assert!(
+            run.text_rects("▸").iter().any(in_code),
+            "the heading still shows the fold"
+        );
+        run.click_code_mark("▸");
+        assert!(run.app.code.hidden_ranges().is_empty());
+    }
+
+    #[test]
+    fn arrow_down_stops_on_the_last_visible_line_of_a_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "# Last\nhidden body").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        run.click_code_mark("▾");
+        let hidden = run.app.code.hidden_ranges().to_vec();
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        run.app.code.request_focus(&run.ctx);
+        run.frame(vec![]);
+        run.key(egui::Key::ArrowDown, egui::Modifiers::NONE);
+        run.frame(vec![]);
+        assert_eq!(run.app.code.selection().head, 0);
+        assert_eq!(run.app.code.hidden_ranges(), hidden.as_slice());
+        assert_eq!(run.app.code.measured_height(1), 0.0);
+        assert_eq!(text(&run.app), "# Last\nhidden body");
+    }
+
+    #[test]
+    fn a_jump_after_a_live_edit_rebases_folds_before_revealing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "# Alpha\nbody line\n# Gamma\ntail\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        run.click_code_mark("▾");
+        let start = run.app.code.hidden_ranges()[0].start;
+        let end = run.app.code.hidden_ranges()[0].end;
+        // The code pane is not on screen, so it has not shifted the fold.
+        run.app.mode = Mode::Live;
+        let inserted = "xxxxxxxxxxxxxxxxxxxxxxxx";
+        run.app
+            .doc
+            .apply(
+                vec![inkmark_buffer::Edit::insert(0, inserted)],
+                Selection::caret(0),
+                Selection::caret(inserted.len()),
+                inkmark_buffer::EditKind::Other,
+            )
+            .unwrap();
+        // Inside the old fold range, outside the range once it shifts.
+        run.app.code.set_selection(Selection::caret(start));
+        run.app.mode = Mode::Code;
+        run.frame(vec![]);
+        let hidden = run.app.code.hidden_ranges().to_vec();
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        assert_eq!(hidden[0].start, start + inserted.len());
+        assert_eq!(hidden[0].end, end + inserted.len());
+        assert!(start < hidden[0].start);
+    }
 }

@@ -90,7 +90,27 @@ pub struct CodeView {
     /// Folds changed after this frame's first sync and need heights again.
     fold_resync: bool,
     /// Gutter hits painted last frame, each the body it toggles.
-    marker_hits: Vec<(Rect, Range<usize>)>,
+    marker_hits: Vec<MarkerHit>,
+    /// Heading markers for the parse `region_revision` was built from.
+    /// Kept and shifted when a frame's parse is only a placeholder, so the
+    /// marks do not vanish between keystrokes.
+    regions: Vec<CachedRegion>,
+    region_revision: Option<u64>,
+}
+
+/// A heading the code pane can fold, remembered across frames.
+struct CachedRegion {
+    /// First byte of the heading line.
+    at: usize,
+    line: usize,
+    body: Range<usize>,
+}
+
+struct MarkerHit {
+    rect: Rect,
+    body: Range<usize>,
+    /// Nested heading body start inside `body`, when there is one.
+    child: Option<usize>,
 }
 
 /// Where the text area sits this frame.
@@ -137,6 +157,8 @@ impl CodeView {
             pending_reveal: false,
             fold_resync: false,
             marker_hits: Vec::new(),
+            regions: Vec::new(),
+            region_revision: None,
         }
     }
 
@@ -242,6 +264,8 @@ impl CodeView {
         self.pending_reveal = false;
         self.fold_resync = false;
         self.marker_hits.clear();
+        self.regions.clear();
+        self.region_revision = None;
     }
 
     /// Gives up keyboard focus (e.g. while a dialog is open).
@@ -259,7 +283,7 @@ impl CodeView {
         &mut self,
         ui: &mut Ui,
         doc: &mut Document,
-        parse: Option<&mut ParseState>,
+        mut parse: Option<&mut ParseState>,
     ) -> Response {
         self.theme = theme::current(ui.ctx());
         let rect = ui.available_rect_before_wrap();
@@ -311,15 +335,19 @@ impl CodeView {
         if self.text.begin_frame(config, ui.ctx().pixels_per_point()) {
             self.lines.invalidate();
         }
+        // Rebase first. A jump's offsets are already in the current
+        // document, and the folds may still be in the previous one (the
+        // code pane was hidden while the live pane was edited).
+        self.sync(doc, true);
         if self.pending_reveal {
             self.pending_reveal = false;
             if self.folds.reveal(doc, self.selection.head)
                 || self.folds.reveal(doc, self.selection.anchor)
             {
                 self.lines.invalidate();
+                self.fold_resync = true;
             }
         }
-        self.sync(doc, true);
         if let Some(pos) = self.pending_scroll.take() {
             self.apply_scroll_pos(pos);
         }
@@ -369,12 +397,13 @@ impl CodeView {
         if self.reveal_caret > 0 {
             self.scroll_caret_into_view(ui, doc, viewport);
         }
-        let parse = parse.map(|p| {
-            if let Some(wait) = p.update(doc) {
+        if let Some(parse) = parse.as_mut() {
+            if let Some(wait) = parse.update(doc) {
                 ui.ctx().request_repaint_after(wait);
             }
-            &*p
-        });
+            self.refresh_regions(doc, parse);
+        }
+        let parse = parse.map(|p| &*p);
         let caret = self.paint(ui, doc, parse.map(ParseState::output), frame, focused);
 
         if focused {
@@ -406,6 +435,8 @@ impl CodeView {
         let synced = self.lines.sync(doc, |chars| text.estimate_height(chars));
         if let Synced::Changed(changes) = &synced {
             self.folds.rebase(changes);
+            self.folds.align_lines(doc);
+            self.rebase_regions(doc, changes);
             if map_selection {
                 for c in changes {
                     self.selection.anchor = c.map(self.selection.anchor, Bias::Left);
@@ -417,6 +448,75 @@ impl CodeView {
         if !matches!(synced, Synced::Unchanged) {
             self.apply_fold_heights(doc);
         }
+    }
+
+    /// Rebuilds heading markers when the parse revision changes. A
+    /// placeholder parse (no blocks yet) keeps the markers already shifted
+    /// through the edit, so they stay clickable while a full parse runs.
+    fn refresh_regions(&mut self, doc: &Document, parse: &ParseState) {
+        let revision = parse.revision();
+        if self.region_revision == Some(revision) {
+            return;
+        }
+        let output = parse.output();
+        if output.map.len() != doc.len() {
+            return;
+        }
+        if output.blocks.iter().next().is_none() && !doc.is_empty() {
+            return;
+        }
+        self.regions = inkmark_parse::heading_regions(doc, output)
+            .into_iter()
+            .filter(|region| region.line < doc.line_count())
+            .map(|region| CachedRegion {
+                at: doc.line_to_byte(region.line),
+                line: region.line,
+                body: region.body,
+            })
+            .collect();
+        self.region_revision = Some(revision);
+    }
+
+    /// Moves cached markers through `changes`, then onto whole lines.
+    fn rebase_regions(&mut self, doc: &Document, changes: &[Change]) {
+        for region in &mut self.regions {
+            for change in changes {
+                region.at = change.map(region.at, Bias::Left);
+                let start = change.map(region.body.start, Bias::Right);
+                let end = change.map(region.body.end, Bias::Left).max(start);
+                region.body = start..end;
+            }
+            let len = doc.len();
+            region.at = region.at.min(len);
+            if len > 0 {
+                region.at = doc.line_to_byte(doc.byte_to_line(region.at));
+            }
+            region.body = crate::folds::line_aligned(doc, region.body.start, region.body.end);
+            region.line = if doc.line_count() == 0 {
+                0
+            } else {
+                doc.byte_to_line(region.at.min(len))
+            };
+        }
+        self.regions
+            .retain(|region| !region.body.is_empty() && region.line < doc.line_count());
+    }
+
+    /// The heading on `line`, and where a nested heading's body starts.
+    fn marker_for(&self, line: usize) -> Option<(Range<usize>, Option<usize>)> {
+        let index = self.regions.partition_point(|region| region.line < line);
+        let (start, end) = {
+            let region = self.regions.get(index)?;
+            if region.line != line || region.body.is_empty() {
+                return None;
+            }
+            (region.body.start, region.body.end)
+        };
+        let child = self.regions[index + 1..]
+            .iter()
+            .find(|next| next.body.start > start && next.body.start < end)
+            .map(|next| next.body.start);
+        Some((start..end, child))
     }
 
     /// Gives every hidden line a height of 0 so scroll math skips it.
@@ -628,14 +728,15 @@ impl CodeView {
                 if row > 0 {
                     row -= 1;
                 } else if line > 0 {
-                    line -= 1;
-                    while line > 0 && self.folds.hides_line(doc, line) {
-                        line -= 1;
+                    let mut prev = line - 1;
+                    while prev > 0 && self.folds.hides_line(doc, prev) {
+                        prev -= 1;
                     }
-                    if self.folds.hides_line(doc, line) {
-                        head = 0;
+                    // Hidden lines above, and nothing visible: stay here.
+                    if self.folds.hides_line(doc, prev) {
                         break;
                     }
+                    line = prev;
                     geometry = self.text.geometry(&Self::line_text(doc, line));
                     row = geometry.rows.len() - 1;
                 } else {
@@ -645,14 +746,16 @@ impl CodeView {
             } else if row + 1 < geometry.rows.len() {
                 row += 1;
             } else if line + 1 < doc.line_count() {
-                line += 1;
-                while line < doc.line_count() && self.folds.hides_line(doc, line) {
-                    line += 1;
+                let mut next = line + 1;
+                while next < doc.line_count() && self.folds.hides_line(doc, next) {
+                    next += 1;
                 }
-                if line >= doc.line_count() {
-                    head = doc.len();
+                // The rest of the document is folded. Stay on this line
+                // instead of putting the caret in text that is not drawn.
+                if next >= doc.line_count() {
                     break;
                 }
+                line = next;
                 geometry = self.text.geometry(&Self::line_text(doc, line));
                 row = 0;
             } else {
@@ -941,13 +1044,13 @@ impl CodeView {
             return self.end_drag_if_released(down);
         };
         if pressed && response.hovered() {
-            if let Some(body) = self
+            let hit = self
                 .marker_hits
                 .iter()
-                .find(|(rect, _)| rect.contains(pos))
-                .map(|(_, body)| body.clone())
-            {
-                self.folds.toggle(body);
+                .find(|hit| hit.rect.contains(pos))
+                .map(|hit| (hit.body.clone(), hit.child));
+            if let Some((body, child)) = hit {
+                self.folds.toggle(body, child);
                 self.lines.invalidate();
                 self.fold_resync = true;
                 self.drag = None;
@@ -1086,10 +1189,6 @@ impl CodeView {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, self.theme.background);
 
-        let regions = parse
-            .filter(|output| output.map.len() == doc.len())
-            .map(|output| inkmark_parse::heading_regions(doc, output))
-            .unwrap_or_default();
         let selection = self.selection.range();
         let caret_line = doc.byte_to_line(self.selection.head);
         let mut meshes = GlyphMeshes::default();
@@ -1108,11 +1207,8 @@ impl CodeView {
             let text = doc.slice(range.clone());
             let height = self.text.line_height(&text);
             self.lines.heights.set_measured(line, height);
-            if let Some(region) = regions
-                .iter()
-                .find(|region| region.line == line && !region.body.is_empty())
-            {
-                let mark = if self.folds.is_folded_at(region.body.start) {
+            if let Some((body, child)) = self.marker_for(line) {
+                let mark = if self.folds.covers(&body, child) {
                     "▸"
                 } else {
                     "▾"
@@ -1124,10 +1220,11 @@ impl CodeView {
                     FontId::proportional(12.0),
                     self.theme.text,
                 );
-                self.marker_hits.push((
-                    Rect::from_min_size(pos2(rect.left(), y), vec2(PADDING, height)),
-                    region.body.clone(),
-                ));
+                self.marker_hits.push(MarkerHit {
+                    rect: Rect::from_min_size(pos2(rect.left(), y), vec2(PADDING, height)),
+                    body,
+                    child,
+                });
             }
             if line == self.lines.anchor.line && self.lines.anchor.offset > height {
                 self.lines.anchor.offset = height;
