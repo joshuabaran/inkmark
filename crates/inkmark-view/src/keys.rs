@@ -1047,6 +1047,16 @@ mod tests {
     }
 
     #[test]
+    fn the_readme_lists_these_shortcuts() {
+        let readme = include_str!("../../../README.md");
+        let table = KeyMap::readme_table();
+        assert!(
+            readme.contains(table.trim_end()),
+            "README shortcut table drifted from KeyMap::readme_table"
+        );
+    }
+
+    #[test]
     fn the_readme_table_names_every_default() {
         let table = KeyMap::readme_table();
         assert!(table.starts_with("| Keys | Action |\n|---|---|\n"));

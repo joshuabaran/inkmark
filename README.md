@@ -99,6 +99,7 @@ with `INKMARK_RENDERER=glow` to use OpenGL.
 
 ```sh
 inkmark --help        # usage; inkmark --version prints the version
+inkmark --list-keys   # the key bindings below, as config.toml
 inkmark notes.md      # browses that file's folder; a missing path is a new file there
 inkmark ~/notes       # browses the folder, with nothing open
 inkmark               # browses the current directory and shows recent files
@@ -106,33 +107,66 @@ inkmark               # browses the current directory and shows recent files
 
 | Keys | Action |
 |---|---|
-| Ctrl+E | Cycle split → code → live |
-| Ctrl+1 / Ctrl+2 | Focus the code / live pane (switching to it when only one pane shows) |
-| Ctrl+M | Toggle the focused pane's minimap |
-| Ctrl+O, Ctrl+S, Ctrl+Shift+S | Open, save, save as |
-| Ctrl+Shift+O | Open a folder in the sidebar |
-| Ctrl+Shift+E | Show or hide the sidebar |
-| Ctrl+N | New Markdown file in the selected folder, or the folder you have open |
-| F2, Delete (sidebar) | Rename, or move to the trash, the selected file or folder |
-| Ctrl+click | Follow a link: a note, `#heading`, footnote, or web page |
-| Alt+Left, Alt+Right | Back to where you followed the last link from, and forward again |
-| Ctrl+R | Recent files |
-| Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y | Undo, redo (shared by both panes) |
-| Ctrl+B, Ctrl+I, Ctrl+\` | Toggle bold, italic, code |
-| Ctrl+Shift+X | Toggle strikethrough |
-| Ctrl+K | Insert a link |
-| Ctrl+Enter | Toggle the line's task checkbox (making it a task if needed) |
-| Ctrl+Alt+0…6 | Paragraph / heading level |
-| Enter (live) | Continue a list item or quote; on an empty one, leave it |
-| Shift+Enter (live) | Hard line break |
-| Tab / Shift+Tab | Indent / outdent list items (or selected lines in code); in a table, next / previous cell |
-| Enter (live table) | Cell below; in the last row, a new row |
-| Ctrl+Alt+Up / Down | Insert a table row above / below |
-| Ctrl+Alt+Left / Right | Insert a table column left / right |
-| Ctrl+Alt+Backspace, +Shift | Delete the table row, column |
-| Alt+Shift+arrows | Move the table row or column |
-| Ctrl+Alt+F | Line up the table's pipes |
-| Ctrl+Alt+T | Insert a 3×3 table |
+| Ctrl+E | Cycle split, code, and live (`cycle_mode`) |
+| Ctrl+1 | Focus the code pane (switching to it when only live shows) (`focus_code`) |
+| Ctrl+2 | Focus the live pane (switching to it when only code shows) (`focus_live`) |
+| Ctrl+M | Toggle the focused pane's minimap (`toggle_minimap`) |
+| Ctrl+O | Open a file (`open_file`) |
+| Ctrl+S | Save (`save`) |
+| Ctrl+Shift+S | Save as (`save_as`) |
+| Ctrl+Shift+O | Open a folder in the sidebar (`open_folder`) |
+| Ctrl+Shift+E | Show or hide the sidebar (`toggle_sidebar`) |
+| Ctrl+N | New Markdown file in the selected folder, or the open folder (`new_file`) |
+| Ctrl+R | Recent files (`recent_files`) |
+| Alt+Left | Back to where you followed the last link from (`back`) |
+| Alt+Right | Forward again (`forward`) |
+| F2 | Rename the selected file or folder (`rename`) |
+| Delete | Move the selected file or folder to the trash (`move_to_trash`) |
+| Ctrl+Z | Undo (`undo`) |
+| Ctrl+Shift+Z, Ctrl+Y | Redo (`redo`) |
+| Ctrl+B | Toggle bold (`bold`) |
+| Ctrl+I | Toggle italic (`italic`) |
+| Ctrl+Backtick | Toggle code (`code`) |
+| Ctrl+Shift+X | Toggle strikethrough (`strikethrough`) |
+| Ctrl+K | Insert a link (`link`) |
+| Ctrl+Enter | Toggle the line's task checkbox (`toggle_task`) |
+| Ctrl+Alt+0 | Turn the line into a paragraph (`heading_0`) |
+| Ctrl+Alt+1 | Set heading level 1 (`heading_1`) |
+| Ctrl+Alt+2 | Set heading level 2 (`heading_2`) |
+| Ctrl+Alt+3 | Set heading level 3 (`heading_3`) |
+| Ctrl+Alt+4 | Set heading level 4 (`heading_4`) |
+| Ctrl+Alt+5 | Set heading level 5 (`heading_5`) |
+| Ctrl+Alt+6 | Set heading level 6 (`heading_6`) |
+| Ctrl+A | Select all (`select_all`) |
+| Ctrl+Left | Move to the previous word (`word_left`) |
+| Ctrl+Right | Move to the next word (`word_right`) |
+| Ctrl+Backspace | Delete the previous word (`delete_word_left`) |
+| Ctrl+Delete | Delete the next word (`delete_word_right`) |
+| Ctrl+Home | Move to the start of the document (`document_start`) |
+| Ctrl+End | Move to the end of the document (`document_end`) |
+| Ctrl+Alt+Up | Insert a table row above (`insert_row_above`) |
+| Ctrl+Alt+Down | Insert a table row below (`insert_row_below`) |
+| Ctrl+Alt+Left | Insert a table column to the left (`insert_column_left`) |
+| Ctrl+Alt+Right | Insert a table column to the right (`insert_column_right`) |
+| Ctrl+Alt+Backspace | Delete the table row (`delete_row`) |
+| Ctrl+Alt+Shift+Backspace | Delete the table column (`delete_column`) |
+| Alt+Shift+Up | Move the table row up (`move_row_up`) |
+| Alt+Shift+Down | Move the table row down (`move_row_down`) |
+| Alt+Shift+Left | Move the table column left (`move_column_left`) |
+| Alt+Shift+Right | Move the table column right (`move_column_right`) |
+| Ctrl+Alt+F | Line up the table's pipes (`format_table`) |
+| Ctrl+Alt+T | Insert a 3×3 table (`insert_table`) |
+
+Arrows, Home, End, Page Up, Page Down, Backspace, Delete, Enter and Tab edit
+as usual, and holding Shift extends a selection. Those keys are not in the
+table, so they can't be rebound; the Ctrl and Alt chords of them can, and
+are listed above. Ctrl+click follows a link (a note, `#heading`, footnote,
+or web page) and is not a binding either. In the live pane, Enter continues
+a list item or quote and leaves an empty one; Shift+Enter inserts a hard
+line break. In a table, Tab and Shift+Tab move to the next and previous
+cell, and Enter moves to the cell below, adding a row on the last. Outside
+a table, a table chord keeps its ordinary meaning, so Alt+Shift+Left still
+extends the selection.
 
 In the live pane, click a task's checkbox to tick it. Right-click a table cell for the
 row, column and alignment commands. When you leave a table you edited,
@@ -160,7 +194,18 @@ code = "JetBrains Mono"   # code pane and code spans; default: the system monosp
 text = "Inter"            # live pane; default: the system sans-serif font
 code_size = 14            # points
 text_size = 16
+
+[keys]
+bold = "Ctrl+Shift+B"     # one chord, or a list of them
+italic = []               # an empty list unbinds; anything left out keeps its default
 ```
+
+`inkmark --list-keys` prints every binding as it stands, ready to paste
+into that table. A name inkmark doesn't know, a chord it can't read, or
+two actions on one chord is reported, and that one keeps its default; the
+rest of the file still applies. Super, Ctrl+Alt+Delete, and Alt+Tab (with
+or without Shift or Ctrl) belong to the desktop: binding one is kept, and
+the error banner says the desktop will take it.
 
 Colors come from the desktop: Omarchy's current theme if there is one,
 otherwise inkmark's own dark or light theme. `INKMARK_THEME=path/to/colors.toml`

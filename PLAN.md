@@ -2,7 +2,7 @@
 
 **Name (working):** `inkmark` · Rust · egui/eframe · Linux/Wayland (Omarchy/Hyprland) first · no Electron/WebView
 
-**Status:** Signed off 2026-10-01. MVP (M1–M6), GFM (G1–G4) and the [file browser](#file-browser-next) (F1–F3) are complete as of 2026-10-02; the first outside review's 21 issues and seven suggestions are fixed, and footnotes are in ([hardening and footnotes](#hardening-and-footnotes-2026-10-02)); [notes and links](#notes-and-links) is in review. See [Results](#results) for measurements and the [Roadmap](#roadmap) for what's planned. Changes to locked decisions require updating this doc first.
+**Status:** Signed off 2026-10-01. MVP (M1–M6), GFM (G1–G4) and the [file browser](#file-browser-next) (F1–F3) are complete as of 2026-10-02; the first outside review's 21 issues and seven suggestions are fixed, and footnotes are in ([hardening and footnotes](#hardening-and-footnotes-2026-10-02)); [notes and links](#notes-and-links) is in review. [Configurable key bindings](#configurable-key-bindings) are in as of 2026-10-02. See [Results](#results) for measurements and the [Roadmap](#roadmap) for what's planned. Changes to locked decisions require updating this doc first.
 
 ---
 
@@ -437,15 +437,20 @@ Small items left from earlier rounds, done 2026-10-03 on branch `cleanup`. Decid
 - **Alt+Right** goes forward again after Alt+Left.
 - **Links to non-Markdown files** open in the default app (`xdg-open`) only for an allowlist of safe types: images, PDF, plain text, audio, video, office documents. Anything else (scripts, `.desktop`, unknown types), and any file with an executable bit, is refused with a status-bar message.
 
-### Configurable key bindings (next)
+### Configurable key bindings
 
-Every shortcut can be rebound. Proposed 2026-10-03, to confirm when the round starts:
+Done 2026-10-02 on branch `key-bindings`. Decided 2026-10-02:
 
-- A `[keys]` table in `~/.config/inkmark/config.toml`, applied live: `bold = "Ctrl+B"`, or a list (`insert_row_below = ["Ctrl+Alt+Down", "Ctrl+Enter"]`); an empty list unbinds; anything not set keeps its default.
-- One table of actions and default bindings that the app shell and both panes use; today's shortcuts move onto it unchanged.
-- An unknown action, an unparseable key, or two actions on one chord is reported in the error banner, and that entry keeps its default.
-- `inkmark --list-keys` prints every action with its current keys; the README's shortcut table is generated from the same list.
-- Not configurable: plain editing keys (arrows, Backspace, Enter; their Ctrl/Alt variants are), mouse gestures, and keys the desktop owns.
+| Question | Decision |
+|---|---|
+| Where | A `[keys]` table in `~/.config/inkmark/config.toml`, applied live with the fonts. `bold = "Ctrl+B"`, or a list (`insert_row_below = ["Ctrl+Alt+Down", "F6"]`). An empty list unbinds. Anything left out keeps its default. |
+| One table | `inkmark-view`'s `keys` module is the only list of actions and default chords. The shell, the sidebar and both panes read it. The chords that shipped are unchanged. Ctrl/Alt editing chords are actions too, so they can be unbound: word left/right, delete word left/right, document start/end, select all. |
+| Matching | A chord matches when Shift and Alt are exactly the ones it names. Extra Shift or Alt does not fire the shorter chord (Ctrl+Shift+B is not bold). Linux Ctrl still matches: those events set both `ctrl` and `command`, and matching uses `matches_exact`. Shift on a word or document motion extends the selection. Shift on delete-word still deletes. |
+| Table chords | Outside a table the key keeps its ordinary meaning, so Alt+Shift+Left still extends a selection. The shell consumes only its own actions, so a pane chord is never eaten by an app one. |
+| Errors | An unknown action, a chord that doesn't parse, a value that isn't a chord or a list, or two actions on one chord is named in the error banner, and that entry keeps its default. The rest of the file, fonts included, still applies. A file that doesn't parse at all keeps the previous settings. A swap (each action taking the other's chord) applies. If rejecting one entry makes another collide with the default that snapped back, that one is rejected too. |
+| Desktop keys | Super, Ctrl+Alt+Delete, Alt+Tab, Alt+Shift+Tab, Ctrl+Alt+Tab and Ctrl+Alt+Shift+Tab are the compositor's. Binding one is kept, and the banner says the desktop will take it. None of them is a default. |
+| Listing | `inkmark --list-keys` prints the bindings that would apply, as TOML ready to paste back. The README shortcut table is generated from the same defaults; a test fails if the README drifts. |
+| Not bindings | Arrows, Backspace, Delete, Enter, Tab, Home, End, Page Up/Down, and Shift held to extend a selection. Ctrl+click and IME. |
 
 ### Later
 
