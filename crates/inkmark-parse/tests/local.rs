@@ -594,9 +594,10 @@ fn adding_a_far_definition_styles_the_reference() {
 
 #[test]
 fn typing_beside_a_link_reference_keeps_it_a_link() {
-    // The definition is twenty paragraphs away, outside the reparsed block.
+    // Both definitions are twenty paragraphs away, outside the reparsed
+    // block. Each reference in the block has to keep its own stand-in.
     let filler = "Other text.\n\n".repeat(20);
-    let src = format!("See [ref] here.\n\n{filler}[ref]: /url\n");
+    let src = format!("See [ref] and [other] here.\n\n{filler}[ref]: /url\n\n[other]: /two\n");
     let mut doc = Document::from_text(&src);
     let mut out = GfmParser.parse(&src);
     let at = src.find("See ").unwrap() + "See ".len();
@@ -613,6 +614,39 @@ fn typing_beside_a_link_reference_keeps_it_a_link() {
     assert_eq!(out, GfmParser.parse(&whole(&doc)));
     assert!(
         reference_spans(&out, &doc, "[ref]")
+            .iter()
+            .any(|s| s.style.contains(inkmark_parse::Style::LINK))
+    );
+    assert!(
+        reference_spans(&out, &doc, "[other]")
+            .iter()
+            .any(|s| s.style.contains(inkmark_parse::Style::LINK))
+    );
+}
+
+#[test]
+fn changing_a_far_destination_keeps_the_reference_a_link() {
+    // The URL is not stored on the reference span. Editing it updates
+    // where a click goes and leaves the reference's spans alone.
+    let filler = "Some text.\n\n".repeat(20);
+    let src = format!("See [x][ref].\n\n{filler}[ref]: /url\n");
+    let mut doc = Document::from_text(&src);
+    let mut out = GfmParser.parse(&src);
+    let at = whole(&doc).find("/url").unwrap();
+    let since = doc.epoch();
+    doc.apply(
+        vec![Edit::replace(at..at + "/url".len(), "/other")],
+        Selection::caret(at),
+        Selection::caret(at),
+        EditKind::Other,
+    )
+    .unwrap();
+    assert!(out.catch_up(&GfmParser, &doc, since));
+    assert_valid(&out, &doc);
+    assert_eq!(out.link_defs.get("ref").map(String::as_str), Some("/other"));
+    assert_eq!(out, GfmParser.parse(&whole(&doc)));
+    assert!(
+        reference_spans(&out, &doc, "[x][ref]")
             .iter()
             .any(|s| s.style.contains(inkmark_parse::Style::LINK))
     );

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -155,18 +156,34 @@ impl ParseOutput {
     }
 
     /// Definitions that live outside `region`, written after its bytes so a
-    /// reference inside it still parses as a link or footnote. A deleted
-    /// definition collapses to an empty range and is not revived here.
-    /// Stand-in spans start at `len` and are dropped; a placeholder
-    /// destination is enough, because a reference's spans don't carry the URL.
+    /// reference inside it still parses as a link or footnote. Only labels
+    /// the region actually mentions are included, and only the earliest
+    /// definition of each. A deleted definition collapses to an empty range
+    /// and is not revived here. Stand-in spans start at `len` and are
+    /// dropped; a placeholder destination is enough, because a reference's
+    /// spans don't carry the URL.
     fn append_standins(&self, text: &mut String, region: &Range<usize>) {
+        let refs = referenced(text);
+        if refs.links.is_empty() && refs.footnotes.is_empty() {
+            return;
+        }
         let mut emitted = false;
-        let mut seen: Vec<&DefinitionLabel> = Vec::new();
+        let mut seen: HashSet<&DefinitionLabel> = HashSet::new();
         for def in &self.definitions {
             if def.range.is_empty() || !strictly_outside(&def.range, region) {
                 continue;
             }
-            if seen.contains(&&def.label) {
+            if !seen.insert(&def.label) {
+                continue;
+            }
+            let wanted = match &def.label {
+                DefinitionLabel::Link(label) => refs.links.contains(label),
+                DefinitionLabel::Footnote(label) => {
+                    let folded = normalize_label(label);
+                    refs.footnotes.contains(label.as_str()) || refs.footnotes.contains(&folded)
+                }
+            };
+            if !wanted {
                 continue;
             }
             let Some(line) = standin_line(&def.label) else {
@@ -177,7 +194,6 @@ impl ParseOutput {
                 emitted = true;
             }
             text.push_str(&line);
-            seen.push(&def.label);
         }
     }
 
@@ -227,6 +243,42 @@ fn standin_line(label: &DefinitionLabel) -> Option<String> {
     } else {
         Some(line)
     }
+}
+
+struct Referenced {
+    links: HashSet<String>,
+    footnotes: HashSet<String>,
+}
+
+/// Link and footnote labels `text` mentions in complete `[...]` groups.
+/// Link labels are normalized. An unclosed `[` is skipped so a later
+/// reference in the same block is still seen.
+fn referenced(text: &str) -> Referenced {
+    let mut refs = Referenced {
+        links: HashSet::new(),
+        footnotes: HashSet::new(),
+    };
+    let mut rest = text;
+    while let Some(rel) = rest.find('[') {
+        let after = &rest[rel + 1..];
+        let (footnote, body) = match after.strip_prefix('^') {
+            Some(stripped) => (true, stripped),
+            None => (false, after),
+        };
+        let Some(content) = bracket_body(body) else {
+            rest = &rest[rel + 1..];
+            continue;
+        };
+        if footnote {
+            refs.footnotes.insert(normalize_label(content));
+            refs.footnotes.insert(content.to_string());
+        } else if !content.is_empty() {
+            refs.links.insert(normalize_label(content));
+        }
+        let consumed = rel + 1 + (after.len() - body.len()) + content.len() + 1;
+        rest = &rest[consumed..];
+    }
+    refs
 }
 
 /// Whether `text` holds a link or footnote reference to one of `changed`.
@@ -289,8 +341,10 @@ impl ParseOutput {
     /// are replaced by the ones it has now (from `local`, a parse of its
     /// `len` bytes plus stand-ins after them). A label nothing defines any
     /// more stops resolving, instead of lingering until the full parse.
-    /// Labels whose resolved destination changed are returned so references
-    /// outside `region` can be restyled.
+    /// Labels that start or stop resolving are returned so references
+    /// outside `region` can be restyled. A destination change is not among
+    /// them: reference spans do not carry the URL, and `link_defs` is
+    /// updated here for the click.
     fn replace_definitions(
         &mut self,
         region: &Range<usize>,
@@ -319,19 +373,18 @@ impl ParseOutput {
         }
         self.definitions.sort_by_key(|d| d.range.start);
         // Each label touched resolves to its earliest remaining definition,
-        // wherever that is, or not at all. Unchanged labels are not returned:
-        // an edit that merely widened over a definition must not reparse
-        // every reference to it.
-        let mut seen: Vec<DefinitionLabel> = Vec::new();
+        // wherever that is, or not at all. Only a label that starts or stops
+        // resolving is returned. Typing a new destination, or widening over
+        // a definition that is still there, must not reparse every reference.
+        let mut seen: HashSet<&DefinitionLabel> = HashSet::new();
         let mut changed: Vec<DefinitionLabel> = Vec::new();
         for label in &touched {
-            if seen.contains(label) {
+            if !seen.insert(label) {
                 continue;
             }
-            seen.push(label.clone());
-            let previous = self.resolved(label);
+            let previous = self.resolved(label).is_some();
             self.retarget(label);
-            if self.resolved(label) != previous {
+            if self.resolved(label).is_some() != previous {
                 changed.push(label.clone());
             }
         }
