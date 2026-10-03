@@ -22,9 +22,7 @@ use crate::images::{ImageCache, ImageSlot};
 use crate::lines::{LineIndex, SCROLLBAR_WIDTH, ScrollPos, Synced};
 use crate::live_layout::{self, LeafLayout, LeafStyle, Reveal};
 use crate::motion;
-use crate::theme::{
-    self, BACKGROUND, CARET, CODE_BACKGROUND, LIST_MARKER, MARKUP, QUOTE_BAR, RULE, SELECTION, TEXT,
-};
+use crate::theme::{self, Theme};
 
 const PADDING: f32 = 28.0;
 const QUOTE_INDENT: f32 = 22.0;
@@ -254,6 +252,8 @@ pub struct LiveView {
     hint: Option<&'static str>,
     /// A link was Ctrl+clicked at this offset; the app follows it.
     follow: Option<usize>,
+    /// Colors, refreshed from the context every frame.
+    theme: std::sync::Arc<Theme>,
     /// The caret at this offset is at the end of a row that wrapped
     /// mid-word (End, or a click past the row), not the start of the next
     /// row. Stale as soon as the caret is anywhere else.
@@ -295,6 +295,7 @@ impl LiveView {
             seal_undo: false,
             hint: None,
             follow: None,
+            theme: std::sync::Arc::new(Theme::dark()),
             upstream_at: None,
             hit_upstream: false,
             selection_current: false,
@@ -439,6 +440,7 @@ impl LiveView {
         doc: &mut Document,
         parse: Option<&mut ParseState>,
     ) -> Response {
+        self.theme = theme::current(ui.ctx());
         let rect = ui.available_rect_before_wrap();
         ui.advance_cursor_after_rect(rect);
         let bar = Rect::from_min_max(pos2(rect.right() - SCROLLBAR_WIDTH, rect.top()), rect.max);
@@ -489,7 +491,7 @@ impl LiveView {
             self.lines.invalidate();
         }
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, BACKGROUND);
+        painter.rect_filled(rect, 0.0, self.theme.background);
         if self.images.is_none() {
             self.images = Some(ImageCache::new(ui.ctx()));
         }
@@ -573,7 +575,7 @@ impl LiveView {
             self.scroll_caret_into_view(ui, doc, parse, frame);
         }
         let caret = self.paint(&painter, doc, parse, frame);
-        self.lines.paint_scrollbar(&painter, bar);
+        self.lines.paint_scrollbar(&painter, bar, &self.theme);
         if let Some(r) = minimap {
             self.paint_minimap(&painter, ui, doc, parse, r, rect.height());
         }
@@ -639,7 +641,7 @@ impl LiveView {
 
     fn place(&mut self, doc: &Document, parse: &ParseOutput, leaf: Leaf, width: f32) -> Placed {
         let (map, link_defs) = (&parse.map, &parse.link_defs);
-        let layout = live_layout::build(doc, map, &leaf, self.reveal(doc));
+        let layout = live_layout::build(doc, map, &leaf, self.reveal(doc), &self.theme);
         let containers: f32 = leaf.containers.iter().map(container_indent).sum();
         let row = self.text.row_height();
         let (pad_top, pad_bottom, inner) = match layout.style {
@@ -772,7 +774,7 @@ impl LiveView {
                         };
                         (
                             cell.clone(),
-                            live_layout::build(doc, &parse.map, &leaf, reveal.clone()),
+                            live_layout::build(doc, &parse.map, &leaf, reveal.clone(), &self.theme),
                         )
                     })
                     .collect()
@@ -980,7 +982,13 @@ impl LiveView {
                 containers: Vec::new(),
             };
         }
-        let layout = live_layout::build(doc, &parse.map, &leaf, Some(reveal_at(doc, offset)));
+        let layout = live_layout::build(
+            doc,
+            &parse.map,
+            &leaf,
+            Some(reveal_at(doc, offset)),
+            &self.theme,
+        );
         let (seg, d) = layout.display_pos(offset);
         layout.source_pos(seg, d) == offset
     }
@@ -1538,7 +1546,7 @@ impl LiveView {
                 } else {
                     let h = self.text.line_height(&text);
                     self.text
-                        .draw_line(&mut meshes, &text, pos2(frame.left, y), MARKUP);
+                        .draw_line(&mut meshes, &text, pos2(frame.left, y), self.theme.markup);
                     h
                 };
                 self.lines.heights.set_measured(line, height);
@@ -1584,15 +1592,16 @@ impl LiveView {
                 .last()
                 .map_or(0.0, |c| c.x + c.w);
             let bg = Rect::from_min_size(c.min, vec2(width, c.height()));
-            painter.rect_filled(bg, 0.0, BACKGROUND);
-            self.text.draw_line(&mut meshes, &preedit, c.min, TEXT);
-            painter.hline(bg.x_range(), bg.bottom() - 1.0, (1.0, CARET));
+            painter.rect_filled(bg, 0.0, self.theme.background);
+            self.text
+                .draw_line(&mut meshes, &preedit, c.min, self.theme.text);
+            painter.hline(bg.x_range(), bg.bottom() - 1.0, (1.0, self.theme.caret));
         }
         self.text.end_frame(meshes, painter);
         if self.focused
             && let Some(c) = caret
         {
-            painter.rect_filled(c, 0.0, CARET);
+            painter.rect_filled(c, 0.0, self.theme.caret);
         }
         caret.filter(|c| rect.intersects(*c))
     }
@@ -1613,7 +1622,7 @@ impl LiveView {
             return;
         }
         let m = self.lines.minimap(rect, viewport);
-        m.paint_background(painter);
+        m.paint_background(painter, self.theme.mini_background);
         let (top, bottom) = m.window();
         let row = f64::from(self.text.row_height());
         let start = heights.line_at(top).line;
@@ -1641,11 +1650,17 @@ impl LiveView {
                         y + h * 0.35,
                         h * 0.45,
                         (indent, width.max(indent + 0.2)),
-                        theme::MINI_HEADING,
+                        self.theme.mini_heading,
                     );
                 }
                 BlockKind::CodeBlock { .. } | BlockKind::HtmlBlock => {
-                    m.bar(painter, y, h, (indent, 1.0), theme::MINI_CODE_BACKGROUND);
+                    m.bar(
+                        painter,
+                        y,
+                        h,
+                        (indent, 1.0),
+                        self.theme.mini_code_background,
+                    );
                     let rows = (h / row).round().max(1.0) as usize;
                     for i in 0..rows {
                         let w = 0.35 + 0.4 * ink(first + i);
@@ -1654,12 +1669,18 @@ impl LiveView {
                             y + (i as f64 + 0.3) * row,
                             row * 0.4,
                             (indent + 0.04, indent + w),
-                            theme::MINI_CODE,
+                            self.theme.mini_code,
                         );
                     }
                 }
                 BlockKind::ThematicBreak => {
-                    m.bar(painter, y + h / 2.0, 8.0, (indent, 1.0), theme::MINI_TEXT);
+                    m.bar(
+                        painter,
+                        y + h / 2.0,
+                        8.0,
+                        (indent, 1.0),
+                        self.theme.mini_text,
+                    );
                 }
                 _ => {
                     let rows = (h / row).round().max(1.0) as usize;
@@ -1674,13 +1695,18 @@ impl LiveView {
                             y + (i as f64 + 0.3) * row,
                             row * 0.4,
                             (indent, (indent + w).min(1.0)),
-                            theme::MINI_TEXT,
+                            self.theme.mini_text,
                         );
                     }
                 }
             }
         }
-        m.paint_viewport(painter, ui.rect_contains_pointer(rect));
+        let fill = if ui.rect_contains_pointer(rect) {
+            self.theme.mini_viewport_hover
+        } else {
+            self.theme.mini_viewport
+        };
+        m.paint_viewport(painter, fill, self.theme.mini_viewport_edge);
     }
 
     /// Draws `body`'s segments at `origin`, with selection highlights and
@@ -1711,7 +1737,7 @@ impl LiveView {
                     &mut rects,
                 );
                 for r in rects {
-                    painter.rect_filled(r.translate(o.to_vec2()), 0.0, SELECTION);
+                    painter.rect_filled(r.translate(o.to_vec2()), 0.0, self.theme.selection);
                 }
             }
             if hidden || (body.layout.style == LeafStyle::Rule && seg.text.is_empty()) {
@@ -1725,7 +1751,7 @@ impl LiveView {
                     wrap_width: Some(body.wrap),
                 },
                 o,
-                TEXT,
+                self.theme.text,
                 &seg.colors,
             );
             for strike in &seg.strikes {
@@ -1736,7 +1762,7 @@ impl LiveView {
                     painter.hline(
                         r.x_range(),
                         r.top() + r.height() * 0.55,
-                        Stroke::new(1.3, theme::STRUCK),
+                        Stroke::new(1.3, self.theme.struck),
                     );
                 }
             }
@@ -1762,7 +1788,7 @@ impl LiveView {
             match c.kind {
                 BlockKind::BlockQuote => {
                     let bar = Rect::from_min_max(pos2(x + 4.0, top), pos2(x + 7.0, top + p.height));
-                    painter.rect_filled(bar, 1.0, QUOTE_BAR);
+                    painter.rect_filled(bar, 1.0, self.theme.quote_bar);
                 }
                 BlockKind::Item if doc.byte_to_line(c.range.start) == p.first_line => {
                     let y = top + p.body.seg_tops.first().copied().unwrap_or(0.0);
@@ -1780,18 +1806,19 @@ impl LiveView {
                                 vec2(size, size),
                             );
                             if checked {
-                                painter.rect_filled(b, 3.0, theme::CHECKBOX_DONE);
+                                painter.rect_filled(b, 3.0, self.theme.checkbox_done);
                                 let tick = [
                                     pos2(b.left() + size * 0.22, b.top() + size * 0.52),
                                     pos2(b.left() + size * 0.42, b.top() + size * 0.72),
                                     pos2(b.left() + size * 0.78, b.top() + size * 0.3),
                                 ];
-                                painter.line(tick.to_vec(), Stroke::new(2.0, BACKGROUND));
+                                painter
+                                    .line(tick.to_vec(), Stroke::new(2.0, self.theme.background));
                             } else {
                                 painter.rect_stroke(
                                     b,
                                     3.0,
-                                    Stroke::new(1.5, LIST_MARKER),
+                                    Stroke::new(1.5, self.theme.list_marker),
                                     StrokeKind::Inside,
                                 );
                             }
@@ -1799,8 +1826,12 @@ impl LiveView {
                         }
                         None => {
                             let marker = list_marker(doc, parse, c, &p.leaf.containers);
-                            self.text
-                                .draw_line(meshes, &marker, pos2(x + 4.0, y), LIST_MARKER);
+                            self.text.draw_line(
+                                meshes,
+                                &marker,
+                                pos2(x + 4.0, y),
+                                self.theme.list_marker,
+                            );
                         }
                     }
                 }
@@ -1808,8 +1839,12 @@ impl LiveView {
                     if let Some(label) = footnote_label(doc, parse, c, &p.leaf.block) {
                         let y = top + p.body.seg_tops.first().copied().unwrap_or(0.0);
                         let marker = self.fit_marker(&label, FOOTNOTE_INDENT - 6.0);
-                        self.text
-                            .draw_line(meshes, &marker, pos2(x + 2.0, y), LIST_MARKER);
+                        self.text.draw_line(
+                            meshes,
+                            &marker,
+                            pos2(x + 2.0, y),
+                            self.theme.list_marker,
+                        );
                     }
                 }
                 _ => {}
@@ -1819,11 +1854,14 @@ impl LiveView {
         match p.body.layout.style {
             LeafStyle::Code | LeafStyle::Html => {
                 let bg = Rect::from_min_max(pos2(x, top + 2.0), pos2(right, top + p.height - 2.0));
-                painter.rect_filled(bg, 4.0, CODE_BACKGROUND);
+                painter.rect_filled(bg, 4.0, self.theme.code_background);
             }
             LeafStyle::Rule if p.body.layout.segments.iter().all(|s| s.text.is_empty()) => {
                 let y = top + p.height / 2.0;
-                painter.line_segment([pos2(x, y), pos2(right, y)], Stroke::new(1.5, RULE));
+                painter.line_segment(
+                    [pos2(x, y), pos2(right, y)],
+                    Stroke::new(1.5, self.theme.rule),
+                );
             }
             _ => {}
         }
@@ -1833,9 +1871,9 @@ impl LiveView {
             let r = Rect::from_min_size(origin, vec2(grid.width(), grid.height()));
             if grid.has_head && !grid.row_h.is_empty() {
                 let head = Rect::from_min_size(origin, vec2(grid.width(), grid.row_h[0]));
-                painter.rect_filled(head, 0.0, CODE_BACKGROUND);
+                painter.rect_filled(head, 0.0, self.theme.code_background);
             }
-            let line = Stroke::new(1.0, QUOTE_BAR);
+            let line = Stroke::new(1.0, self.theme.quote_bar);
             for y in grid.row_y.iter().skip(1) {
                 painter.hline(r.x_range(), origin.y + y, line);
             }
@@ -1876,10 +1914,16 @@ impl LiveView {
                 ImageSlot::Failed(e) => format!("Can't show {}: {e}", image.dest),
                 ImageSlot::Remote => format!("Remote image not loaded: {}", image.dest),
             };
-            painter.rect_filled(r, 4.0, CODE_BACKGROUND);
-            painter.rect_stroke(r, 4.0, Stroke::new(1.0, QUOTE_BAR), StrokeKind::Inside);
+            painter.rect_filled(r, 4.0, self.theme.code_background);
+            painter.rect_stroke(
+                r,
+                4.0,
+                Stroke::new(1.0, self.theme.quote_bar),
+                StrokeKind::Inside,
+            );
             let label_pos = pos2(r.left() + 10.0, r.center().y - self.text.row_height() / 2.0);
-            self.text.draw_line(meshes, &label, label_pos, MARKUP);
+            self.text
+                .draw_line(meshes, &label, label_pos, self.theme.markup);
         }
     }
 }

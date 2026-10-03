@@ -11,12 +11,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use egui::{
-    Align2, Color32, EventFilter, FontId, Id, Key, Modifiers, Rect, Response, RichText, ScrollArea,
-    Sense, Ui, pos2, vec2,
+    Align2, EventFilter, FontId, Id, Key, Modifiers, Rect, Response, RichText, ScrollArea, Sense,
+    Ui, pos2, vec2,
 };
 use inkmark_files::{Entry, Pending, Row, Tree, Watch, list_dir};
 
-use crate::theme::{self, BACKGROUND, MARKUP, SELECTION, TEXT};
+use crate::theme::{self, Theme};
 
 const ROW_H: f32 = 22.0;
 
@@ -84,6 +84,8 @@ pub struct FileBrowser {
     refresh_rect: Option<Rect>,
     new_file_rect: Option<Rect>,
     watch: Option<Watch>,
+    /// Colors, refreshed from the context every frame.
+    theme: std::sync::Arc<Theme>,
 }
 
 impl FileBrowser {
@@ -109,6 +111,7 @@ impl FileBrowser {
             refresh_rect: None,
             new_file_rect: None,
             watch: None,
+            theme: std::sync::Arc::new(Theme::dark()),
         }
     }
 
@@ -241,6 +244,7 @@ impl FileBrowser {
     }
 
     pub fn show(&mut self, ui: &mut Ui) -> BrowserOutput {
+        self.theme = theme::current(ui.ctx());
         self.poll(ui.ctx());
         if self.focus_next {
             ui.memory_mut(|m| m.request_focus(self.id));
@@ -258,7 +262,7 @@ impl FileBrowser {
             );
         });
         let rect = ui.max_rect();
-        ui.painter().rect_filled(rect, 0.0, BACKGROUND);
+        ui.painter().rect_filled(rect, 0.0, self.theme.background);
         // Clicks on empty space focus the tree without moving the caret in a pane.
         let background = ui.interact(rect, self.id, Sense::click());
         if background.clicked() {
@@ -357,7 +361,7 @@ impl FileBrowser {
     fn header(&mut self, ui: &mut Ui, output: &mut BrowserOutput) {
         let name = self.tree.root_name().to_string();
         ui.add_space(4.0);
-        ui.label(RichText::new(name).strong().color(TEXT));
+        ui.label(RichText::new(name).strong().color(self.theme.text));
         // Wrapped, so a narrow sidebar doesn't spill the buttons over the panes.
         ui.horizontal_wrapped(|ui| {
             let can_up = self.tree.parent_root().is_some();
@@ -597,7 +601,7 @@ impl FileBrowser {
                             ui.painter().rect_stroke(
                                 response.rect.shrink(1.0),
                                 2.0,
-                                egui::Stroke::new(1.5, theme::CARET),
+                                egui::Stroke::new(1.5, self.theme.caret),
                                 egui::StrokeKind::Inside,
                             );
                         }
@@ -664,16 +668,15 @@ impl FileBrowser {
         let selected = self.selected.as_deref() == Some(row.path.as_path());
         let current = self.current.as_deref() == Some(row.path.as_path());
         if selected {
-            ui.painter().rect_filled(rect, 0.0, SELECTION);
+            ui.painter().rect_filled(rect, 0.0, self.theme.selection);
         } else if current {
-            ui.painter()
-                .rect_filled(rect, 0.0, Color32::from_rgb(32, 40, 54));
+            ui.painter().rect_filled(rect, 0.0, self.theme.current_row);
         }
         if current {
             ui.painter().rect_filled(
                 Rect::from_min_max(rect.min, pos2(rect.left() + 2.0, rect.bottom())),
                 0.0,
-                theme::CARET,
+                self.theme.caret,
             );
         }
         let indent = rect.left() + 8.0 + row.depth as f32 * 14.0;
@@ -689,16 +692,16 @@ impl FileBrowser {
             label.push_str("  loop");
         }
         let color = if row.kind.is_dir() || row.kind.openable() {
-            TEXT
+            self.theme.text
         } else {
-            MARKUP
+            self.theme.markup
         };
         ui.painter().text(
             pos2(indent, rect.center().y),
             Align2::LEFT_CENTER,
             marker,
             FontId::proportional(13.0),
-            MARKUP,
+            self.theme.markup,
         );
         ui.painter().text(
             pos2(indent + 16.0, rect.center().y),

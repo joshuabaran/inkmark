@@ -18,7 +18,7 @@ use crate::commands::{self, EditPlan};
 use crate::lines::SCROLLBAR_WIDTH;
 use crate::lines::{LineIndex, ScrollPos, Synced};
 use crate::motion;
-use crate::theme::{self, BACKGROUND, CARET, SELECTION, TEXT};
+use crate::theme::{self, Theme};
 
 const PADDING: f32 = 12.0;
 const CARET_WIDTH: f32 = 2.0;
@@ -67,6 +67,8 @@ pub struct CodeView {
     pending_scroll: Option<ScrollPos>,
     /// A link was Ctrl+clicked at this offset; the app follows it.
     follow: Option<usize>,
+    /// Colors, refreshed from the context every frame.
+    theme: std::sync::Arc<Theme>,
     /// The caret at this offset is at the end of a row that wrapped
     /// mid-word (End, or a click past the row), not the start of the next
     /// row. Stale as soon as the caret is anywhere else.
@@ -111,6 +113,7 @@ impl CodeView {
             selection_current: false,
             pending_scroll: None,
             follow: None,
+            theme: std::sync::Arc::new(Theme::dark()),
             upstream_at: None,
             hit_upstream: false,
             font_size: 14.0,
@@ -215,6 +218,7 @@ impl CodeView {
         doc: &mut Document,
         parse: Option<&mut ParseState>,
     ) -> Response {
+        self.theme = theme::current(ui.ctx());
         let rect = ui.available_rect_before_wrap();
         ui.advance_cursor_after_rect(rect);
         let bar_left = rect.right() - SCROLLBAR_WIDTH;
@@ -889,7 +893,7 @@ impl CodeView {
     ) -> Option<Rect> {
         let rect = frame.rect;
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, BACKGROUND);
+        painter.rect_filled(rect, 0.0, self.theme.background);
 
         let selection = self.selection.range();
         let caret_line = doc.byte_to_line(self.selection.head);
@@ -940,7 +944,7 @@ impl CodeView {
                 for span in parse.map.spans_in(range.clone()) {
                     let local = span.range.start.max(range.start) - range.start
                         ..span.range.end.min(range.end) - range.start;
-                    if let Some(color) = theme::code_color(&span)
+                    if let Some(color) = self.theme.code_color(&span)
                         && !local.is_empty()
                     {
                         colors.push((local, color));
@@ -948,12 +952,12 @@ impl CodeView {
                 }
             }
             self.text
-                .draw_line_colored(&mut meshes, &text, origin, TEXT, &colors);
+                .draw_line_colored(&mut meshes, &text, origin, self.theme.text, &colors);
             y += height;
             line += 1;
         }
         for r in highlights {
-            painter.rect_filled(r, 0.0, SELECTION);
+            painter.rect_filled(r, 0.0, self.theme.selection);
         }
         if let Some(c) = caret
             && !self.preedit.is_empty()
@@ -965,17 +969,19 @@ impl CodeView {
                 .last()
                 .map_or(0.0, |c| c.x + c.w);
             let bg = Rect::from_min_size(c.min, vec2(width, c.height()));
-            painter.rect_filled(bg, 0.0, BACKGROUND);
-            self.text.draw_line(&mut meshes, &preedit, c.min, TEXT);
-            painter.hline(bg.x_range(), bg.bottom() - 1.0, (1.0, CARET));
+            painter.rect_filled(bg, 0.0, self.theme.background);
+            self.text
+                .draw_line(&mut meshes, &preedit, c.min, self.theme.text);
+            painter.hline(bg.x_range(), bg.bottom() - 1.0, (1.0, self.theme.caret));
         }
         self.text.end_frame(meshes, &painter);
         if focused && let Some(c) = caret {
-            painter.rect_filled(c, 0.0, CARET);
+            painter.rect_filled(c, 0.0, self.theme.caret);
         }
         self.lines.paint_scrollbar(
             &painter,
             Rect::from_min_max(pos2(frame.bar_left, rect.top()), rect.max),
+            &self.theme,
         );
         if let Some(r) = frame.minimap {
             self.paint_minimap(&painter, ui, doc, parse, r);
@@ -1000,7 +1006,7 @@ impl CodeView {
             return;
         }
         let m = self.lines.minimap(rect, self.viewport);
-        m.paint_background(painter);
+        m.paint_background(painter, self.theme.mini_background);
         let parse = parse.filter(|p| p.map.len() == doc.len());
         let (top, bottom) = m.window();
         let mut line = heights.line_at(top).line;
@@ -1026,8 +1032,8 @@ impl CodeView {
                 let start = doc.line_to_byte(line) + indent_bytes;
                 let color = parse
                     .and_then(|p| p.map.spans_in(start..start + 1).into_iter().next())
-                    .and_then(|s| theme::code_color(&s))
-                    .map_or(theme::MINI_TEXT, |c| c.gamma_multiply(0.55));
+                    .and_then(|s| self.theme.code_color(&s))
+                    .map_or(self.theme.mini_text, |c| c.gamma_multiply(0.55));
                 m.bar(
                     painter,
                     y + h * 0.2,
@@ -1039,6 +1045,11 @@ impl CodeView {
             y += h;
             line += 1;
         }
-        m.paint_viewport(painter, ui.rect_contains_pointer(rect));
+        let fill = if ui.rect_contains_pointer(rect) {
+            self.theme.mini_viewport_hover
+        } else {
+            self.theme.mini_viewport
+        };
+        m.paint_viewport(painter, fill, self.theme.mini_viewport_edge);
     }
 }

@@ -4,8 +4,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Color32, Key, KeyboardShortcut, Modifiers, Rect, RichText, Stroke, UiBuilder,
-    ViewportCommand, pos2,
+    self, Key, KeyboardShortcut, Modifiers, Rect, RichText, Stroke, UiBuilder, ViewportCommand,
+    pos2,
 };
 use inkmark_buffer::{DiskStatus, Document, LineEnding, OpenError};
 use inkmark_files::{
@@ -13,7 +13,7 @@ use inkmark_files::{
 };
 use inkmark_parse::{GfmParser, ParseState};
 use inkmark_text::Fonts;
-use inkmark_view::{BrowserOutput, CodeView, FileBrowser, LiveView};
+use inkmark_view::{BrowserOutput, CodeView, FileBrowser, LiveView, theme};
 
 /// How long a key hint stays in the status bar.
 const HINT_TIME: Duration = Duration::from_secs(4);
@@ -53,6 +53,7 @@ enum Pane {
 
 mod links;
 mod measure;
+mod os_theme;
 mod recent;
 mod sidebar;
 
@@ -133,7 +134,6 @@ fn main() -> eframe::Result {
         "inkmark",
         options,
         Box::new(|cc| {
-            cc.egui_ctx.set_theme(egui::Theme::Dark);
             let mut app = App::new(&cc.egui_ctx, path);
             app.measure = measure::Measure::from_env(start);
             Ok(Box::new(app))
@@ -245,6 +245,8 @@ struct App {
     trash_confirm: Option<PathBuf>,
     /// Where Move to Trash sends things; tests use their own.
     trash: Box<dyn Trash>,
+    /// The desktop's colors, followed live (fixed in tests).
+    os_theme: os_theme::OsTheme,
     /// A dialog took keyboard focus from the panes last frame.
     modal_was_open: bool,
     /// Tests receive the dialog kind instead of opening a portal window.
@@ -254,7 +256,9 @@ struct App {
 
 impl App {
     fn new(ctx: &egui::Context, path: Option<PathBuf>) -> Self {
-        Self::with_recent(ctx, path, recent::Recent::load())
+        let mut app = Self::with_recent(ctx, path, recent::Recent::load());
+        app.os_theme = os_theme::OsTheme::follow(ctx);
+        app
     }
 
     fn with_recent(ctx: &egui::Context, path: Option<PathBuf>, recent: recent::Recent) -> Self {
@@ -303,6 +307,7 @@ impl App {
             rename: None,
             trash_confirm: None,
             trash: Box::new(SystemTrash),
+            os_theme: os_theme::OsTheme::fixed(),
             modal_was_open: false,
             #[cfg(test)]
             dialog_hook: None,
@@ -674,7 +679,7 @@ impl App {
         let mut action = None;
         if let Some(message) = &self.error {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(message).color(Color32::from_rgb(255, 140, 120)));
+                ui.label(RichText::new(message).color(theme::current(ui.ctx()).error));
                 if ui.button("Dismiss").clicked() {
                     action = Some("dismiss");
                 }
@@ -736,7 +741,7 @@ impl App {
                 ui.label("●");
             }
             if let Some((hint, _)) = &self.hint {
-                ui.label(RichText::new(hint).color(Color32::from_rgb(230, 200, 120)));
+                ui.label(RichText::new(hint).color(theme::current(ui.ctx()).hint));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(if encoding.bom { "UTF-8 BOM" } else { "UTF-8" });
@@ -1165,10 +1170,13 @@ impl App {
         if handle_resp.drag_stopped() {
             self.sidebar.save();
         }
+        // The gap would otherwise show the window's clear color.
+        let colors = theme::current(ui.ctx());
+        ui.painter().rect_filled(handle, 0.0, colors.background);
         ui.painter().vline(
             handle.center().x,
             handle.y_range(),
-            Stroke::new(1.0, Color32::from_gray(40)),
+            Stroke::new(1.0, colors.divider),
         );
         if right.width() > 1.0 {
             ui.scope_builder(UiBuilder::new().max_rect(right), |ui| self.panes(ui));
@@ -1377,7 +1385,7 @@ impl App {
                 ui.painter().vline(
                     mid,
                     rect.y_range(),
-                    Stroke::new(2.0, Color32::from_gray(40)),
+                    Stroke::new(2.0, theme::current(ui.ctx()).divider),
                 );
             }
         }
@@ -1420,6 +1428,7 @@ impl App {
     /// drive exactly this, without a real window.
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.os_theme.poll(&ctx);
         self.handle_shortcuts(&ctx);
         self.poll_dialog(&ctx);
         self.check_disk(&ctx);
@@ -1523,7 +1532,7 @@ fn name_modal(
             edit.state.store(ui.ctx(), field);
         }
         if let Some(error) = error {
-            ui.label(RichText::new(error).color(Color32::from_rgb(255, 140, 120)));
+            ui.label(RichText::new(error).color(theme::current(ui.ctx()).error));
         }
         ui.horizontal(|ui| {
             if ui.button(action).clicked() {

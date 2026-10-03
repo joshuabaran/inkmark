@@ -7,7 +7,7 @@ use inkmark_buffer::{Change, Document};
 use inkmark_minimap::Minimap;
 use inkmark_text::{HeightCache, ScrollAnchor};
 
-use crate::theme::{SCROLL_THUMB, SCROLL_TRACK};
+use crate::theme::Theme;
 
 pub(crate) const SCROLLBAR_WIDTH: f32 = 10.0;
 
@@ -177,8 +177,8 @@ impl LineIndex {
         (target.is_some(), response.hovered())
     }
 
-    pub fn paint_scrollbar(&self, painter: &Painter, bar: Rect) {
-        painter.rect_filled(bar, 0.0, SCROLL_TRACK);
+    pub fn paint_scrollbar(&self, painter: &Painter, bar: Rect, theme: &Theme) {
+        painter.rect_filled(bar, 0.0, theme.scroll_track);
         let total = self.heights.total().max(1.0) as f32;
         let viewport = bar.height();
         if total <= viewport {
@@ -191,7 +191,7 @@ impl LineIndex {
             pos2(bar.left() + 2.0, bar.top() + top),
             vec2(SCROLLBAR_WIDTH - 4.0, height),
         );
-        painter.rect_filled(thumb, 3.0, SCROLL_THUMB);
+        painter.rect_filled(thumb, 3.0, theme.scroll_thumb);
     }
 
     /// Re-estimates every height. `changes` (already applied to the anchor)
