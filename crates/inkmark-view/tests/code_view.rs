@@ -438,3 +438,126 @@ fn clicking_minimap_or_scrollbar_keeps_typing_focus() {
         );
     }
 }
+
+#[test]
+fn ctrl_arrows_and_ctrl_delete_work_by_word() {
+    let mut h = Harness::new("alpha beta gamma");
+    h.key(Key::ArrowRight, CMD);
+    assert_eq!(h.head(), 5);
+    h.key(Key::ArrowRight, CMD);
+    assert_eq!(h.head(), 10);
+    h.key(Key::ArrowLeft, CMD);
+    assert_eq!(h.head(), 6);
+    h.key(Key::ArrowRight, CMD.plus(SHIFT));
+    assert_eq!(
+        h.view.selection().range(),
+        6..10,
+        "Ctrl+Shift selects by word"
+    );
+    h.press(Key::ArrowLeft);
+    h.key(Key::Backspace, CMD);
+    assert_eq!(h.text(), "beta gamma");
+    h.key(Key::Delete, CMD);
+    assert_eq!(h.text(), " gamma");
+    h.key(Key::Z, CMD);
+    h.key(Key::Z, CMD);
+    assert_eq!(h.text(), "alpha beta gamma");
+}
+
+#[test]
+fn formatting_shortcuts_patch_the_source() {
+    let mut h = Harness::new("make this bold\n- [ ] task");
+    // Select "this" by word.
+    h.key(Key::ArrowRight, CMD);
+    h.press(Key::ArrowRight);
+    h.key(Key::ArrowRight, CMD.plus(SHIFT));
+    h.key(Key::B, CMD);
+    assert_eq!(h.text(), "make **this** bold\n- [ ] task");
+    h.key(Key::B, CMD);
+    assert_eq!(h.text(), "make this bold\n- [ ] task", "toggles off");
+    h.key(Key::I, CMD);
+    assert_eq!(h.text(), "make *this* bold\n- [ ] task");
+    h.key(Key::Z, CMD);
+    h.key(Key::Backtick, CMD);
+    assert_eq!(h.text(), "make `this` bold\n- [ ] task");
+    h.key(Key::Z, CMD);
+    h.key(Key::X, CMD.plus(SHIFT));
+    assert_eq!(h.text(), "make ~~this~~ bold\n- [ ] task");
+    h.key(Key::Z, CMD);
+    h.key(Key::K, CMD);
+    assert!(h.text().starts_with("make [this]("), "{}", h.text());
+    h.key(Key::Z, CMD);
+    // Ctrl+Enter ticks the task on the caret's line; Ctrl+Alt+2 makes a heading.
+    h.key(Key::End, CMD);
+    h.key(Key::Enter, CMD);
+    assert_eq!(h.text(), "make this bold\n- [x] task");
+    h.key(Key::Home, CMD);
+    h.key(Key::Num2, CMD.plus(Modifiers::ALT));
+    assert_eq!(h.text(), "## make this bold\n- [x] task");
+    // Ctrl+A selects everything.
+    h.key(Key::A, CMD);
+    assert_eq!(h.view.selection().range(), 0..h.doc.len());
+}
+
+#[test]
+fn dragging_past_the_bottom_edge_scrolls_and_extends_the_selection() {
+    let text: String = (0..400).map(|i| format!("line {i}\n")).collect();
+    let mut h = Harness::new(&text);
+    let start = pos2(60.0, 20.0);
+    let below = pos2(60.0, SCREEN.bottom() + 40.0);
+    let button = |pos, pressed| Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    h.frame(vec![Event::PointerMoved(start), button(start, true)]);
+    h.frame(vec![Event::PointerMoved(below)]);
+    let first = h.head();
+    for _ in 0..30 {
+        h.frame(vec![Event::PointerMoved(below)]);
+    }
+    let later = h.head();
+    h.frame(vec![button(below, false)]);
+    let line_of = |at: usize| text[..at].matches('\n').count();
+    assert!(
+        line_of(later) > line_of(first) + 5,
+        "holding below the pane keeps scrolling: line {} then {}",
+        line_of(first),
+        line_of(later)
+    );
+    assert!(
+        h.view.selection().anchor < 20,
+        "the selection still starts where it was pressed"
+    );
+}
+
+#[test]
+fn end_on_a_mid_word_wrap_stays_on_the_row() {
+    // Review of #28: a row that wraps inside a word used to end before its
+    // last character, and the caret at the true end drew on the next row,
+    // so a second End walked on.
+    let long = "x".repeat(400);
+    let mut h = Harness::new(&format!("{long}\nend"));
+    h.press(Key::End);
+    let row_end = h.head();
+    assert!(row_end > 10 && row_end < 400, "wrapped: {row_end}");
+    h.press(Key::End);
+    assert_eq!(h.head(), row_end, "End again stays on the row");
+    // The next row starts exactly there: End reached the row's true end.
+    h.press(Key::ArrowRight);
+    h.press(Key::Home);
+    assert_eq!(h.head(), row_end, "the next row starts where End stopped");
+    h.press(Key::ArrowLeft);
+    h.press(Key::End);
+    h.press(Key::Home);
+    assert_eq!(h.head(), 0, "Home from the row's end goes to its start");
+    h.press(Key::End);
+    h.type_text("Y");
+    assert_eq!(
+        h.text()[row_end..row_end + 1].to_owned(),
+        "Y",
+        "typed after the row's last x"
+    );
+    assert_eq!(h.text().len(), 400 + 1 + 4);
+}

@@ -1358,6 +1358,14 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame(ui);
+    }
+}
+
+impl App {
+    /// One frame of the whole app. Separate from `eframe::App::ui` so tests
+    /// drive exactly this, without a real window.
+    fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.handle_shortcuts(&ctx);
         self.poll_dialog(&ctx);
@@ -2592,5 +2600,307 @@ mod tests {
         let note = offset_of(&app, "The source");
         assert_eq!(app.live.selection().head, note);
         assert_eq!(app.code.selection().head, note);
+    }
+
+    /// Runs whole-app frames (`App::frame`, as the window does) and keeps
+    /// what each frame drew and asked the window to do.
+    struct Run {
+        ctx: egui::Context,
+        app: App,
+        time: f64,
+        out: egui::FullOutput,
+    }
+
+    impl Run {
+        fn new(dir: &Path, path: Option<PathBuf>) -> Self {
+            let ctx = egui::Context::default();
+            let recent = recent::Recent::from_store(Some(dir.join("recent")));
+            let app = App::with_recent(&ctx, path, recent);
+            let mut run = Self {
+                ctx,
+                app,
+                time: 0.0,
+                out: Default::default(),
+            };
+            run.settle();
+            run
+        }
+
+        fn input(&mut self, events: Vec<egui::Event>) -> egui::RawInput {
+            self.time += 1.0 / 60.0;
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_max(
+                    egui::Pos2::ZERO,
+                    egui::pos2(1000.0, 700.0),
+                )),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            }
+        }
+
+        fn run(&mut self, input: egui::RawInput) {
+            let app = &mut self.app;
+            self.out = self.ctx.run_ui(input, |ui| app.frame(ui));
+            self.out.textures_delta.clear();
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let input = self.input(events);
+            self.run(input);
+        }
+
+        fn key(&mut self, key: egui::Key, modifiers: egui::Modifiers) {
+            self.frame(vec![shortcut(key, modifiers)]);
+        }
+
+        /// The window's close button.
+        fn close_window(&mut self) {
+            let mut input = self.input(vec![]);
+            input.viewports.insert(
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    events: vec![egui::ViewportEvent::Close],
+                    ..Default::default()
+                },
+            );
+            self.run(input);
+        }
+
+        fn sent(&self, command: &ViewportCommand) -> bool {
+            self.out
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|v| v.commands.contains(command))
+        }
+
+        /// Where the last frame drew `text` (a button or a list row).
+        fn text_rect(&self, text: &str) -> Option<egui::Rect> {
+            fn find(shape: &egui::Shape, text: &str) -> Option<egui::Rect> {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == text => {
+                        Some(t.galley.rect.translate(t.pos.to_vec2()))
+                    }
+                    egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
+                    _ => None,
+                }
+            }
+            // The last match is drawn on top (a dialog over the sidebar).
+            self.out
+                .shapes
+                .iter()
+                .rev()
+                .find_map(|c| find(&c.shape, text))
+        }
+
+        fn click_text(&mut self, text: &str) {
+            // A dialog's first frame only measures it; give it a frame or
+            // two to be drawn.
+            for _ in 0..3 {
+                if self.text_rect(text).is_some() {
+                    break;
+                }
+                self.frame(vec![]);
+            }
+            let at = self
+                .text_rect(text)
+                .unwrap_or_else(|| panic!("{text:?} isn't on screen"))
+                .center();
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            self.frame(vec![egui::Event::PointerMoved(at)]);
+            self.frame(vec![button(true)]);
+            self.frame(vec![button(false)]);
+            self.frame(vec![]);
+        }
+
+        fn settle(&mut self) {
+            let start = Instant::now();
+            while !self.app.parse.is_settled() {
+                self.frame(vec![]);
+                assert!(start.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            self.frame(vec![]);
+        }
+
+        fn check_disk_now(&mut self) {
+            self.app.next_disk_check = Instant::now();
+            self.frame(vec![]);
+        }
+    }
+
+    #[test]
+    fn closing_with_unsaved_changes_asks_and_cancel_keeps_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "one\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(path.clone()));
+        type_into(&mut r.app, "two\n");
+        r.close_window();
+        assert_eq!(r.app.confirm, Some(Confirm::Close));
+        assert!(
+            r.sent(&ViewportCommand::CancelClose),
+            "the close is held back"
+        );
+        r.frame(vec![]);
+        r.click_text("Cancel");
+        assert!(r.app.confirm.is_none());
+        r.frame(vec![]);
+        assert!(!r.sent(&ViewportCommand::Close));
+        assert_eq!(text(&r.app), "one\ntwo\n");
+        // Escape cancels too.
+        r.close_window();
+        r.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(r.app.confirm.is_none());
+        assert!(!r.sent(&ViewportCommand::Close));
+    }
+
+    #[test]
+    fn closing_discards_or_saves_as_chosen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "one\n").unwrap();
+
+        let mut r = Run::new(dir.path(), Some(path.clone()));
+        type_into(&mut r.app, "two\n");
+        r.close_window();
+        r.frame(vec![]);
+        r.click_text("Discard");
+        assert!(r.sent(&ViewportCommand::Close));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one\n", "nothing saved");
+
+        let mut r = Run::new(dir.path(), Some(path.clone()));
+        type_into(&mut r.app, "two\n");
+        r.close_window();
+        r.frame(vec![]);
+        r.click_text("Save");
+        r.frame(vec![]);
+        assert!(r.sent(&ViewportCommand::Close));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn closing_a_saved_document_doesnt_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "one\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(path));
+        r.close_window();
+        assert!(r.app.confirm.is_none());
+        assert!(!r.sent(&ViewportCommand::CancelClose));
+    }
+
+    #[test]
+    fn opening_another_file_saves_discards_or_cancels_as_chosen() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        for (choice, saved, opened) in [
+            ("Save", true, true),
+            ("Discard", false, true),
+            ("Cancel", false, false),
+        ] {
+            fs::write(&a, "a\n").unwrap();
+            let mut r = Run::new(dir.path(), Some(a.clone()));
+            type_into(&mut r.app, "edit\n");
+            r.app.request_open(b.clone());
+            r.frame(vec![]);
+            r.click_text(choice);
+            assert!(r.app.confirm.is_none(), "{choice}");
+            assert_eq!(
+                fs::read_to_string(&a).unwrap() == "a\nedit\n",
+                saved,
+                "{choice}: saved?"
+            );
+            let now = r.app.doc.path().unwrap().to_path_buf();
+            assert_eq!(now == b, opened, "{choice}: opened?");
+            if !opened {
+                assert_eq!(text(&r.app), "a\nedit\n", "{choice}: edits kept");
+            }
+        }
+    }
+
+    #[test]
+    fn keep_mine_and_reload_answer_a_change_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "one\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(path.clone()));
+        type_into(&mut r.app, "mine\n");
+        fs::write(&path, "theirs\n").unwrap();
+        r.check_disk_now();
+        assert!(matches!(r.app.banner, Some(Banner::DiskChanged)));
+        r.click_text("Keep mine");
+        assert!(r.app.banner.is_none());
+        r.check_disk_now();
+        assert!(r.app.banner.is_none(), "their version counts as seen");
+        // Saving now writes ours over theirs, as chosen.
+        r.app.save();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one\nmine\n");
+
+        fs::write(&path, "theirs again\n").unwrap();
+        r.check_disk_now();
+        r.click_text("Reload");
+        assert_eq!(text(&r.app), "theirs again\n");
+        assert!(r.app.banner.is_none());
+    }
+
+    #[test]
+    fn a_deleted_file_is_noticed_and_the_banner_dismissed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "one\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(path.clone()));
+        fs::remove_file(&path).unwrap();
+        r.check_disk_now();
+        assert!(matches!(r.app.banner, Some(Banner::DiskMissing)));
+        r.click_text("Dismiss");
+        assert!(r.app.banner.is_none());
+        r.check_disk_now();
+        assert!(r.app.banner.is_none(), "dismissed stays dismissed");
+        // If a file appears there again, that's a change.
+        fs::write(&path, "new\n").unwrap();
+        r.check_disk_now();
+        assert!(matches!(r.app.banner, Some(Banner::DiskChanged)));
+        assert_eq!(text(&r.app), "one\n");
+    }
+
+    #[test]
+    fn the_recent_list_opens_by_keyboard_or_click() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) = (
+            dir.path().join("a.md"),
+            dir.path().join("b.md"),
+            dir.path().join("c.md"),
+        );
+        for p in [&a, &b, &c] {
+            fs::write(p, "x\n").unwrap();
+        }
+        let mut r = Run::new(dir.path(), Some(a.clone()));
+        for p in [&b, &c] {
+            r.app.recent.add(p);
+        }
+        // c, b, a: Ctrl+R, Down, Enter opens b.
+        r.key(egui::Key::R, egui::Modifiers::COMMAND);
+        assert_eq!(r.app.recent_list, Some(0));
+        r.key(egui::Key::ArrowDown, egui::Modifiers::NONE);
+        r.key(egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(r.app.recent_list.is_none());
+        assert_eq!(r.app.doc.path(), Some(b.as_path()));
+        // Escape closes it; a click on a row opens that file.
+        r.key(egui::Key::R, egui::Modifiers::COMMAND);
+        r.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(r.app.recent_list.is_none());
+        r.key(egui::Key::R, egui::Modifiers::COMMAND);
+        r.frame(vec![]);
+        r.click_text("c.md");
+        assert_eq!(r.app.doc.path(), Some(c.as_path()));
     }
 }

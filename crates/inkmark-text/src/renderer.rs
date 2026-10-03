@@ -293,7 +293,8 @@ impl TextRenderer {
         let ppp = self.pixels_per_point;
         let line_height_px = self.line_height_px;
         let row_height = self.row_height();
-        let text_len = line.text.len();
+        let text = line.text;
+        let text_len = text.len();
         let buffer_line = self.cached_line(line);
         let mut rows: Vec<Row> = Vec::new();
         for run in buffer_line.layout_runs(None, line_height_px) {
@@ -310,12 +311,17 @@ impl TextRenderer {
             let prev_end = rows.last().map_or(0, |r| r.end);
             let start = clusters.iter().map(|c| c.start).min().unwrap_or(prev_end);
             let end = clusters.iter().map(|c| c.end).max().unwrap_or(prev_end);
+            let ends_in_space = clusters.last().is_some_and(|c| {
+                text.get(c.start..c.end)
+                    .is_some_and(|t| !t.is_empty() && t.chars().all(char::is_whitespace))
+            });
             rows.push(Row {
                 top: run.line_top / ppp,
                 height: run.line_height / ppp,
                 start,
                 end,
                 clusters,
+                ends_in_space,
             });
         }
         if rows.is_empty() {
