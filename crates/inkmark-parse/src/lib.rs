@@ -12,8 +12,8 @@ mod tree;
 
 pub use images::{InlineImage, inline_images};
 pub use links::{
-    Heading, Link, definition_label, footnote_offset, heading_offset, headings, is_link, link_at,
-    slug,
+    Heading, HeadingRegion, Link, definition_label, footnote_offset, heading_offset,
+    heading_regions, headings, is_link, link_at, slug,
 };
 pub use map::{SourceMap, Span, SpanKind, Style, Syntax};
 pub use pulldown::{GfmParser, PulldownParser};

@@ -162,6 +162,7 @@ inkmark               # browses the current directory and shows recent files
 | Ctrl+H | Replace in this file (`replace`) |
 | F3 | Find the next match (`find_next`) |
 | Shift+F3 | Find the previous match (`find_previous`) |
+| Ctrl+G | Go to line (`go_to_line`) |
 
 Arrows, Home, End, Page Up, Page Down, Backspace, Delete, Enter and Tab edit
 as usual, and holding Shift extends a selection. Those keys are not in the

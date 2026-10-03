@@ -44,6 +44,7 @@ enum Pane {
 
 mod config;
 mod findbar;
+mod gotoline;
 mod links;
 mod measure;
 mod os_theme;
@@ -52,6 +53,7 @@ mod recent;
 mod session;
 
 use findbar::FindBar;
+use gotoline::GoToLine;
 mod sidebar;
 
 const USAGE: &str = "\
@@ -319,6 +321,8 @@ struct App {
     /// Find and replace in the open document. Closed, it still remembers
     /// the query so F3 can repeat it.
     find: FindBar,
+    /// Ctrl+G. Closed, it keeps nothing: the next open starts empty.
+    goto: GoToLine,
     /// Heading rows for the outline, rebuilt when the parse revision changes.
     outline: outline::Outline,
     /// The error banner text the settings put up, to take down once fixed.
@@ -401,6 +405,7 @@ impl App {
             settings: config::Settings::default(),
             keys: keys::KeyMap::builtin(),
             find: FindBar::default(),
+            goto: GoToLine::default(),
             outline: outline::Outline::default(),
             settings_error: None,
             modal_was_open: false,
@@ -808,6 +813,7 @@ impl App {
             Action::Replace => self.open_find(ctx, true),
             Action::FindNext => self.find_move(true),
             Action::FindPrevious => self.find_move(false),
+            Action::GoToLine => self.open_goto(ctx),
             _ => {}
         }
     }
@@ -817,11 +823,23 @@ impl App {
         if self.modal_open() {
             return;
         }
+        self.goto.close();
         let selection = self.selection();
         let range = selection.range();
         let seed = FindBar::seed(self.doc.slice(range.clone()).as_ref());
         self.find.open(range.start, seed, replace);
         // The bar takes the keys; the caret comes back when it closes.
+        self.code.release_focus(ctx);
+        self.live.release_focus(ctx);
+    }
+
+    /// Ctrl+G. A dialog already owns the keyboard, so the prompt waits.
+    fn open_goto(&mut self, ctx: &egui::Context) {
+        if self.modal_open() {
+            return;
+        }
+        self.find.close();
+        self.goto.open();
         self.code.release_focus(ctx);
         self.live.release_focus(ctx);
     }
@@ -1878,6 +1896,25 @@ impl App {
             }
             if let Some(sel) = step.selection {
                 self.show_match(sel);
+            }
+        }
+        if self.goto.is_open() {
+            let line_count = self.doc.line_count();
+            let modal = self.modal_open();
+            let step = {
+                let goto = &mut self.goto;
+                egui::Panel::bottom("goto")
+                    .show(ui, |ui| goto.show(ui, line_count, modal))
+                    .inner
+            };
+            if let Some(line) = step.line {
+                let here = self.here();
+                let offset = self.doc.line_to_byte(line);
+                self.jump_to(offset);
+                self.remember(here);
+                self.focus_pane(&ctx, self.focus);
+            } else if step.closed {
+                self.focus_pane(&ctx, self.focus);
             }
         }
         egui::CentralPanel::default()
@@ -3262,6 +3299,57 @@ mod tests {
             self.frame(vec![]);
         }
 
+        /// Every place the last frame drew `text`.
+        fn text_rects(&self, text: &str) -> Vec<egui::Rect> {
+            fn walk(shape: &egui::Shape, text: &str, out: &mut Vec<egui::Rect>) {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == text => {
+                        out.push(t.galley.rect.translate(t.pos.to_vec2()));
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            walk(shape, text, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for clip in &self.out.shapes {
+                walk(&clip.shape, text, &mut out);
+            }
+            out
+        }
+
+        /// Clicks the topmost `mark` in the code pane. The sidebar draws the
+        /// same ▾ and ▸ further left.
+        fn click_code_mark(&mut self, mark: &str) {
+            let in_code = |rect: &egui::Rect| rect.left() > 220.0 && rect.left() < 520.0;
+            for _ in 0..3 {
+                if self.text_rects(mark).iter().any(in_code) {
+                    break;
+                }
+                self.frame(vec![]);
+            }
+            let at = self
+                .text_rects(mark)
+                .into_iter()
+                .filter(in_code)
+                .min_by(|a, b| a.top().total_cmp(&b.top()))
+                .unwrap_or_else(|| panic!("{mark} isn't in the code pane"))
+                .center();
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            self.frame(vec![egui::Event::PointerMoved(at)]);
+            self.frame(vec![button(true)]);
+            self.frame(vec![button(false)]);
+            self.frame(vec![]);
+        }
+
         fn settle(&mut self) {
             let start = Instant::now();
             while !self.app.parse.is_settled() {
@@ -3712,7 +3800,7 @@ mod tests {
         // A real rebind replaces it, and an empty list unbinds the mode cycle.
         r.key(egui::Key::Z, egui::Modifiers::COMMAND);
         assert_eq!(text(&r.app), "word\n");
-        fs::write(&config, "[keys]\nbold = \"Ctrl+G\"\ncycle_mode = []\n").unwrap();
+        fs::write(&config, "[keys]\nbold = \"Ctrl+L\"\ncycle_mode = []\n").unwrap();
         r.app.apply_settings_from(Some(&config), |_| None);
         assert!(r.app.error.is_none(), "{:?}", r.app.error);
         select_word(&mut r);
@@ -3720,7 +3808,7 @@ mod tests {
         r.key(egui::Key::E, egui::Modifiers::COMMAND);
         assert_eq!(text(&r.app), "word\n");
         assert!(r.app.mode == Mode::Split);
-        r.key(egui::Key::G, egui::Modifiers::COMMAND);
+        r.key(egui::Key::L, egui::Modifiers::COMMAND);
         assert_eq!(text(&r.app), "**word**\n");
 
         // Syntax that doesn't parse keeps those bindings.
@@ -3734,17 +3822,17 @@ mod tests {
                 .contains("keeping the previous")
         );
         select_word(&mut r);
-        r.key(egui::Key::G, egui::Modifiers::COMMAND);
+        r.key(egui::Key::L, egui::Modifiers::COMMAND);
         assert_eq!(text(&r.app), "word\n");
 
-        // The watched file is re-read, and unbinding bold takes Ctrl+G away.
+        // The watched file is re-read, and unbinding bold takes Ctrl+L away.
         r.app.font_files = vec![Some(config.clone())];
         r.app.font_stamps = vec![Some(std::time::SystemTime::UNIX_EPOCH)];
         fs::write(&config, "[keys]\nbold = []\n").unwrap();
         r.check_disk_now();
         assert!(r.app.error.is_none(), "{:?}", r.app.error);
         select_word(&mut r);
-        r.key(egui::Key::G, egui::Modifiers::COMMAND);
+        r.key(egui::Key::L, egui::Modifiers::COMMAND);
         r.key(egui::Key::B, egui::Modifiers::COMMAND);
         assert_eq!(text(&r.app), "word\n");
     }
@@ -3953,5 +4041,123 @@ mod tests {
         assert_eq!(outline::column_widths(1000.0, Some(240.0)), (240.0, 200.0));
         assert_eq!(outline::column_widths(1000.0, None), (0.0, 200.0));
         assert_eq!(outline::column_widths(400.0, Some(240.0)), (160.0, 120.0));
+    }
+
+    #[test]
+    fn go_to_line_moves_both_panes_and_clamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "one\ntwo\nthree").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        let two = text(&run.app).find("two").unwrap();
+        let three = text(&run.app).find("three").unwrap();
+
+        run.key(egui::Key::G, egui::Modifiers::COMMAND);
+        run.frame(vec![]);
+        assert!(run.text_rect("Go to line").is_some());
+        run.frame(vec![egui::Event::Text("2".into())]);
+        run.frame(vec![]);
+        run.key(egui::Key::Enter, egui::Modifiers::NONE);
+        run.frame(vec![]);
+        assert_eq!(run.app.code.selection(), Selection::caret(two));
+        assert_eq!(run.app.live.selection(), Selection::caret(two));
+        assert!(run.text_rect("Go to line").is_none());
+
+        run.key(egui::Key::ArrowLeft, egui::Modifiers::ALT);
+        assert_eq!(run.app.code.selection(), Selection::caret(0));
+        assert_eq!(run.app.live.selection(), Selection::caret(0));
+
+        run.key(egui::Key::G, egui::Modifiers::COMMAND);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("99".into())]);
+        run.frame(vec![]);
+        run.click_text("Go");
+        run.frame(vec![]);
+        assert_eq!(run.app.code.selection(), Selection::caret(three));
+        assert_eq!(run.app.live.selection(), Selection::caret(three));
+    }
+
+    #[test]
+    fn go_to_line_ignores_a_blank_entry_and_escape_closes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "one\ntwo\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        run.key(egui::Key::G, egui::Modifiers::COMMAND);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("no".into())]);
+        run.frame(vec![]);
+        run.key(egui::Key::Enter, egui::Modifiers::NONE);
+        run.frame(vec![]);
+        assert_eq!(run.app.code.selection().head, 0);
+        assert!(run.text_rect("Go to line").is_some());
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        run.frame(vec![]);
+        assert!(run.text_rect("Go to line").is_none());
+        assert_eq!(run.app.code.selection().head, 0);
+        assert_eq!(text(&run.app), "one\ntwo\n");
+    }
+
+    #[test]
+    fn folding_a_heading_hides_its_body_in_the_code_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        let src = "# Alpha\nvisible body\n## Beta\ninner body\n# Gamma\ntail\n";
+        fs::write(&path, src).unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        assert!(run.app.code.measured_height(1) > 0.0);
+        assert!(run.app.live.measured_height(1) > 0.0);
+
+        run.click_code_mark("▾");
+        let hidden = run.app.code.hidden_ranges().to_vec();
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        let body = text(&run.app).find("visible body").unwrap();
+        let inner = text(&run.app).find("inner body").unwrap();
+        let gamma = text(&run.app).find("# Gamma").unwrap();
+        assert!(hidden[0].start <= body && inner < hidden[0].end);
+        assert_eq!(hidden[0].end, gamma);
+        assert_eq!(run.app.code.measured_height(1), 0.0);
+        assert!(run.app.live.measured_height(1) > 0.0);
+        assert_eq!(text(&run.app), src);
+
+        run.app.code.request_focus(&run.ctx);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("\n".into())]);
+        run.frame(vec![]);
+        let shifted = run.app.code.hidden_ranges().to_vec();
+        assert_eq!(shifted.len(), 1, "{shifted:?}");
+        assert_eq!(shifted[0].start, hidden[0].start + 1);
+        assert_eq!(shifted[0].end, hidden[0].end + 1);
+
+        let inner = text(&run.app).find("inner body").unwrap();
+        let line = run.app.doc.byte_to_line(inner) + 1;
+        run.key(egui::Key::G, egui::Modifiers::COMMAND);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text(line.to_string())]);
+        run.frame(vec![]);
+        run.key(egui::Key::Enter, egui::Modifiers::NONE);
+        run.frame(vec![]);
+        assert_eq!(run.app.code.selection(), Selection::caret(inner));
+        assert_eq!(run.app.live.selection(), Selection::caret(inner));
+        assert!(
+            run.app
+                .code
+                .hidden_ranges()
+                .iter()
+                .all(|range| inner < range.start || inner >= range.end),
+            "{:?}",
+            run.app.code.hidden_ranges()
+        );
+        let shown = run.app.doc.byte_to_line(inner);
+        assert!(run.app.code.measured_height(shown) > 0.0);
+        assert!(run.app.live.measured_height(shown) > 0.0);
+
+        run.click_code_mark("▾");
+        assert!(!run.app.code.hidden_ranges().is_empty());
+        let other = dir.path().join("other.md");
+        fs::write(&other, "plain\n").unwrap();
+        run.app.open(other);
+        run.frame(vec![]);
+        assert!(run.app.code.hidden_ranges().is_empty());
     }
 }

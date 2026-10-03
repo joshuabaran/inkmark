@@ -7,14 +7,15 @@ use std::time::{Duration, Instant};
 
 use egui::output::IMEOutput;
 use egui::{
-    CursorIcon, Event, EventFilter, IMEPurpose, Id, ImeEvent, Key, Modifiers, Pos2, Rect, Response,
-    Sense, Ui, pos2, vec2,
+    Align2, CursorIcon, Event, EventFilter, FontId, IMEPurpose, Id, ImeEvent, Key, Modifiers, Pos2,
+    Rect, Response, Sense, Ui, pos2, vec2,
 };
 use inkmark_buffer::{Bias, Change, Document, Edit, EditKind, Selection};
 use inkmark_parse::{ParseOutput, ParseState};
 use inkmark_text::{GlyphMeshes, ScrollAnchor, SharedFonts, TextConfig, TextRenderer};
 
 use crate::commands::{self, EditPlan};
+use crate::folds::Folds;
 use crate::keys::{self, Action};
 use crate::lines::SCROLLBAR_WIDTH;
 use crate::lines::{LineIndex, ScrollPos, Synced};
@@ -81,6 +82,15 @@ pub struct CodeView {
     pub line_height: f32,
     /// Shortcuts, shared with the other pane and the app shell.
     keys: keys::KeyMap,
+    /// Heading bodies hidden in this pane. Source ranges, so an edit moves
+    /// them and a reparse leaves them where the bytes are.
+    folds: Folds,
+    /// `set_selection` landed somewhere that may be inside a fold.
+    pending_reveal: bool,
+    /// Folds changed after this frame's first sync and need heights again.
+    fold_resync: bool,
+    /// Gutter hits painted last frame, each the body it toggles.
+    marker_hits: Vec<(Rect, Range<usize>)>,
 }
 
 /// Where the text area sits this frame.
@@ -123,6 +133,10 @@ impl CodeView {
             font_size: 14.0,
             line_height: 21.0,
             keys: keys::KeyMap::builtin(),
+            folds: Folds::default(),
+            pending_reveal: false,
+            fold_resync: false,
+            marker_hits: Vec::new(),
         }
     }
 
@@ -135,12 +149,27 @@ impl CodeView {
         self.selection
     }
 
+    /// Source ranges the code pane is currently hiding.
+    pub fn hidden_ranges(&self) -> &[Range<usize>] {
+        self.folds.ranges()
+    }
+
+    /// The height currently stored for `line` (0 while that line is folded).
+    pub fn measured_height(&self, line: usize) -> f32 {
+        if line < self.lines.heights.len() {
+            self.lines.heights.height(line)
+        } else {
+            0.0
+        }
+    }
+
     /// Moves the selection (e.g. from search or the other pane) and scrolls to it.
     pub fn set_selection(&mut self, selection: Selection) {
         self.selection = selection;
         self.selection_current = true;
         self.preferred_x = None;
         self.reveal_caret = REVEAL_FRAMES;
+        self.pending_reveal = true;
     }
 
     /// The offset of a link Ctrl+clicked since the last call.
@@ -209,6 +238,10 @@ impl CodeView {
         self.preferred_x = None;
         self.preedit.clear();
         self.drag = None;
+        self.folds.clear();
+        self.pending_reveal = false;
+        self.fold_resync = false;
+        self.marker_hits.clear();
     }
 
     /// Gives up keyboard focus (e.g. while a dialog is open).
@@ -278,6 +311,14 @@ impl CodeView {
         if self.text.begin_frame(config, ui.ctx().pixels_per_point()) {
             self.lines.invalidate();
         }
+        if self.pending_reveal {
+            self.pending_reveal = false;
+            if self.folds.reveal(doc, self.selection.head)
+                || self.folds.reveal(doc, self.selection.anchor)
+            {
+                self.lines.invalidate();
+            }
+        }
         self.sync(doc, true);
         if let Some(pos) = self.pending_scroll.take() {
             self.apply_scroll_pos(pos);
@@ -321,6 +362,10 @@ impl CodeView {
         {
             self.scrolled = true;
         }
+        if self.fold_resync {
+            self.fold_resync = false;
+            self.sync(doc, false);
+        }
         if self.reveal_caret > 0 {
             self.scroll_caret_into_view(ui, doc, viewport);
         }
@@ -358,15 +403,41 @@ impl CodeView {
         let text = &self.text;
         // A selection set from outside is already in current offsets.
         let map_selection = map_selection && !std::mem::take(&mut self.selection_current);
-        if let Synced::Changed(changes) = self.lines.sync(doc, |chars| text.estimate_height(chars))
-            && map_selection
-        {
-            for c in &changes {
-                self.selection.anchor = c.map(self.selection.anchor, Bias::Left);
-                self.selection.head = c.map(self.selection.head, Bias::Left);
+        let synced = self.lines.sync(doc, |chars| text.estimate_height(chars));
+        if let Synced::Changed(changes) = &synced {
+            self.folds.rebase(changes);
+            if map_selection {
+                for c in changes {
+                    self.selection.anchor = c.map(self.selection.anchor, Bias::Left);
+                    self.selection.head = c.map(self.selection.head, Bias::Left);
+                }
             }
         }
         self.clamp_selection(doc);
+        if !matches!(synced, Synced::Unchanged) {
+            self.apply_fold_heights(doc);
+        }
+    }
+
+    /// Gives every hidden line a height of 0 so scroll math skips it.
+    /// Visible lines keep the estimate or measurement they already have.
+    fn apply_fold_heights(&mut self, doc: &Document) {
+        let ranges: Vec<Range<usize>> = self.folds.ranges().to_vec();
+        let len = self.lines.heights.len();
+        for body in ranges {
+            let start = body.start.min(doc.len());
+            if doc.line_count() == 0 || len == 0 {
+                continue;
+            }
+            let mut line = doc.byte_to_line(start);
+            if doc.line_to_byte(line) < body.start {
+                line += 1;
+            }
+            while line < len && line < doc.line_count() && doc.line_to_byte(line) < body.end {
+                self.lines.heights.set_measured(line, 0.0);
+                line += 1;
+            }
+        }
     }
 
     fn clamp_selection(&mut self, doc: &Document) {
@@ -525,6 +596,13 @@ impl CodeView {
         self.preferred_x = None;
         self.reveal_caret = REVEAL_FRAMES;
         doc.seal_undo_step();
+        // A jump that lands in a folded body opens it, so the caret is visible.
+        if self.folds.reveal(doc, self.selection.head)
+            || self.folds.reveal(doc, self.selection.anchor)
+        {
+            self.lines.invalidate();
+            self.fold_resync = true;
+        }
     }
 
     fn upstream(&self) -> bool {
@@ -551,6 +629,13 @@ impl CodeView {
                     row -= 1;
                 } else if line > 0 {
                     line -= 1;
+                    while line > 0 && self.folds.hides_line(doc, line) {
+                        line -= 1;
+                    }
+                    if self.folds.hides_line(doc, line) {
+                        head = 0;
+                        break;
+                    }
                     geometry = self.text.geometry(&Self::line_text(doc, line));
                     row = geometry.rows.len() - 1;
                 } else {
@@ -561,6 +646,13 @@ impl CodeView {
                 row += 1;
             } else if line + 1 < doc.line_count() {
                 line += 1;
+                while line < doc.line_count() && self.folds.hides_line(doc, line) {
+                    line += 1;
+                }
+                if line >= doc.line_count() {
+                    head = doc.len();
+                    break;
+                }
                 geometry = self.text.geometry(&Self::line_text(doc, line));
                 row = 0;
             } else {
@@ -849,6 +941,18 @@ impl CodeView {
             return self.end_drag_if_released(down);
         };
         if pressed && response.hovered() {
+            if let Some(body) = self
+                .marker_hits
+                .iter()
+                .find(|(rect, _)| rect.contains(pos))
+                .map(|(_, body)| body.clone())
+            {
+                self.folds.toggle(body);
+                self.lines.invalidate();
+                self.fold_resync = true;
+                self.drag = None;
+                return;
+            }
             let now = Instant::now();
             let count = match self.last_press {
                 Some((t, p, n)) if now - t < MULTI_CLICK && p.distance(pos) < 4.0 => n % 3 + 1,
@@ -938,6 +1042,10 @@ impl CodeView {
         self.reveal_caret -= 1;
         let head = self.selection.head;
         let line = doc.byte_to_line(head);
+        if self.folds.hides_line(doc, line) {
+            self.reveal_caret = 0;
+            return;
+        }
         let text = Self::line_text(doc, line);
         let height = self.text.line_height(&text);
         self.lines.heights.set_measured(line, height);
@@ -978,6 +1086,10 @@ impl CodeView {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, self.theme.background);
 
+        let regions = parse
+            .filter(|output| output.map.len() == doc.len())
+            .map(|output| inkmark_parse::heading_regions(doc, output))
+            .unwrap_or_default();
         let selection = self.selection.range();
         let caret_line = doc.byte_to_line(self.selection.head);
         let mut meshes = GlyphMeshes::default();
@@ -986,11 +1098,37 @@ impl CodeView {
         let mut caret = None;
         let mut y = rect.top() - self.lines.anchor.offset;
         let mut line = self.lines.anchor.line;
+        self.marker_hits.clear();
         while y < rect.bottom() && line < doc.line_count() {
+            if let Some(next) = self.folds.hidden_until(doc, line) {
+                line = next;
+                continue;
+            }
             let range = doc.line_range(line);
             let text = doc.slice(range.clone());
             let height = self.text.line_height(&text);
             self.lines.heights.set_measured(line, height);
+            if let Some(region) = regions
+                .iter()
+                .find(|region| region.line == line && !region.body.is_empty())
+            {
+                let mark = if self.folds.is_folded_at(region.body.start) {
+                    "▸"
+                } else {
+                    "▾"
+                };
+                painter.text(
+                    pos2(rect.left() + 1.0, y + height * 0.5),
+                    Align2::LEFT_CENTER,
+                    mark,
+                    FontId::proportional(12.0),
+                    self.theme.text,
+                );
+                self.marker_hits.push((
+                    Rect::from_min_size(pos2(rect.left(), y), vec2(PADDING, height)),
+                    region.body.clone(),
+                ));
+            }
             if line == self.lines.anchor.line && self.lines.anchor.offset > height {
                 self.lines.anchor.offset = height;
             }
@@ -1096,6 +1234,10 @@ impl CodeView {
         let mut y = heights.offset_of(line);
         while y < bottom && line < doc.line_count().min(heights.len()) {
             let h = f64::from(heights.height(line));
+            if h == 0.0 {
+                line += 1;
+                continue;
+            }
             let (mut indent, mut indent_bytes, mut len) = (0.0f32, 0, 0.0f32);
             let mut in_indent = true;
             for c in doc.rope().line(line).chars().take(COLUMNS as usize) {

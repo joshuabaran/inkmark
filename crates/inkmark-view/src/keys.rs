@@ -91,9 +91,10 @@ pub enum Action {
     Replace = 50,
     FindNext = 51,
     FindPrevious = 52,
+    GoToLine = 53,
 }
 
-const COUNT: usize = 53;
+const COUNT: usize = 54;
 
 impl Action {
     pub const ALL: [Action; COUNT] = [
@@ -150,6 +151,7 @@ impl Action {
         Action::Replace,
         Action::FindNext,
         Action::FindPrevious,
+        Action::GoToLine,
     ];
 
     pub const fn index(self) -> usize {
@@ -213,6 +215,7 @@ impl Action {
             Replace => "replace",
             FindNext => "find_next",
             FindPrevious => "find_previous",
+            GoToLine => "go_to_line",
         }
     }
 
@@ -273,6 +276,7 @@ impl Action {
             Replace => "Replace in this file",
             FindNext => "Find the next match",
             FindPrevious => "Find the previous match",
+            GoToLine => "Go to line",
         }
     }
 
@@ -281,7 +285,7 @@ impl Action {
         match self {
             CycleMode | FocusCode | FocusLive | ToggleMinimap | OpenFile | Save | SaveAs
             | OpenFolder | ToggleSidebar | NewFile | RecentFiles | Back | Forward | Find
-            | Replace | FindNext | FindPrevious => Scope::App,
+            | Replace | FindNext | FindPrevious | GoToLine => Scope::App,
             Rename | MoveToTrash => Scope::Browser,
             InsertRowAbove | InsertRowBelow | InsertColumnLeft | InsertColumnRight | DeleteRow
             | DeleteColumn | MoveRowUp | MoveRowDown | MoveColumnLeft | MoveColumnRight
@@ -910,6 +914,7 @@ fn default_chords(action: Action) -> Vec<Chord> {
         Replace => vec![chord(ctrl, Key::H)],
         FindNext => vec![chord(Modifiers::NONE, Key::F3)],
         FindPrevious => vec![chord(shift, Key::F3)],
+        GoToLine => vec![chord(ctrl, Key::G)],
     }
 }
 

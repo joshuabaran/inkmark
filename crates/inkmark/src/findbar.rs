@@ -71,6 +71,10 @@ impl FindBar {
         self.open
     }
 
+    pub fn close(&mut self) {
+        self.open = false;
+    }
+
     #[cfg(test)]
     pub fn set_replacement(&mut self, text: impl Into<String>) {
         self.replacement = text.into();

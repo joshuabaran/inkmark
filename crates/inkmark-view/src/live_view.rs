@@ -335,6 +335,15 @@ impl LiveView {
         self.selection
     }
 
+    /// The height currently stored for `line`.
+    pub fn measured_height(&self, line: usize) -> f32 {
+        if line < self.lines.heights.len() {
+            self.lines.heights.height(line)
+        } else {
+            0.0
+        }
+    }
+
     pub fn set_selection(&mut self, selection: Selection) {
         self.selection = selection;
         self.selection_current = true;

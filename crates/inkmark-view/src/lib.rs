@@ -3,6 +3,7 @@
 mod browser;
 mod code_view;
 mod commands;
+mod folds;
 mod images;
 pub mod keys;
 mod lines;
