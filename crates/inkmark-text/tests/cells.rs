@@ -56,11 +56,25 @@ fn wide_characters_take_two_cells() {
 fn a_wrapped_line_of_wide_characters_stays_inside_its_width() {
     let wrap = 200.0;
     let mut r = renderer(Some(wrap));
-    let text = "中文字符".repeat(20);
+    // CJK, emoji, and a character most systems have no font for (drawn as a
+    // fallback box): none of them is assumed to be 1 em wide.
+    let text = "中文😀𠀀".repeat(20);
     let g = r.geometry(&text);
     assert!(g.rows.len() > 1, "it wraps");
     for row in &g.rows {
         let right = row.clusters.last().map_or(0.0, |c| c.x + c.w);
         assert!(right <= wrap + 0.5, "a row reaches {right} past {wrap}");
+    }
+}
+
+#[test]
+fn emoji_and_missing_glyphs_take_two_cells_too() {
+    let mut r = renderer(None);
+    let cell = r.geometry("a").rows[0].clusters[0].w;
+    for text in ["a😀b", "a𠀀b"] {
+        let got = cells(&r.geometry(text), text, cell);
+        assert_eq!(got[1].1, 1.0, "{text}: {got:?}");
+        assert_eq!(got[1].2, 2.0, "{text}: {got:?}");
+        assert_eq!(got[2].1, 3.0, "{text}: {got:?}");
     }
 }

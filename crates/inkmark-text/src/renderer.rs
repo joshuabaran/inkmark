@@ -302,29 +302,64 @@ impl TextRenderer {
             ))
     }
 
-    fn new_line(&self, line: RichLine) -> BufferLine {
+    /// A line to shape. `wide` scales the characters starting at those
+    /// byte offsets (see `wide_scales`).
+    fn new_line(&self, line: RichLine, wide: &HashMap<usize, f32>) -> BufferLine {
         let mut attrs = AttrsList::new(&self.attrs(FontStyle::default()));
         for (range, style) in line.runs {
             attrs.add_span(range.clone(), &self.attrs(*style));
         }
-        // Monospace text: wide characters (CJK, most emoji) are shaped two
-        // cells wide, so wrapping sees the widths they'll be drawn at. Their
-        // fonts set them 1 em wide; scale that to two cells.
         let config = self.config();
-        if config.monospace && self.avg_advance_px > 0.0 {
-            let em = config.font_size * self.pixels_per_point;
-            let scale = 2.0 * self.avg_advance_px / em;
-            let wide = self.attrs(FontStyle::default()).metrics(Metrics::new(
-                em * scale,
-                (config.line_height * self.pixels_per_point).round(),
-            ));
-            for (i, c) in line.text.char_indices() {
-                if unicode_width::UnicodeWidthChar::width(c) == Some(2) {
-                    attrs.add_span(i..i + c.len_utf8(), &wide);
-                }
-            }
+        let em = config.font_size * self.pixels_per_point;
+        let line_height = (config.line_height * self.pixels_per_point).round();
+        for (&at, &scale) in wide {
+            let len = line.text[at..].chars().next().map_or(0, char::len_utf8);
+            let attrs_at = self
+                .attrs(FontStyle::default())
+                .metrics(Metrics::new(em * scale, line_height));
+            attrs.add_span(at..at + len, &attrs_at);
         }
         BufferLine::new(line.text, LineEnding::None, attrs, Shaping::Advanced)
+    }
+
+    /// Monospace text: how much to scale each wide character (CJK, most
+    /// emoji) so it's shaped exactly two cells wide, and wrapping sees the
+    /// width it's drawn at. Measured, not assumed: a CJK font draws them 1
+    /// em wide, but emoji and the boxes of a missing font differ.
+    fn wide_scales(&mut self, line: RichLine) -> HashMap<usize, f32> {
+        let config = self.config();
+        let cell = self.avg_advance_px;
+        let wide: Vec<usize> = line
+            .text
+            .char_indices()
+            .filter(|&(_, c)| unicode_width::UnicodeWidthChar::width(c) == Some(2))
+            .map(|(i, _)| i)
+            .collect();
+        if !config.monospace || cell <= 0.0 || wide.is_empty() {
+            return HashMap::new();
+        }
+        let mut probe = self.new_line(line, &HashMap::new());
+        let ppp = self.pixels_per_point;
+        let laid = layout(
+            &mut probe,
+            &mut self.fonts.borrow_mut().font_system,
+            config,
+            None,
+            ppp,
+            false,
+            None,
+        );
+        let mut advance: HashMap<usize, f32> = HashMap::new();
+        for g in laid.iter().flat_map(|l| l.glyphs.iter()) {
+            let a = advance.entry(g.start).or_insert(0.0);
+            *a = a.max(g.w);
+        }
+        wide.into_iter()
+            .filter_map(|at| {
+                let w = advance.get(&at).copied().filter(|&w| w > 0.0)?;
+                Some((at, 2.0 * cell / w))
+            })
+            .collect()
     }
 
     /// Monospace text on its cell grid: each glyph's `(x, w)` in pixels
@@ -374,7 +409,7 @@ impl TextRenderer {
     fn measure_avg_advance(&mut self) -> f32 {
         const SAMPLE: &str = "The quick brown fox jumps over the lazy dog, then naps; 0123456789.";
         let (config, ppp) = (self.config(), self.pixels_per_point);
-        let mut line = self.new_line(RichLine::plain(SAMPLE));
+        let mut line = self.new_line(RichLine::plain(SAMPLE), &HashMap::new());
         let width = layout(
             &mut line,
             &mut self.fonts.borrow_mut().font_system,
@@ -485,7 +520,8 @@ impl TextRenderer {
         let hash = line.key_hash();
         let hit = self.lines.get(&hash).is_some_and(|c| line.matches(&c.key));
         if !hit {
-            let mut buffer_line = self.new_line(line);
+            let scales = self.wide_scales(line);
+            let mut buffer_line = self.new_line(line, &scales);
             layout(
                 &mut buffer_line,
                 &mut self.fonts.borrow_mut().font_system,
