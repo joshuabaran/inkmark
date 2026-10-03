@@ -91,13 +91,23 @@ pub fn link_at(doc: &Document, out: &ParseOutput, offset: usize) -> Option<Link>
     }))
 }
 
-/// Where `#anchor` points: the start of the heading's text whose GitHub
-/// slug is `anchor`. Repeated headings get `-1`, `-2`… as on GitHub.
-pub fn heading_offset(doc: &Document, out: &ParseOutput, anchor: &str) -> Option<usize> {
-    let anchor = anchor.to_lowercase();
-    let mut seen: HashMap<String, usize> = HashMap::new();
+/// One heading, in document order. `text` is the heading's words, trimmed:
+/// the same characters a GitHub slug is built from. `offset` is the first of
+/// those characters, or the block start when the heading has none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Heading {
+    pub level: u8,
+    pub text: String,
+    pub offset: usize,
+}
+
+/// Every heading in the block tree, including headings inside a list or a
+/// quote. The outline and [`heading_offset`] both walk this list, so a click
+/// and a Ctrl+click land on the same byte.
+pub fn headings(doc: &Document, out: &ParseOutput) -> Vec<Heading> {
+    let mut found = Vec::new();
     for block in out.blocks.iter() {
-        let BlockKind::Heading(_) = block.kind else {
+        let BlockKind::Heading(level) = block.kind else {
             continue;
         };
         let spans = out.map.spans_in(block.range.clone());
@@ -111,7 +121,22 @@ pub fn heading_offset(doc: &Document, out: &ParseOutput, anchor: &str) -> Option
             }
             first_text.get_or_insert(s.range.start);
         }
-        let base = slug(&text);
+        found.push(Heading {
+            level,
+            text: text.trim().to_owned(),
+            offset: first_text.unwrap_or(block.range.start),
+        });
+    }
+    found
+}
+
+/// Where `#anchor` points: the start of the heading's text whose GitHub
+/// slug is `anchor`. Repeated headings get `-1`, `-2`… as on GitHub.
+pub fn heading_offset(doc: &Document, out: &ParseOutput, anchor: &str) -> Option<usize> {
+    let anchor = anchor.to_lowercase();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for heading in headings(doc, out) {
+        let base = slug(&heading.text);
         let count = seen.entry(base.clone()).or_insert(0);
         let id = if *count == 0 {
             base
@@ -120,7 +145,7 @@ pub fn heading_offset(doc: &Document, out: &ParseOutput, anchor: &str) -> Option
         };
         *count += 1;
         if id == anchor {
-            return Some(first_text.unwrap_or(block.range.start));
+            return Some(heading.offset);
         }
     }
     None
@@ -249,5 +274,60 @@ mod tests {
         assert_eq!(footnote_offset(&doc, &out, "none"), None);
         assert_eq!(definition_label("[^a\\]b]: x"), Some("a\\]b"));
         assert_eq!(definition_label("[^a[b]: x"), None);
+    }
+
+    #[test]
+    fn headings_match_the_anchor_offsets() {
+        let src = "# Getting Started!\n\ntext\n\n## Getting started\n\n## Ünïcode *and* `code`\n";
+        let doc = Document::from_text(src);
+        let out = GfmParser.parse(src);
+        let found = headings(&doc, &out);
+        assert_eq!(
+            found
+                .iter()
+                .map(|h| (h.level, h.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "Getting Started!"),
+                (2, "Getting started"),
+                (2, "Ünïcode and code"),
+            ]
+        );
+        assert_eq!(
+            found[0].offset,
+            heading_offset(&doc, &out, "getting-started").unwrap()
+        );
+        assert_eq!(
+            found[1].offset,
+            heading_offset(&doc, &out, "getting-started-1").unwrap()
+        );
+        assert_eq!(found[2].offset, src.find("Ünïcode").unwrap());
+    }
+
+    #[test]
+    fn headings_include_setext_quotes_and_lists() {
+        let src = "Setext title\n============\n\nSub title\n---------\n\n> # Quoted\n\n- item\n\n  ## Listed\n\n```\n# Not a heading\n```\n\n###### Deep\n\n#   \n";
+        let doc = Document::from_text(src);
+        let out = GfmParser.parse(src);
+        let found = headings(&doc, &out);
+        assert_eq!(
+            found
+                .iter()
+                .map(|h| (h.level, h.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "Setext title"),
+                (2, "Sub title"),
+                (1, "Quoted"),
+                (2, "Listed"),
+                (6, "Deep"),
+                (1, ""),
+            ]
+        );
+        assert_eq!(found[0].offset, src.find("Setext title").unwrap());
+        assert_eq!(found[2].offset, src.find("Quoted").unwrap());
+        assert_eq!(found[3].offset, src.find("Listed").unwrap());
+        assert!(found[5].offset < src.len());
+        assert!(found.iter().all(|h| h.text != "Not a heading"));
     }
 }
