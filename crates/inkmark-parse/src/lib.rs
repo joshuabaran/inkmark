@@ -24,13 +24,15 @@ pub struct ParseOutput {
     pub blocks: BlockTree,
     pub map: SourceMap,
     /// Link reference definitions (`[label]: dest`), keyed by
-    /// [`normalize_label`]. Local reparses only add to these; the next
-    /// full parse drops ones that were deleted.
+    /// [`normalize_label`]: the first definition of a label wins, as in
+    /// CommonMark. A local reparse replaces the definitions inside its
+    /// region, and drops a label nothing defines any more.
     pub link_defs: std::collections::HashMap<String, String>,
     /// Labels of footnote definitions (`[^label]:`), as written.
     pub footnotes: std::collections::BTreeSet<String>,
     /// Where each link and footnote definition is, in source order, so a
-    /// local reparse can drop the ones an edit deleted.
+    /// local reparse can drop the ones an edit deleted. Every occurrence is
+    /// listed, so when the first of two `[ref]:` goes, the second takes over.
     pub definitions: Vec<Definition>,
 }
 
@@ -39,6 +41,8 @@ pub struct ParseOutput {
 pub struct Definition {
     pub range: std::ops::Range<usize>,
     pub label: DefinitionLabel,
+    /// A link definition's destination (empty for a footnote).
+    pub dest: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

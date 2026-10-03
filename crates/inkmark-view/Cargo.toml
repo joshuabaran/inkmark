@@ -10,6 +10,7 @@ unicode-width.workspace = true
 egui.workspace = true
 image.workspace = true
 resvg.workspace = true
+flate2.workspace = true
 inkmark-buffer.workspace = true
 inkmark-files.workspace = true
 inkmark-minimap.workspace = true

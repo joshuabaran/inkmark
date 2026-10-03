@@ -191,6 +191,16 @@ struct Place {
     offset: usize,
 }
 
+/// How a navigation got where it's going, for the history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Travel {
+    /// Following a link: a new way forward.
+    Follow,
+    /// Alt+Left or Alt+Right to this place (taken off its stack).
+    Back(Place),
+    Forward(Place),
+}
+
 /// What to do once a file opened by following a link is parsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Jump {
@@ -231,6 +241,9 @@ struct App {
     back: Vec<Place>,
     /// Places gone back from, most recent last (Alt+Right).
     forward: Vec<Place>,
+    /// A history change waiting on a file being opened: committed once that
+    /// file is open, undone if the open was cancelled or failed.
+    pending_history: Option<(PathBuf, Place, Travel)>,
     /// Where to put the caret once the file being opened has been parsed.
     pending_jump: Option<(PathBuf, Jump)>,
     /// Tests record URLs here instead of starting a browser.
@@ -313,6 +326,7 @@ impl App {
             hint: None,
             back: Vec::new(),
             forward: Vec::new(),
+            pending_history: None,
             pending_jump: None,
             #[cfg(test)]
             opened_urls: Vec::new(),
@@ -1369,8 +1383,8 @@ impl App {
                 self.show_hint(format!("{} doesn't exist", display_name(&path)));
             }
             links::Target::File { path, anchor } => {
-                self.remember(here);
                 self.pending_jump = anchor.map(|a| (path.clone(), Jump::Anchor(a)));
+                self.pending_history = Some((path.clone(), here, Travel::Follow));
                 self.request_open(path);
             }
             links::Target::Refused(reason) => self.show_hint(reason),
@@ -1394,36 +1408,75 @@ impl App {
 
     /// Alt+Left: back to where the last followed link was clicked.
     fn go_back(&mut self) {
-        let Some(place) = self.back.pop() else {
-            return;
-        };
-        let here = self.here();
-        self.forward.push(here);
-        self.go_to(place);
+        if let Some(place) = self.back.pop() {
+            self.travel(Travel::Back(place));
+        }
     }
 
     /// Alt+Right: forward again to where Alt+Left came from.
     fn go_forward(&mut self) {
-        let Some(place) = self.forward.pop() else {
-            return;
-        };
-        let here = self.here();
-        self.back.push(here);
-        self.go_to(place);
+        if let Some(place) = self.forward.pop() {
+            self.travel(Travel::Forward(place));
+        }
     }
 
-    fn go_to(&mut self, place: Place) {
-        match place.path {
-            // Gone since (deleted, or moved by another program): say so
-            // rather than open an empty new file in its place.
+    /// Goes to a place from the history. The history changes only once the
+    /// place is reached: in this file, now; in another, once it's open.
+    fn travel(&mut self, travel: Travel) {
+        let here = self.here();
+        let (Travel::Back(place) | Travel::Forward(place)) = travel.clone() else {
+            return;
+        };
+        match &place.path {
+            // Gone since (deleted, or moved by another program): say so,
+            // and keep the place, rather than open an empty file there.
             Some(path) if Some(path.as_path()) != self.doc.path() && !path.exists() => {
-                self.show_hint(format!("{} no longer exists", display_name(&path)));
+                self.show_hint(format!("{} no longer exists", display_name(path)));
+                self.unwind(travel);
             }
             Some(path) if Some(path.as_path()) != self.doc.path() => {
                 self.pending_jump = Some((path.clone(), Jump::Offset(place.offset)));
-                self.request_open(path);
+                self.pending_history = Some((path.clone(), here, travel));
+                self.request_open(path.clone());
             }
-            _ => self.jump_to(place.offset.min(self.doc.len())),
+            _ => {
+                self.commit(here, travel);
+                self.jump_to(place.offset.min(self.doc.len()));
+            }
+        }
+    }
+
+    /// The history after reaching a place, coming from `here`.
+    fn commit(&mut self, here: Place, travel: Travel) {
+        match travel {
+            Travel::Follow => self.remember(here),
+            Travel::Back(_) => self.forward.push(here),
+            Travel::Forward(_) => self.back.push(here),
+        }
+    }
+
+    /// The place didn't get reached: it goes back on its stack.
+    fn unwind(&mut self, travel: Travel) {
+        match travel {
+            Travel::Follow => {}
+            Travel::Back(place) => self.back.push(place),
+            Travel::Forward(place) => self.forward.push(place),
+        }
+    }
+
+    /// Settles a history change waiting on an open: done once that file is
+    /// the open one; undone once nothing's pending and it isn't (the
+    /// unsaved-changes prompt was cancelled, or the open failed).
+    fn settle_history(&mut self) {
+        let Some((path, here, travel)) = self.pending_history.clone() else {
+            return;
+        };
+        if self.doc.path() == Some(path.as_path()) {
+            self.pending_history = None;
+            self.commit(here, travel);
+        } else if self.confirm.is_none() {
+            self.pending_history = None;
+            self.unwind(travel);
         }
     }
 
@@ -1499,6 +1552,7 @@ impl App {
         if let Some(at) = self.live.take_follow().or(self.code.take_follow()) {
             self.follow(at);
         }
+        self.settle_history();
         self.apply_pending_jump();
         if let Some((_, shown)) = &self.hint {
             let shown = *shown;
@@ -3328,5 +3382,35 @@ mod tests {
         assert_eq!(app.opened_urls.len(), 1, "a script isn't opened");
         assert!(app.hint.as_ref().unwrap().0.contains("tool.sh"));
         assert_eq!(app.doc.path(), Some(a.as_path()));
+    }
+
+    #[test]
+    fn history_changes_only_when_a_navigation_lands() {
+        // Review of #33.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "[next](b.md)\n").unwrap();
+        fs::write(dir.path().join("b.md"), "# B\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        let mut time = 0.0;
+        settle(&ctx, &mut app, &mut time);
+        let gone = Place {
+            path: Some(dir.path().join("gone.md")),
+            offset: 0,
+        };
+        app.forward.push(gone.clone());
+        // A cancelled open: no back entry, the way forward kept.
+        type_into(&mut app, "draft");
+        app.follow(1);
+        assert!(app.confirm.is_some());
+        app.confirm = None;
+        drive(&ctx, &mut app, &mut time, vec![]);
+        assert!(app.back.is_empty());
+        assert_eq!(app.forward, vec![gone.clone()]);
+        // Forward to a deleted file: refused, and the place stays.
+        app.go_forward();
+        assert_eq!(app.forward, vec![gone]);
+        assert!(app.back.is_empty());
     }
 }

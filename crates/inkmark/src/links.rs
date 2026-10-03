@@ -101,10 +101,10 @@ fn local(dest: &str, base: &Path) -> Target {
 /// File types that are documents, opened with `xdg-open`: images, PDF,
 /// plain text, audio, video, office documents.
 const SAFE_DOCUMENTS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tif", "tiff", "avif", "heic", "ico", "pdf",
-    "txt", "log", "csv", "tsv", "mp3", "ogg", "oga", "flac", "wav", "m4a", "opus", "mp4", "mkv",
-    "webm", "mov", "avi", "odt", "ods", "odp", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "rtf",
-    "epub",
+    // No SVG: its default app is often a browser, which runs SVG script.
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "avif", "heic", "ico", "pdf", "txt",
+    "log", "csv", "tsv", "mp3", "ogg", "oga", "flac", "wav", "m4a", "opus", "mp4", "mkv", "webm",
+    "mov", "avi", "odt", "ods", "odp", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "rtf", "epub",
 ];
 
 fn is_safe_document(name: &str) -> bool {
@@ -222,6 +222,11 @@ mod tests {
         );
         std::fs::write(base.join("app.desktop"), "").unwrap();
         assert!(matches!(resolve("app.desktop", base), Target::Refused(_)));
+        std::fs::write(base.join("diagram.svg"), "").unwrap();
+        assert!(
+            matches!(resolve("diagram.svg", base), Target::Refused(_)),
+            "SVG can run script"
+        );
         {
             use std::os::unix::fs::PermissionsExt;
             let sneaky = base.join("sneaky.pdf");

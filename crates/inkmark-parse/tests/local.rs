@@ -416,3 +416,50 @@ fn deleting_a_definition_stops_it_resolving_at_once() {
     assert!(out.catch_up(&GfmParser, &doc, since));
     assert_eq!(out.link_defs.get("ref").map(String::as_str), Some("/other"));
 }
+
+#[test]
+fn the_first_definition_of_a_label_wins_through_local_edits() {
+    // Review of #33: duplicates far apart, so no reparse region holds both.
+    let filler = "Some text.\n\n".repeat(20);
+    let src = format!("[x][ref]\n\n[ref]: /first\n\n{filler}[ref]: /second\n");
+    let mut doc = Document::from_text(&src);
+    let mut out = GfmParser.parse(&src);
+    let dest = |out: &ParseOutput| out.link_defs.get("ref").cloned();
+    assert_eq!(dest(&out), Some("/first".into()));
+    let replace = |doc: &mut Document, out: &mut ParseOutput, from: &str, to: &str| {
+        let at = whole(doc).find(from).unwrap();
+        let since = doc.epoch();
+        doc.apply(
+            vec![Edit::replace(at..at + from.len(), to)],
+            Selection::caret(at),
+            Selection::caret(at),
+            EditKind::Other,
+        )
+        .unwrap();
+        assert!(out.catch_up(&GfmParser, doc, since));
+        assert_valid(out, doc);
+        // The definitions agree with a full parse. (A reference far from
+        // its definition still waits for the full parse to style as a link:
+        // a local reparse can't see definitions outside its region.)
+        let full = GfmParser.parse(&whole(doc));
+        assert_eq!(
+            out.definitions, full.definitions,
+            "after {from:?} -> {to:?}"
+        );
+        assert_eq!(out.link_defs, full.link_defs, "after {from:?} -> {to:?}");
+    };
+    // Editing the later duplicate doesn't take over.
+    replace(&mut doc, &mut out, "/second", "/edited");
+    assert_eq!(dest(&out), Some("/first".into()));
+    // Deleting the first hands the label to the later one.
+    replace(&mut doc, &mut out, "[ref]: /first\n", "");
+    assert_eq!(dest(&out), Some("/edited".into()));
+    // Adding an earlier one takes over again.
+    replace(
+        &mut doc,
+        &mut out,
+        "[x][ref]\n",
+        "[x][ref]\n\n[ref]: /new\n",
+    );
+    assert_eq!(dest(&out), Some("/new".into()));
+}

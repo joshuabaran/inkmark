@@ -174,8 +174,34 @@ impl<'a> Builder<'a> {
             self.definitions.push(crate::Definition {
                 range: def.span.clone(),
                 label: crate::DefinitionLabel::Link(label.clone()),
+                dest: def.dest.to_string(),
             });
             link_defs.insert(label, def.dest.to_string());
+        }
+        // pulldown-cmark keeps only the first definition of a label; later
+        // ones (which take over if the first is deleted) are in the source
+        // that produced no output. Read each such stretch on its own.
+        let known: std::collections::HashSet<std::ops::Range<usize>> =
+            self.definitions.iter().map(|d| d.range.clone()).collect();
+        for span in &self.spans {
+            if span.kind != SpanKind::Syntax(Syntax::Other)
+                || !self.src[span.range.clone()].contains("]:")
+            {
+                continue;
+            }
+            let text = &self.src[span.range.clone()];
+            let parser = Parser::new_ext(text, Options::empty());
+            for (label, def) in parser.reference_definitions().iter() {
+                let range = def.span.start + span.range.start..def.span.end + span.range.start;
+                if known.contains(&range) {
+                    continue;
+                }
+                self.definitions.push(crate::Definition {
+                    range,
+                    label: crate::DefinitionLabel::Link(crate::normalize_label(label)),
+                    dest: def.dest.to_string(),
+                });
+            }
         }
         self.definitions.sort_by_key(|d| d.range.start);
         ParseOutput {
@@ -275,6 +301,7 @@ impl<'a> Builder<'a> {
                 self.definitions.push(crate::Definition {
                     range: range.clone(),
                     label: crate::DefinitionLabel::Footnote(label.into_string()),
+                    dest: String::new(),
                 });
                 (
                     OpenTag::FootnoteDefinition,

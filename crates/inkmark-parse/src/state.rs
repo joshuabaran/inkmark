@@ -149,53 +149,45 @@ impl ParseOutput {
     /// more stops resolving, instead of lingering until the full parse.
     fn replace_definitions(&mut self, region: &Range<usize>, len: usize, local: &mut ParseOutput) {
         let inside = |r: &Range<usize>| region.start <= r.start && r.end <= region.end;
-        let mut removed = Vec::new();
+        let mut touched: Vec<crate::DefinitionLabel> = Vec::new();
         self.definitions.retain(|d| {
             let keep = !inside(&d.range);
             if !keep {
-                removed.push(d.label.clone());
+                touched.push(d.label.clone());
             }
             keep
         });
-        let added: Vec<crate::Definition> = std::mem::take(&mut local.definitions)
+        let added = std::mem::take(&mut local.definitions)
             .into_iter()
             .filter(|d| d.range.start < len)
             .map(|mut d| {
                 d.range = d.range.start + region.start..d.range.end.min(len) + region.start;
                 d
-            })
-            .collect();
-        for label in removed {
-            if !self
-                .definitions
-                .iter()
-                .chain(&added)
-                .any(|d| d.label == label)
-            {
-                match label {
-                    crate::DefinitionLabel::Link(l) => {
-                        self.link_defs.remove(&l);
-                    }
-                    crate::DefinitionLabel::Footnote(l) => {
-                        self.footnotes.remove(&l);
-                    }
-                }
-            }
+            });
+        for d in added {
+            touched.push(d.label.clone());
+            self.definitions.push(d);
         }
-        for d in &added {
-            match &d.label {
-                crate::DefinitionLabel::Link(l) => {
-                    if let Some(dest) = local.link_defs.get(l) {
-                        self.link_defs.insert(l.clone(), dest.clone());
-                    }
-                }
-                crate::DefinitionLabel::Footnote(l) => {
-                    self.footnotes.insert(l.clone());
-                }
-            }
-        }
-        self.definitions.extend(added);
         self.definitions.sort_by_key(|d| d.range.start);
+        // Each label touched resolves to its earliest remaining definition,
+        // wherever that is, or not at all.
+        for label in touched {
+            let first = self.definitions.iter().find(|d| d.label == label);
+            match (label, first) {
+                (crate::DefinitionLabel::Link(l), Some(d)) => {
+                    self.link_defs.insert(l, d.dest.clone());
+                }
+                (crate::DefinitionLabel::Link(l), None) => {
+                    self.link_defs.remove(&l);
+                }
+                (crate::DefinitionLabel::Footnote(l), Some(_)) => {
+                    self.footnotes.insert(l);
+                }
+                (crate::DefinitionLabel::Footnote(l), None) => {
+                    self.footnotes.remove(&l);
+                }
+            }
+        }
     }
 }
 
