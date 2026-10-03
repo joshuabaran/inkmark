@@ -64,3 +64,24 @@ fn a_missing_family_is_reported_and_changes_nothing() {
     assert_eq!(missing, vec!["No Such Font 123".to_owned()]);
     assert!(!r.begin_frame(CONFIG, 1.0));
 }
+
+#[test]
+fn a_name_in_another_case_is_stored_as_the_font_spells_it() {
+    // Review of #30: font lookups compare names exactly.
+    let ctx = egui::Context::default();
+    let fonts = Fonts::shared(&ctx);
+    let Some(family) = ["DejaVu Sans", "Noto Sans", "Liberation Sans"]
+        .into_iter()
+        .find(|f| fonts.borrow().has_family(f))
+    else {
+        return;
+    };
+    let typed = family.to_lowercase();
+    assert!(
+        fonts
+            .borrow_mut()
+            .set_families(None, Some(&typed))
+            .is_empty()
+    );
+    assert_eq!(fonts.borrow().families().1, family);
+}

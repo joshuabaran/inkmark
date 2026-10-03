@@ -120,11 +120,35 @@ impl Fonts {
 
     /// Whether a font family with this name is installed (any case).
     pub fn has_family(&self, name: &str) -> bool {
-        self.font_system.db().faces().any(|face| {
-            face.families
-                .iter()
-                .any(|(family, _)| family.eq_ignore_ascii_case(name))
-        })
+        self.installed_family(name).is_some()
+    }
+
+    /// The installed family `name` refers to, spelled as the font names
+    /// itself: font lookups compare names exactly, so a name typed in
+    /// another case must be stored in this spelling. Exact matches win.
+    pub fn installed_family(&self, name: &str) -> Option<String> {
+        let mut folded = None;
+        for face in self.font_system.db().faces() {
+            for (family, _) in &face.families {
+                if family == name {
+                    return Some(family.clone());
+                }
+                if folded.is_none() && family.eq_ignore_ascii_case(name) {
+                    folded = Some(family.clone());
+                }
+            }
+        }
+        folded
+    }
+
+    /// The families code (monospace) and plain text (sans-serif) use now.
+    pub fn families(&self) -> (String, String) {
+        use cosmic_text::fontdb::Family as F;
+        let db = self.font_system.db();
+        (
+            db.family_name(&F::Monospace).to_owned(),
+            db.family_name(&F::SansSerif).to_owned(),
+        )
     }
 
     /// The families plain text and code use (`None` leaves one as it is).
@@ -135,10 +159,10 @@ impl Fonts {
         let mut changed = false;
         for (name, mono) in [(monospace, true), (sans, false)] {
             let Some(name) = name else { continue };
-            if !self.has_family(name) {
+            let Some(name) = self.installed_family(name) else {
                 missing.push(name.to_owned());
                 continue;
-            }
+            };
             let db = self.font_system.db_mut();
             if mono {
                 db.set_monospace_family(name);

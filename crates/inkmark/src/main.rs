@@ -15,9 +15,12 @@ use inkmark_parse::{GfmParser, ParseState};
 use inkmark_text::Fonts;
 use inkmark_view::{BrowserOutput, CodeView, FileBrowser, LiveView, theme};
 
-/// Font sizes, in points, unless config.toml sets them.
+/// Font sizes, in points, unless config.toml sets them, and line height as
+/// a multiple of the size.
 const CODE_SIZE: f32 = 14.0;
 const TEXT_SIZE: f32 = 16.0;
+const CODE_LINE: f32 = 21.0 / 14.0;
+const TEXT_LINE: f32 = 26.0 / 16.0;
 
 /// How long a key hint stays in the status bar.
 const HINT_TIME: Duration = Duration::from_secs(4);
@@ -258,6 +261,10 @@ struct App {
     /// in tests), with their last modification times.
     font_files: Vec<Option<PathBuf>>,
     font_stamps: Vec<Option<std::time::SystemTime>>,
+    /// The last config.toml that read cleanly, kept through a bad read.
+    settings: config::Settings,
+    /// The error banner text the settings put up, to take down once fixed.
+    settings_error: Option<String>,
     /// A dialog took keyboard focus from the panes last frame.
     modal_was_open: bool,
     /// Tests receive the dialog kind instead of opening a portal window.
@@ -324,6 +331,8 @@ impl App {
             fonts: fonts.clone(),
             font_files: Vec::new(),
             font_stamps: Vec::new(),
+            settings: config::Settings::default(),
+            settings_error: None,
             modal_was_open: false,
             #[cfg(test)]
             dialog_hook: None,
@@ -528,34 +537,63 @@ impl App {
         config_file: Option<&Path>,
         system_font: impl Fn(&str) -> Option<String>,
     ) {
-        let settings = match config_file.map(std::fs::read_to_string) {
-            Some(Ok(text)) => config::parse(&text).unwrap_or_else(|e| {
-                self.error = Some(format!("Couldn't read config.toml: {e}"));
-                config::Settings::default()
-            }),
-            // No config file: defaults.
-            _ => config::Settings::default(),
+        let mut problems = Vec::new();
+        // No file: defaults. A file that can't be read or parsed (perhaps
+        // half-written): say so and keep the last good settings.
+        let read = match config_file.map(std::fs::read_to_string) {
+            None => Ok(None),
+            Some(Ok(text)) => config::parse(&text).map(Some),
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Some(Err(e)) => Err(e.to_string()),
         };
-        let code = settings
-            .code_font
-            .clone()
-            .or_else(|| system_font("monospace"));
-        let text = settings
-            .text_font
-            .clone()
-            .or_else(|| system_font("sans-serif"));
-        let missing = self
-            .fonts
-            .borrow_mut()
-            .set_families(code.as_deref(), text.as_deref());
+        match read {
+            Ok(settings) => self.settings = settings.unwrap_or_default(),
+            Err(e) => problems.push(format!(
+                "Couldn't read config.toml: {e} (keeping the previous settings)"
+            )),
+        }
+        let settings = self.settings.clone();
+        // A font named in the config that isn't installed falls back to the
+        // system's, as if it weren't named.
+        let mut missing = Vec::new();
+        let mut pick = |configured: Option<&String>, alias: &str| match configured {
+            Some(name) if self.fonts.borrow().has_family(name) => Some(name.clone()),
+            Some(name) => {
+                missing.push(name.clone());
+                system_font(alias)
+            }
+            None => system_font(alias),
+        };
+        let code = pick(settings.code_font.as_ref(), "monospace");
+        let text = pick(settings.text_font.as_ref(), "sans-serif");
+        missing.extend(
+            self.fonts
+                .borrow_mut()
+                .set_families(code.as_deref(), text.as_deref()),
+        );
         if !missing.is_empty() {
-            self.error = Some(format!(
-                "Font not installed: {} (using the default)",
+            problems.push(format!(
+                "Font not installed: {} (using the system font)",
                 missing.join(", ")
             ));
         }
-        self.code.font_size = settings.code_size.unwrap_or(CODE_SIZE);
-        self.live.font_size = settings.text_size.unwrap_or(TEXT_SIZE);
+        let code_size = settings.code_size.unwrap_or(CODE_SIZE);
+        let text_size = settings.text_size.unwrap_or(TEXT_SIZE);
+        self.code.font_size = code_size;
+        self.code.line_height = (code_size * CODE_LINE).round();
+        self.live.font_size = text_size;
+        self.live.line_height = (text_size * TEXT_LINE).round();
+        // Show what's wrong; once nothing is, take down only our own banner.
+        if problems.is_empty() {
+            if self.error.is_some() && self.error == self.settings_error {
+                self.error = None;
+            }
+            self.settings_error = None;
+        } else {
+            let message = problems.join(". ");
+            self.error = Some(message.clone());
+            self.settings_error = Some(message);
+        }
     }
 
     fn check_disk(&mut self, ctx: &egui::Context) {
@@ -3076,13 +3114,85 @@ mod tests {
             "{:?}",
             app.error
         );
-        // The config named a code font, so only the text font came from the system.
-        assert_eq!(*asked.borrow(), vec!["sans-serif".to_owned()]);
+        // The configured code font isn't installed, so it falls back to the
+        // system's too.
+        assert_eq!(
+            *asked.borrow(),
+            vec!["monospace".to_owned(), "sans-serif".to_owned()]
+        );
 
         app.error = None;
         fs::write(&config, "[font]\ncode_size = \"big\"\n").unwrap();
         app.apply_settings_from(Some(&config), |_| None);
         assert!(app.error.as_deref().unwrap().contains("code_size"));
-        assert_eq!(app.code.font_size, CODE_SIZE, "a bad file means defaults");
+        assert_eq!(
+            app.live.font_size, 20.0,
+            "a bad file keeps the last good settings"
+        );
+    }
+
+    #[test]
+    fn settings_fall_back_scale_and_clear_their_own_errors() {
+        // Review of #30.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path(), None);
+        let Some(installed) = ["DejaVu Sans", "Noto Sans", "Liberation Sans"]
+            .into_iter()
+            .find(|f| app.fonts.borrow().has_family(f))
+        else {
+            return;
+        };
+        let system = |alias: &str| (alias == "sans-serif").then(|| installed.to_owned());
+        let config = dir.path().join("config.toml");
+
+        // A configured font that isn't installed falls back to the system's.
+        fs::write(
+            &config,
+            "[font]\ntext = \"No Such Sans 123\"\ntext_size = 24\n",
+        )
+        .unwrap();
+        app.apply_settings_from(Some(&config), system);
+        assert_eq!(app.fonts.borrow().families().1, installed);
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap()
+                .contains("using the system font")
+        );
+        // Line height follows the size.
+        assert_eq!(app.live.line_height, (24.0 * TEXT_LINE).round());
+        assert_eq!(app.code.line_height, 21.0);
+
+        // Fixed: the settings' own error goes away.
+        fs::write(&config, "[font]\ntext_size = 24\n").unwrap();
+        app.apply_settings_from(Some(&config), system);
+        assert!(app.error.is_none(), "{:?}", app.error);
+
+        // An unrelated error stays.
+        app.error = Some("Couldn't save: disk full".into());
+        app.apply_settings_from(Some(&config), system);
+        assert_eq!(app.error.as_deref(), Some("Couldn't save: disk full"));
+
+        // A file that exists but can't be read keeps the previous settings.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = fs::read_to_string(&config).is_err();
+        app.error = None;
+        app.apply_settings_from(Some(&config), system);
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+        if unreadable {
+            assert!(
+                app.error
+                    .as_deref()
+                    .unwrap()
+                    .contains("keeping the previous")
+            );
+            assert_eq!(app.live.font_size, 24.0);
+        }
+        // A deleted file means defaults.
+        fs::remove_file(&config).unwrap();
+        app.apply_settings_from(Some(&config), system);
+        assert_eq!(app.live.font_size, TEXT_SIZE);
+        assert!(app.error.is_none());
     }
 }
