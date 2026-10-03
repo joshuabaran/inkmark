@@ -64,31 +64,35 @@ impl Body {
     }
 
     /// Caret rect for source offset `at`, from the body's top-left.
-    fn caret_rect(&self, at: usize) -> Rect {
+    /// `upstream`: at a mid-word wrap, at the end of the row before.
+    fn caret_rect(&self, at: usize, upstream: bool) -> Rect {
         let (seg, d) = self.layout.display_pos(at);
         self.geometry[seg]
-            .caret_rect(d, CARET_WIDTH)
+            .caret_rect_affine(d, CARET_WIDTH, upstream)
             .translate(vec2(0.0, self.seg_tops[seg]))
     }
 
-    /// Source offset at `local` (from the body's top-left).
-    fn hit(&self, local: Vec2) -> usize {
+    /// Source offset at `local` (from the body's top-left), and whether it
+    /// is the end of a mid-word-wrapped row (upstream).
+    fn hit(&self, local: Vec2) -> (usize, bool) {
         let seg = self.segment_at(local.y);
-        let d = self.geometry[seg].hit(vec2(local.x, local.y - self.seg_tops[seg]));
-        self.layout.source_pos(seg, d)
+        let (d, upstream) =
+            self.geometry[seg].hit_affine(vec2(local.x, local.y - self.seg_tops[seg]));
+        (self.layout.source_pos(seg, d), upstream)
     }
 
-    /// Start or end of the visual row holding `at`.
-    fn row_edge(&self, at: usize, end: bool) -> usize {
+    /// Start or end of the visual row holding `at` (on the row before at a
+    /// wrap point when `upstream`), and whether that end is upstream.
+    fn row_edge(&self, at: usize, end: bool, upstream: bool) -> (usize, bool) {
         let (seg, d) = self.layout.display_pos(at);
         let g = &self.geometry[seg];
-        let row = g.row_of(d);
-        let d = if end {
-            g.hit_row(row, f32::INFINITY)
+        let row = g.row_of_affine(d, upstream);
+        let (d, upstream) = if end {
+            g.hit_row_affine(row, f32::INFINITY)
         } else {
-            g.rows[row].start
+            (g.rows[row].start, false)
         };
-        self.layout.source_pos(seg, d)
+        (self.layout.source_pos(seg, d), upstream)
     }
 
     /// Widest visual row, for table column sizing and alignment.
@@ -186,18 +190,19 @@ struct Placed {
 
 impl Placed {
     /// Caret rect for `at`, from the leaf's text origin.
-    fn caret_rect(&self, at: usize) -> Rect {
+    fn caret_rect(&self, at: usize, upstream: bool) -> Rect {
         match self.table.as_ref().and_then(|g| g.cell_for(at)) {
             Some(cell) => cell
                 .body
-                .caret_rect(at)
+                .caret_rect(at, upstream)
                 .translate(cell.origin + vec2(0.0, TABLE_PAD)),
-            None => self.body.caret_rect(at),
+            None => self.body.caret_rect(at, upstream),
         }
     }
 
-    /// Source offset at `local`, from the leaf's text origin.
-    fn hit(&self, local: Vec2) -> usize {
+    /// Source offset at `local`, from the leaf's text origin, and whether
+    /// it's upstream.
+    fn hit(&self, local: Vec2) -> (usize, bool) {
         let local_in_table = local - vec2(0.0, TABLE_PAD);
         match self.table.as_ref().and_then(|g| g.cell_at(local_in_table)) {
             Some(cell) => cell.body.hit(local_in_table - cell.origin),
@@ -205,10 +210,10 @@ impl Placed {
         }
     }
 
-    fn row_edge(&self, at: usize, end: bool) -> usize {
+    fn row_edge(&self, at: usize, end: bool, upstream: bool) -> (usize, bool) {
         match self.table.as_ref().and_then(|g| g.cell_for(at)) {
-            Some(cell) => cell.body.row_edge(at, end),
-            None => self.body.row_edge(at, end),
+            Some(cell) => cell.body.row_edge(at, end, upstream),
+            None => self.body.row_edge(at, end, upstream),
         }
     }
 }
@@ -249,6 +254,12 @@ pub struct LiveView {
     hint: Option<&'static str>,
     /// A link was Ctrl+clicked at this offset; the app follows it.
     follow: Option<usize>,
+    /// The caret at this offset is at the end of a row that wrapped
+    /// mid-word (End, or a click past the row), not the start of the next
+    /// row. Stale as soon as the caret is anywhere else.
+    upstream_at: Option<usize>,
+    /// Whether the last `offset_at` hit was such a row end.
+    hit_upstream: bool,
     /// The selection was set from outside in current offsets: don't map it
     /// through edits on the next sync.
     selection_current: bool,
@@ -284,6 +295,8 @@ impl LiveView {
             seal_undo: false,
             hint: None,
             follow: None,
+            upstream_at: None,
+            hit_upstream: false,
             selection_current: false,
             pending_scroll: None,
             checkboxes: Vec::new(),
@@ -901,7 +914,7 @@ impl LiveView {
         let line = doc.byte_to_line(head);
         match self.place_line(doc, parse, line, frame.width) {
             Some(p) => {
-                let r = p.caret_rect(head);
+                let r = p.caret_rect(head, self.upstream());
                 let top = self.lines.heights.offset_of(p.first_line) + f64::from(r.top());
                 (top, p.indent + r.left(), r.height())
             }
@@ -926,9 +939,14 @@ impl LiveView {
         match self.place_line(doc, parse, at.line, frame.width) {
             Some(p) => {
                 let local = (y - self.lines.heights.offset_of(p.first_line)) as f32;
-                p.hit(vec2(x - p.indent, local))
+                let (at, upstream) = p.hit(vec2(x - p.indent, local));
+                self.hit_upstream = upstream;
+                at
             }
-            None => doc.line_to_byte(at.line),
+            None => {
+                self.hit_upstream = false;
+                doc.line_to_byte(at.line)
+            }
         }
     }
 
@@ -1032,17 +1050,32 @@ impl LiveView {
             }
             y += 4.0f64.copysign(f64::from(dy));
         }
+        let upstream = self.hit_upstream && target != 0 && target != doc.len();
         self.move_to(target, extend);
+        self.upstream_at = upstream.then_some(target);
         self.preferred_x = Some(x);
     }
 
-    fn row_edge(&mut self, doc: &Document, parse: &ParseOutput, frame: Frame, end: bool) -> usize {
+    fn upstream(&self) -> bool {
+        self.upstream_at == Some(self.selection.head)
+    }
+
+    /// Start or end of the caret's visual row, and whether that end is
+    /// upstream (see `upstream_at`).
+    fn row_edge(
+        &mut self,
+        doc: &Document,
+        parse: &ParseOutput,
+        frame: Frame,
+        end: bool,
+    ) -> (usize, bool) {
         let head = self.selection.head;
         let line = doc.byte_to_line(head);
+        let upstream = self.upstream();
         let Some(p) = self.place_line(doc, parse, line, frame.width) else {
-            return doc.line_to_byte(line);
+            return (doc.line_to_byte(line), false);
         };
-        p.row_edge(head, end)
+        p.row_edge(head, end, upstream)
     }
 
     // ---- input ---------------------------------------------------------------
@@ -1377,12 +1410,13 @@ impl LiveView {
             Key::Home if cmd => self.move_to(0, shift),
             Key::End if cmd => self.move_to(doc.len(), shift),
             Key::Home => {
-                let target = self.row_edge(doc, parse, frame, false);
+                let (target, _) = self.row_edge(doc, parse, frame, false);
                 self.move_to(target, shift);
             }
             Key::End => {
-                let target = self.row_edge(doc, parse, frame, true);
+                let (target, upstream) = self.row_edge(doc, parse, frame, true);
                 self.move_to(target, shift);
+                self.upstream_at = upstream.then_some(target);
             }
             Key::A if cmd => {
                 self.selection = Selection {
@@ -1419,11 +1453,13 @@ impl LiveView {
         if pressed && response.hovered() {
             let at = self.offset_at(doc, parse, frame, pos);
             self.move_to(at, shift);
+            self.upstream_at = self.hit_upstream.then_some(at);
             self.reveal_caret = 0;
             self.dragging = true;
         } else if self.dragging && down {
             let at = self.offset_at(doc, parse, frame, pos);
             self.selection.head = at;
+            self.upstream_at = self.hit_upstream.then_some(at);
         }
         if response.double_clicked() {
             let word = motion::word_at(doc, self.selection.head);
@@ -1532,7 +1568,7 @@ impl LiveView {
             }
             self.draw_leaf(painter, &mut meshes, doc, parse, &p, frame, y, &selection);
             if (p.first_line..=p.last_line).contains(&caret_line) {
-                let r = p.caret_rect(self.selection.head);
+                let r = p.caret_rect(self.selection.head, self.upstream());
                 caret = Some(r.translate(vec2(frame.left + p.indent, y)));
             }
             y += p.height;

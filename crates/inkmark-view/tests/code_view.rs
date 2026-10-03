@@ -531,3 +531,33 @@ fn dragging_past_the_bottom_edge_scrolls_and_extends_the_selection() {
         "the selection still starts where it was pressed"
     );
 }
+
+#[test]
+fn end_on_a_mid_word_wrap_stays_on_the_row() {
+    // Review of #28: a row that wraps inside a word used to end before its
+    // last character, and the caret at the true end drew on the next row,
+    // so a second End walked on.
+    let long = "x".repeat(400);
+    let mut h = Harness::new(&format!("{long}\nend"));
+    h.press(Key::End);
+    let row_end = h.head();
+    assert!(row_end > 10 && row_end < 400, "wrapped: {row_end}");
+    h.press(Key::End);
+    assert_eq!(h.head(), row_end, "End again stays on the row");
+    // The next row starts exactly there: End reached the row's true end.
+    h.press(Key::ArrowRight);
+    h.press(Key::Home);
+    assert_eq!(h.head(), row_end, "the next row starts where End stopped");
+    h.press(Key::ArrowLeft);
+    h.press(Key::End);
+    h.press(Key::Home);
+    assert_eq!(h.head(), 0, "Home from the row's end goes to its start");
+    h.press(Key::End);
+    h.type_text("Y");
+    assert_eq!(
+        h.text()[row_end..row_end + 1].to_owned(),
+        "Y",
+        "typed after the row's last x"
+    );
+    assert_eq!(h.text().len(), 400 + 1 + 4);
+}

@@ -748,3 +748,37 @@ fn a_table_wider_than_the_pane_still_edits_its_last_column() {
     s.type_text("Y");
     assert!(s.text().contains("| Yy |"), "{}", s.text());
 }
+
+#[test]
+fn end_on_a_mid_word_wrap_stays_on_the_row() {
+    // Review of #28, in the live pane: a long unbroken word.
+    let long = "x".repeat(300);
+    let src = format!("{long}\n\nNext.\n");
+    let mut s = Split::new(&src);
+    s.caret(0);
+    s.press(Key::End);
+    let row_end = s.live.selection().head;
+    assert!(row_end > 10 && row_end < 300, "wrapped: {row_end}");
+    s.press(Key::End);
+    assert_eq!(s.live.selection().head, row_end, "End again stays");
+    // The next row starts exactly there: End reached the row's true end.
+    s.press(Key::ArrowRight);
+    s.press(Key::Home);
+    assert_eq!(
+        s.live.selection().head,
+        row_end,
+        "the next row starts where End stopped"
+    );
+    s.press(Key::ArrowLeft);
+    s.press(Key::End);
+    s.press(Key::Home);
+    assert_eq!(s.live.selection().head, 0);
+    s.press(Key::End);
+    s.type_text("Y");
+    assert_eq!(&s.text()[row_end..row_end + 1], "Y");
+    assert_eq!(
+        &s.text()[row_end - 1..row_end],
+        "x",
+        "after the row's last x"
+    );
+}

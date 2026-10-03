@@ -67,6 +67,12 @@ pub struct CodeView {
     pending_scroll: Option<ScrollPos>,
     /// A link was Ctrl+clicked at this offset; the app follows it.
     follow: Option<usize>,
+    /// The caret at this offset is at the end of a row that wrapped
+    /// mid-word (End, or a click past the row), not the start of the next
+    /// row. Stale as soon as the caret is anywhere else.
+    upstream_at: Option<usize>,
+    /// Whether the last `offset_at` hit was such a row end.
+    hit_upstream: bool,
     pub font_size: f32,
     pub line_height: f32,
 }
@@ -105,6 +111,8 @@ impl CodeView {
             selection_current: false,
             pending_scroll: None,
             follow: None,
+            upstream_at: None,
+            hit_upstream: false,
             font_size: 14.0,
             line_height: 21.0,
         }
@@ -501,6 +509,10 @@ impl CodeView {
         doc.seal_undo_step();
     }
 
+    fn upstream(&self) -> bool {
+        self.upstream_at == Some(self.selection.head)
+    }
+
     fn line_text<'d>(doc: &'d Document, line: usize) -> Cow<'d, str> {
         doc.slice(doc.line_range(line))
     }
@@ -510,7 +522,8 @@ impl CodeView {
         let mut head = self.selection.head;
         let mut line = doc.byte_to_line(head);
         let mut geometry = self.text.geometry(&Self::line_text(doc, line));
-        let mut row = geometry.row_of(head - doc.line_to_byte(line));
+        let mut row = geometry.row_of_affine(head - doc.line_to_byte(line), self.upstream());
+        let mut upstream = false;
         let x = self
             .preferred_x
             .unwrap_or_else(|| geometry.caret_x(row, head - doc.line_to_byte(line)));
@@ -536,25 +549,29 @@ impl CodeView {
                 head = doc.len();
                 break;
             }
-            head = doc.line_to_byte(line) + geometry.hit_row(row, x);
+            let (d, up) = geometry.hit_row_affine(row, x);
+            head = doc.line_to_byte(line) + d;
+            upstream = up;
         }
         self.move_to(doc, head, extend);
+        self.upstream_at = upstream.then_some(head);
         self.preferred_x = Some(x);
     }
 
-    /// Start (`end == false`) or end of the caret's visual row.
-    fn row_edge(&mut self, doc: &Document, end: bool) -> usize {
+    /// Start (`end == false`) or end of the caret's visual row, and
+    /// whether that end is upstream (see `upstream_at`).
+    fn row_edge(&mut self, doc: &Document, end: bool) -> (usize, bool) {
         let head = self.selection.head;
         let line = doc.byte_to_line(head);
         let start = doc.line_to_byte(line);
         let geometry = self.text.geometry(&Self::line_text(doc, line));
-        let row = geometry.row_of(head - start);
-        start
-            + if end {
-                geometry.hit_row(row, f32::INFINITY)
-            } else {
-                geometry.rows[row].start
-            }
+        let row = geometry.row_of_affine(head - start, self.upstream());
+        let (d, upstream) = if end {
+            geometry.hit_row_affine(row, f32::INFINITY)
+        } else {
+            (geometry.rows[row].start, false)
+        };
+        (start + d, upstream)
     }
 
     // ---- input ----------------------------------------------------------------
@@ -649,12 +666,13 @@ impl CodeView {
             Key::Home if cmd => self.move_to(doc, 0, shift),
             Key::End if cmd => self.move_to(doc, doc.len(), shift),
             Key::Home => {
-                let target = self.row_edge(doc, false);
+                let (target, _) = self.row_edge(doc, false);
                 self.move_to(doc, target, shift);
             }
             Key::End => {
-                let target = self.row_edge(doc, true);
+                let (target, upstream) = self.row_edge(doc, true);
                 self.move_to(doc, target, shift);
+                self.upstream_at = upstream.then_some(target);
             }
             Key::Backspace if !range.is_empty() => self.delete(doc, range, EditKind::Deleting),
             Key::Delete if !range.is_empty() => self.delete(doc, range, EditKind::Deleting),
@@ -726,7 +744,9 @@ impl CodeView {
         let height = self.text.line_height(&text);
         self.lines.heights.set_measured(at.line, height);
         let geometry = self.text.geometry(&text);
-        doc.line_to_byte(at.line) + geometry.hit(vec2(pos.x - frame.text_left, at.offset))
+        let (d, upstream) = geometry.hit_affine(vec2(pos.x - frame.text_left, at.offset));
+        self.hit_upstream = upstream;
+        doc.line_to_byte(at.line) + d
     }
 
     fn handle_pointer(&mut self, ui: &Ui, response: &Response, doc: &mut Document, frame: Frame) {
@@ -759,6 +779,8 @@ impl CodeView {
                 Granularity::Word => motion::word_at(doc, at),
                 Granularity::Line => motion::line_at(doc, at),
             };
+            self.upstream_at =
+                (granularity == Granularity::Char && self.hit_upstream).then_some(at);
             if modifiers.shift && granularity == Granularity::Char {
                 self.selection.head = at;
             } else {
@@ -798,6 +820,7 @@ impl CodeView {
             let unit = match granularity {
                 Granularity::Char => {
                     self.selection.head = at;
+                    self.upstream_at = self.hit_upstream.then_some(at);
                     return self.end_drag_if_released(down);
                 }
                 Granularity::Word => motion::word_at(doc, at),
@@ -831,10 +854,11 @@ impl CodeView {
         let text = Self::line_text(doc, line);
         let height = self.text.line_height(&text);
         self.lines.heights.set_measured(line, height);
-        let caret = self
-            .text
-            .geometry(&text)
-            .caret_rect(head - doc.line_to_byte(line), CARET_WIDTH);
+        let caret = self.text.geometry(&text).caret_rect_affine(
+            head - doc.line_to_byte(line),
+            CARET_WIDTH,
+            self.upstream(),
+        );
         let top = self.lines.heights.offset_of(line) + f64::from(caret.top());
         let bottom = top + f64::from(caret.height());
         let view_top = self.lines.heights.anchor_y(self.lines.anchor);
@@ -901,7 +925,11 @@ impl CodeView {
                     highlights.extend(rects.into_iter().map(|r| r.translate(origin.to_vec2())));
                 }
                 if line == caret_line {
-                    let r = geometry.caret_rect(self.selection.head - range.start, CARET_WIDTH);
+                    let r = geometry.caret_rect_affine(
+                        self.selection.head - range.start,
+                        CARET_WIDTH,
+                        self.upstream(),
+                    );
                     caret = Some(r.translate(origin.to_vec2()));
                 }
             }
