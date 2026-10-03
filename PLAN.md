@@ -427,10 +427,28 @@ Decided 2026-10-03.
 
 **Slices:** TB1 a table model and its operations as pure source edits (`tables.rs`), tested by parsing the result; TB2 the live pane: re-pad on leaving, the right-click menu, shortcuts in both panes; TB3 inserting a new table.
 
+### Cleanup
+
+Small items left from earlier rounds, done 2026-10-03 on branch `cleanup`. Decided 2026-10-03:
+
+- **Wide characters in the code pane** take exactly two monospace cells (box drawing and symbols already snap to one), so mixed CJK and Latin columns line up.
+- **SVG images** render in the live pane like the other formats.
+- **A link definition deleted by a local edit** stops resolving at once, not only after the next full parse.
+- **Alt+Right** goes forward again after Alt+Left.
+- **Links to non-Markdown files** open in the default app (`xdg-open`) only for an allowlist of safe types: images, PDF, plain text, audio, video, office documents. Anything else (scripts, `.desktop`, unknown types), and any file with an executable bit, is refused with a status-bar message.
+
+### Configurable key bindings (next)
+
+Every shortcut can be rebound. Proposed 2026-10-03, to confirm when the round starts:
+
+- A `[keys]` table in `~/.config/inkmark/config.toml`, applied live: `bold = "Ctrl+B"`, or a list (`insert_row_below = ["Ctrl+Alt+Down", "Ctrl+Enter"]`); an empty list unbinds; anything not set keeps its default.
+- One table of actions and default bindings that the app shell and both panes use; today's shortcuts move onto it unchanged.
+- An unknown action, an unparseable key, or two actions on one chord is reported in the error banner, and that entry keeps its default.
+- `inkmark --list-keys` prints every action with its current keys; the README's shortcut table is generated from the same list.
+- Not configurable: plain editing keys (arrows, Backspace, Enter; their Ctrl/Alt variants are), mouse gestures, and keys the desktop owns.
+
 ### Later
 
-- Tables: re-pad columns so pipes stay aligned as you type; add and remove columns.
-- File management in the browser: rename, move, delete to trash.
-- Code pane: snap fallback glyphs (box drawing, CJK) to whole monospace cells.
-- Images: SVG; remote images (needs a network policy).
-- Still standing from the MVP: a link reference deleted by a local edit lingers until the next full parse.
+- Images from the network (needs a network policy: inkmark makes no network requests today).
+- Updating links in other notes when a note is renamed or moved.
+- Search across the folder; tabs; math and diagrams; screen-reader support (AccessKit) for the editor panes.

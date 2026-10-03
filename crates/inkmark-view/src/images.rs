@@ -146,6 +146,9 @@ fn decode(path: &Path, max_side: u32) -> Result<ColorImage, String> {
     if len > MAX_FILE_BYTES {
         return Err(format!("{} MB is too large to show", len / (1024 * 1024)));
     }
+    if is_svg(path) {
+        return decode_svg(path, max_side);
+    }
     let image = image::ImageReader::open(path)
         .and_then(|r| r.with_guessed_format())
         .map_err(|e| e.to_string())?
@@ -159,6 +162,72 @@ fn decode(path: &Path, max_side: u32) -> Result<ColorImage, String> {
     let rgba = image.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Ok(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+}
+
+/// SVGs go by extension (`.svg`, `.svgz`); the raster decoder guesses
+/// from the bytes.
+fn is_svg(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("svg") || e.eq_ignore_ascii_case("svgz"))
+}
+
+/// Renders an SVG at its own size (scaled down to `max_side`), with text
+/// in the system's fonts. It can't reach other files: `<image href>`
+/// paths aren't loaded (an SVG in a note mustn't read whatever the user can),
+/// and embedded raster images aren't drawn. `.svgz` is inflated here, with
+/// the same size cap as other files.
+fn decode_svg(path: &Path, max_side: u32) -> Result<ColorImage, String> {
+    use resvg::{tiny_skia, usvg};
+
+    // Loading the system fonts is slow; once per run is enough.
+    static FONTS: std::sync::OnceLock<Arc<usvg::fontdb::Database>> = std::sync::OnceLock::new();
+    let fontdb = FONTS
+        .get_or_init(|| {
+            let mut db = usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            Arc::new(db)
+        })
+        .clone();
+    let mut data = std::fs::read(path).map_err(|e| e.to_string())?;
+    if data.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        let mut inflated = Vec::new();
+        flate2::read::GzDecoder::new(data.as_slice())
+            .take(MAX_FILE_BYTES + 1)
+            .read_to_end(&mut inflated)
+            .map_err(|e| format!("not a valid .svgz: {e}"))?;
+        if inflated.len() as u64 > MAX_FILE_BYTES {
+            return Err("the SVG is too large once unpacked".into());
+        }
+        data = inflated;
+    }
+    let options = usvg::Options {
+        fontdb,
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+            resolve_string: Box::new(|_, _| None),
+        },
+        ..Default::default()
+    };
+    let tree =
+        usvg::Tree::from_data(&data, &options).map_err(|e| format!("not a valid SVG: {e}"))?;
+    let size = tree.size();
+    let scale = (max_side as f32 / size.width().max(size.height())).min(1.0);
+    let (w, h) = (
+        (size.width() * scale).ceil().max(1.0) as u32,
+        (size.height() * scale).ceil().max(1.0) as u32,
+    );
+    let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or("the SVG has no size")?;
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    Ok(ColorImage::from_rgba_premultiplied(
+        [w as usize, h as usize],
+        pixmap.data(),
+    ))
 }
 
 #[cfg(test)]
@@ -234,5 +303,68 @@ mod tests {
             cache.get("https://x/y.png", Some(dir.path())),
             ImageSlot::Remote
         ));
+    }
+
+    #[test]
+    fn svgs_render_at_their_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dot.svg");
+        std::fs::write(
+            &path,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="20" height="20" fill="#ff0000"/></svg>"##,
+        )
+        .unwrap();
+        let image = decode(&path, 4096).unwrap();
+        assert_eq!(image.size, [40, 20]);
+        assert_eq!(
+            image.pixels[0],
+            egui::Color32::from_rgb(255, 0, 0),
+            "the rect is drawn"
+        );
+        assert_eq!(image.pixels[39].a(), 0, "the rest is transparent");
+        // Scaled down to fit.
+        assert_eq!(decode(&path, 10).unwrap().size, [10, 5]);
+        // Not SVG at all.
+        std::fs::write(&path, "<html>nope</html>").unwrap();
+        assert!(decode(&path, 4096).unwrap_err().contains("SVG"));
+    }
+
+    #[test]
+    fn an_svg_cant_pull_in_other_files() {
+        // Review of #33: `<image href>` paths aren't read.
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other.svg");
+        std::fs::write(
+            &other,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="#00ff00"/></svg>"##,
+        )
+        .unwrap();
+        let path = dir.path().join("outer.svg");
+        for href in ["other.svg", &other.display().to_string(), "../other.svg"] {
+            std::fs::write(
+                &path,
+                format!(
+                    r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="10" height="10"><image width="10" height="10" xlink:href="{href}"/></svg>"##
+                ),
+            )
+            .unwrap();
+            let image = decode(&path, 4096).unwrap();
+            assert_eq!(image.pixels[0].a(), 0, "{href} was loaded");
+        }
+    }
+
+    #[test]
+    fn svgz_is_inflated() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dot.svgz");
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="#0000ff"/></svg>"##,
+        )
+        .unwrap();
+        std::fs::write(&path, gz.finish().unwrap()).unwrap();
+        let image = decode(&path, 4096).unwrap();
+        assert_eq!(image.pixels[0], egui::Color32::from_rgb(0, 0, 255));
     }
 }

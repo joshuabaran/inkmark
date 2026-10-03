@@ -10,6 +10,9 @@ pub enum Target {
     External(String),
     /// A heading in the open document (`#anchor`).
     Anchor(String),
+    /// A file of a safe type that isn't Markdown (an image, a PDF…), opened
+    /// in the default app.
+    Document(PathBuf),
     /// A Markdown file, opened in inkmark, maybe at a heading.
     File {
         path: PathBuf,
@@ -78,10 +81,42 @@ fn local(dest: &str, base: &Path) -> Target {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    if !inkmark_files::is_markdown_name(name) {
-        return Target::Refused(format!("{name} isn't a Markdown file"));
+    if inkmark_files::is_markdown_name(name) {
+        return Target::File { path, anchor };
     }
-    Target::File { path, anchor }
+    // Opened by whatever app the desktop has for it: only types that are
+    // documents, never anything that could run.
+    if !is_safe_document(name) {
+        return Target::Refused(format!("{name} isn't a type inkmark opens"));
+    }
+    match std::fs::metadata(&path) {
+        Err(_) => Target::Refused(format!("{name} doesn't exist")),
+        Ok(meta) if is_executable(&meta) => {
+            Target::Refused(format!("{name} is executable, so it isn't opened"))
+        }
+        Ok(_) => Target::Document(path),
+    }
+}
+
+/// File types that are documents, opened with `xdg-open`: images, PDF,
+/// plain text, audio, video, office documents.
+const SAFE_DOCUMENTS: &[&str] = &[
+    // No SVG: its default app is often a browser, which runs SVG script.
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "avif", "heic", "ico", "pdf", "txt",
+    "log", "csv", "tsv", "mp3", "ogg", "oga", "flac", "wav", "m4a", "opus", "mp4", "mkv", "webm",
+    "mov", "avi", "odt", "ods", "odp", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "rtf", "epub",
+];
+
+fn is_safe_document(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| SAFE_DOCUMENTS.iter().any(|s| e.eq_ignore_ascii_case(s)))
+}
+
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
 }
 
 /// `https` in `https://…`: letters first, then letters, digits, `+-.`,
@@ -171,7 +206,36 @@ mod tests {
             resolve("javascript:alert(1)", base),
             Target::Refused(_)
         ));
-        assert!(matches!(resolve("image.png", base), Target::Refused(_)));
+        // Non-Markdown files: safe types that exist open in the default
+        // app; anything else, or anything executable, is refused.
+        std::fs::write(base.join("photo.png"), "").unwrap();
+        assert_eq!(
+            resolve("photo.png", base),
+            Target::Document(base.join("photo.png"))
+        );
+        assert!(
+            matches!(resolve("missing.png", base), Target::Refused(r) if r.contains("doesn't exist"))
+        );
+        std::fs::write(base.join("run.sh"), "").unwrap();
+        assert!(
+            matches!(resolve("run.sh", base), Target::Refused(r) if r.contains("isn't a type"))
+        );
+        std::fs::write(base.join("app.desktop"), "").unwrap();
+        assert!(matches!(resolve("app.desktop", base), Target::Refused(_)));
+        std::fs::write(base.join("diagram.svg"), "").unwrap();
+        assert!(
+            matches!(resolve("diagram.svg", base), Target::Refused(_)),
+            "SVG can run script"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let sneaky = base.join("sneaky.pdf");
+            std::fs::write(&sneaky, "").unwrap();
+            std::fs::set_permissions(&sneaky, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(
+                matches!(resolve("sneaky.pdf", base), Target::Refused(r) if r.contains("executable"))
+            );
+        }
         assert!(matches!(resolve("sub", base), Target::Refused(_)));
     }
 }
