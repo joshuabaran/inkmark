@@ -129,17 +129,33 @@ impl Layout {
         }
     }
 
-    /// Records a divider dragged to `x` in an editor area that starts at
-    /// `left` and is `width` wide. A window too narrow for both minimums
-    /// leaves the stored fraction alone.
-    pub(crate) fn set_split_at(&mut self, left: f32, width: f32, x: f32) {
+    /// Moves the divider from where it was drawn (`mid`) by `delta_x`, the
+    /// pointer's travel since the press. The fraction is the code pane's
+    /// share of the width beside the gap. A window too narrow for both
+    /// minimums leaves the stored fraction alone.
+    pub(crate) fn drag_split(&mut self, left: f32, width: f32, mid: f32, delta_x: f32) {
         let Some((lo, hi)) = split_limits(width) else {
             return;
         };
-        let raw = (x - left) / width;
+        if !mid.is_finite() || !delta_x.is_finite() {
+            return;
+        }
+        let usable = width - SPLIT_GAP;
+        let raw = (mid + delta_x - left - SPLIT_GAP / 2.0) / usable;
         if raw.is_finite() {
             self.code_fraction = raw.clamp(lo, hi);
         }
+    }
+
+    /// Sets the outline width from the width on screen when the drag began.
+    /// `delta_x` is the pointer's travel since the press; right shrinks the
+    /// outline. Past either limit, the edge stays put until the pointer
+    /// comes back.
+    pub(crate) fn drag_outline(&mut self, drawn: f32, delta_x: f32) {
+        if !drawn.is_finite() || !delta_x.is_finite() {
+            return;
+        }
+        self.outline_width = (drawn - delta_x).clamp(outline::MIN_WIDTH, outline::MAX_WIDTH);
     }
 }
 
@@ -214,23 +230,49 @@ mod tests {
         let wide = layout.split_fraction(1200.0);
         assert!((wide - 0.85).abs() < f32::EPSILON, "{wide}");
 
-        layout.set_split_at(0.0, 300.0, 10.0);
+        layout.drag_split(0.0, 300.0, 150.0, 10.0);
         assert_eq!(layout.code_fraction, 0.85);
 
-        layout.set_split_at(0.0, 1200.0, 900.0);
-        assert!(
-            (layout.code_fraction - 0.75).abs() < 0.001,
-            "{}",
-            layout.code_fraction
-        );
-        // At the left edge the pane stops at its minimum.
-        layout.code_fraction = 0.85;
-        layout.set_split_at(0.0, 1200.0, 0.0);
+        layout.code_fraction = 0.5;
+        let mid = split_mid(0.0, 1200.0, layout.split_fraction(1200.0));
+        layout.drag_split(0.0, 1200.0, mid, 0.0);
+        let stayed = split_mid(0.0, 1200.0, layout.split_fraction(1200.0));
+        assert!((stayed - mid).abs() < 0.51, "{stayed} {mid}");
+
+        layout.drag_split(0.0, 1200.0, mid, 80.0);
+        let moved = split_mid(0.0, 1200.0, layout.split_fraction(1200.0));
+        assert!((moved - (mid + 80.0)).abs() < 0.51, "{moved}");
+
+        layout.drag_split(0.0, 1200.0, mid, -10_000.0);
         let lo = PANE_MIN / (1200.0 - SPLIT_GAP);
         assert!(
             (layout.code_fraction - lo).abs() < 0.001,
             "{}",
             layout.code_fraction
         );
+    }
+
+    #[test]
+    fn an_outline_drag_starts_from_the_drawn_width() {
+        let mut layout = Layout::load(None);
+        layout.outline_width = 400.0;
+        let (_, drawn) = outline::column_widths(700.0, Some(240.0), layout.outline_width);
+        assert!(drawn < layout.outline_width, "{drawn}");
+        layout.drag_outline(drawn, 20.0);
+        let (_, after) = outline::column_widths(700.0, Some(240.0), layout.outline_width);
+        assert!(
+            (after - (drawn - 20.0)).abs() < 0.1,
+            "drawn {drawn}, after {after}, stored {}",
+            layout.outline_width
+        );
+
+        // 80px of a 200px outline hits the minimum. Another 20px past it,
+        // then 10px back, still sits on the minimum.
+        layout.drag_outline(200.0, 100.0);
+        assert_eq!(layout.outline_width, outline::MIN_WIDTH);
+        layout.drag_outline(200.0, 90.0);
+        assert_eq!(layout.outline_width, outline::MIN_WIDTH);
+        layout.drag_outline(200.0, 70.0);
+        assert_eq!(layout.outline_width, 130.0);
     }
 }

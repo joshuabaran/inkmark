@@ -295,6 +295,10 @@ struct App {
     sidebar: sidebar::Sidebar,
     /// Mode, minimaps, the split, and the outline width, restored on open.
     layout: layout::Layout,
+    /// Drawn outline width where the current drag began.
+    outline_drag_from: Option<f32>,
+    /// Drawn split position where the current drag began.
+    split_drag_from: Option<f32>,
     /// Asks for a name, then creates the file and opens it.
     new_file: Option<NewFilePrompt>,
     /// Asks for a new name for this file or folder.
@@ -398,6 +402,8 @@ impl App {
             browser: FileBrowser::new(root),
             sidebar: sidebar::Sidebar::load(sidebar_store),
             layout,
+            outline_drag_from: None,
+            split_drag_from: None,
             new_file: None,
             rename: None,
             trash_confirm: None,
@@ -1556,14 +1562,21 @@ impl App {
             if handle_resp.hovered() || handle_resp.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
-            if handle_resp.dragged() {
-                // The handle is the outline's left edge. Dragging it right
-                // gives that space to the panes.
-                self.layout.outline_width = (self.layout.outline_width
-                    - handle_resp.drag_delta().x)
-                    .clamp(outline::MIN_WIDTH, outline::MAX_WIDTH);
+            if handle_resp.drag_started() {
+                // Start from the width on screen. The stored width can be
+                // larger when the window has shrunk the outline to fit.
+                self.outline_drag_from = Some(outline_w);
+            }
+            if handle_resp.dragged()
+                && let Some(origin) = self.outline_drag_from
+                && let Some(total) = handle_resp.total_drag_delta()
+            {
+                // The whole movement since the press, so dragging past the
+                // minimum and back keeps the edge with the pointer.
+                self.layout.drag_outline(origin, total.x);
             }
             if handle_resp.drag_stopped() {
+                self.outline_drag_from = None;
                 self.remember_layout();
             }
             let colors = theme::current(ui.ctx());
@@ -1874,15 +1887,22 @@ impl App {
                 if handle.hovered() || handle.dragged() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
+                if handle.drag_started() {
+                    self.split_drag_from = Some(mid);
+                }
                 if handle.dragged()
-                    && let Some(pos) = handle.interact_pointer_pos()
+                    && let Some(origin) = self.split_drag_from
+                    && let Some(total) = handle.total_drag_delta()
                 {
-                    // Store the fraction the pointer asks for. split_fraction
-                    // may draw it closer to the middle on a narrow window,
-                    // and that draw is not what gets written.
-                    self.layout.set_split_at(rect.left(), rect.width(), pos.x);
+                    // Move the line by how far the pointer has traveled, so
+                    // a grab off its center does not jump. The fraction is
+                    // of the area beside the gap. A narrow window draws a
+                    // closer split and leaves this value stored.
+                    self.layout
+                        .drag_split(rect.left(), rect.width(), origin, total.x);
                 }
                 if handle.drag_stopped() {
+                    self.split_drag_from = None;
                     self.remember_layout();
                 }
                 ui.painter().vline(
