@@ -133,7 +133,17 @@ fn markdown_extensions_dotfiles_and_the_show_all_toggle() {
     let mut tree = Tree::new(dir.path());
     tree.load_pending();
     assert!(!names(&mut tree).iter().any(|name| name.contains("secret")));
+    let root = tree.dirs_at(dir.path())[0];
+    tree.invalidate(root);
+    let generation = tree.pending()[0].generation;
     tree.set_show_all(true);
+    let pending = tree.pending();
+    assert_eq!(pending.len(), 1);
+    assert_ne!(
+        pending[0].generation, generation,
+        "a listing still being read kept the old filter"
+    );
+    assert!(pending[0].show_all);
     tree.load_pending();
     let shown = names(&mut tree);
     assert!(shown.iter().any(|name| name == ".secret.md"));

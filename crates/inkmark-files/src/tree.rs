@@ -110,20 +110,24 @@ impl Tree {
         self.show_all
     }
 
-    /// Changing the filter drops every listing. Expanded folders are read again.
+    /// Changing the filter drops every listing, including one still being
+    /// read. Expanded folders are read again with the new filter.
     pub fn set_show_all(&mut self, show_all: bool) {
         if self.show_all == show_all {
             return;
         }
         self.show_all = show_all;
-        let loaded: Vec<usize> = self
+        // A directory that is expanded but not loaded has a listing in
+        // flight. Bumping its generation drops that result, which was
+        // started with the old filter.
+        let dirs: Vec<usize> = self
             .nodes
             .iter()
             .enumerate()
-            .filter(|(_, node)| node.alive && node.loaded)
+            .filter(|(_, node)| node.alive && node.kind.is_dir() && (node.loaded || node.expanded))
             .map(|(index, _)| index)
             .collect();
-        for index in loaded {
+        for index in dirs {
             self.invalidate(index);
         }
     }
