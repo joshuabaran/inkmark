@@ -217,7 +217,7 @@ impl LineIndex {
 
 /// Clicking a pane's scrollbar or minimap keeps (or gives) keyboard focus to
 /// the pane's text, so typing carries on where the caret is.
-fn keep_focus(ui: &Ui, id: Id, response: &egui::Response) {
+pub(crate) fn keep_focus(ui: &Ui, id: Id, response: &egui::Response) {
     // egui drops focus on a click (the release) outside the focused widget,
     // so reclaim it on press, click and drag end alike.
     if response.is_pointer_button_down_on() || response.clicked() || response.drag_stopped() {
