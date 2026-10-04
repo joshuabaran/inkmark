@@ -190,8 +190,11 @@ Markdown extension gets `.md`. Right-click an entry to rename it, move it
 (or drag it onto a folder), move it to the trash, or create a file next
 to it. Nothing is ever overwritten: a name that's taken is refused. If
 the open file is renamed or moved, it stays open with your unsaved
-edits. Width and whether the sidebar is showing are remembered under
-`$XDG_STATE_HOME/inkmark`.
+edits. That width, and whether the sidebar is showing, are remembered
+under `$XDG_STATE_HOME/inkmark`, with the editor layout: which of the
+code and live panes are open, each pane's minimap, the split between
+them, and the outline's width. Drag the lines between the sidebar, the
+panes, and the outline to set those widths.
 
 ### Settings
 
