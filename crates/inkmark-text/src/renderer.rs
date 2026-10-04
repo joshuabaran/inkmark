@@ -407,9 +407,14 @@ impl TextRenderer {
     }
 
     /// Average advance of typical text, in points. Zero before the first
-    /// [`begin_frame`](Self::begin_frame).
+    /// [`begin_frame`](Self::begin_frame), and when the scale is not positive.
     pub fn avg_advance(&self) -> f32 {
-        self.avg_advance_px / self.pixels_per_point.max(1.0)
+        let scale = self.pixels_per_point;
+        if scale <= 0.0 {
+            0.0
+        } else {
+            self.avg_advance_px / scale
+        }
     }
 
     fn measure_avg_advance(&mut self) -> f32 {
@@ -677,4 +682,44 @@ fn layout<'a>(
         TAB_WIDTH,
         Hinting::Enabled,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> TextConfig {
+        TextConfig {
+            monospace: false,
+            font_size: 16.0,
+            line_height: 26.0,
+            wrap_width: Some(600.0),
+        }
+    }
+
+    #[test]
+    fn avg_advance_stays_in_points_below_scale_one() {
+        let ctx = egui::Context::default();
+        let mut text = TextRenderer::new(&ctx);
+        let config = config();
+        assert_eq!(text.avg_advance(), 0.0);
+        text.begin_frame(config, 1.0);
+        let at_one = text.avg_advance();
+        text.begin_frame(config, 0.5);
+        let at_half = text.avg_advance();
+        text.begin_frame(config, 2.0);
+        let at_two = text.avg_advance();
+        assert!(at_one > 1.0, "{at_one}");
+        assert!(
+            (at_half - at_one).abs() / at_one < 0.2,
+            "scale 0.5 is {at_half}, scale 1 is {at_one}"
+        );
+        assert!(
+            (at_two - at_one).abs() / at_one < 0.2,
+            "scale 2 is {at_two}, scale 1 is {at_one}"
+        );
+        text.begin_frame(config, 0.0);
+        let at_zero = text.avg_advance();
+        assert!(at_zero.is_finite() && at_zero >= 0.0, "{at_zero}");
+    }
 }

@@ -733,7 +733,15 @@ impl LiveView {
             return line + 1;
         };
         let placed = self.place(doc, parse, leaf, width);
-        self.record_block(line, placed.first_line, placed.last_line, placed.height);
+        // `line` can sit in the middle of the leaf after an edit. The height
+        // lives on the first line, so record from there and replace what was
+        // stored. Paint stacks a second leaf on that line by walking past it.
+        self.record_block(
+            placed.first_line,
+            placed.first_line,
+            placed.last_line,
+            placed.height,
+        );
         placed.last_line.max(line) + 1
     }
 
@@ -943,9 +951,10 @@ impl LiveView {
             let pressed =
                 hit.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed());
             let map = self.lines.minimap(rect, viewport);
+            // The minimap sits outside the text area, so the drag is `hit`'s.
             let target = match hit.interact_pointer_pos() {
                 Some(p) if pressed => Some(map.jump_target(p.y)),
-                Some(p) if response.dragged() => Some(map.drag_target(p.y)),
+                Some(p) if hit.dragged() => Some(map.drag_target(p.y)),
                 _ => None,
             };
             if let Some(top) = target {
