@@ -26,7 +26,8 @@ disk are the only source of truth: no accounts, sync or plugins.
   The sidebar, status bar, and dialogs use Hack, so the folder and unsaved
   marks render the same on every machine.
 - **Folder sidebar**: browse a directory of notes; open, create, rename
-  and move them (drag and drop works), or move them to the trash.
+  and move them (drag and drop works), or move them to the trash. Search
+  the folder, and show or hide the outline.
 - **Links you can follow**: Ctrl+click a link to open another note, jump
   to a heading or footnote, or open a web page; Alt+Left goes back.
 
@@ -167,6 +168,9 @@ inkmark               # browses the current directory and shows recent files
 | Ctrl+Shift+P | Select paragraph (`select_paragraph`) |
 | Ctrl+Shift+Backslash | Jump to the matching fence or brackets (`match_bracket`) |
 | Ctrl+Shift+F | Search the open folder (`search_folder`) |
+| Ctrl+Shift+B | Show or hide the outline (`toggle_outline`) |
+| Ctrl+Shift+N | New folder in the selected folder, or the open folder (`new_folder`) |
+| F1 | Show or hide the key bindings (`show_keys`) |
 
 Arrows, Home, End, Page Up, Page Down, Backspace, Delete, Enter and Tab edit
 as usual, and holding Shift extends a selection. Those keys are not in the
@@ -185,21 +189,25 @@ its columns are padded so the pipes line up again (one undo step).
 `$...$` and `$$...$$` are drawn as formulas there. The source stays as
 written, and a caret in the formula shows those bytes.
 
-The sidebar sits to the left of the panes. Up moves to the parent folder,
-Open Folder… picks a new root, and Refresh re-reads the folders that are
-expanded. Arrow keys move through the tree, Left and Right collapse and
-expand a folder, and Enter opens a Markdown file. Ctrl+Shift+F searches
-this folder. A file name is listed first, and a match inside a file
-follows; opening either one opens that note. A name without a
-Markdown extension gets `.md`. Right-click an entry to rename it, move it
-(or drag it onto a folder), move it to the trash, or create a file next
-to it. Nothing is ever overwritten: a name that's taken is refused. If
-the open file is renamed or moved, it stays open with your unsaved
-edits. That width, and whether the sidebar is showing, are remembered
-under `$XDG_STATE_HOME/inkmark`, with the editor layout: which of the
-code and live panes are open, each pane's minimap, the split between
-them, and the outline's width. Drag the lines between the sidebar, the
-panes, and the outline to set those widths.
+The sidebar sits to the left of the panes. Its buttons are ↑ up to the
+parent folder, ↗ to open a folder, ↻ to re-read the folders that are
+expanded, + for a new note, ⊞ for a new folder, and ∗ to search. Each one
+has a tooltip, and All files stays words. Arrow keys move through the
+tree, Left and Right collapse and expand a folder, and Enter opens a
+Markdown file. Ctrl+Shift+F searches this folder, and so does ∗. A file
+name is listed first, and a match inside a file follows; opening either
+one opens that note. A name without a Markdown extension gets `.md`. A
+new folder keeps the name you type. Right-click an entry to rename it,
+move it (or drag it onto a folder), move it to the trash, or create a
+file or a folder next to it. Nothing is ever overwritten: a name that's
+taken is refused. If the open file is renamed or moved, it stays open
+with your unsaved edits. The sidebar's width, and whether it is showing,
+are remembered under `$XDG_STATE_HOME/inkmark`, with the editor layout:
+which of the code and live panes are open, each pane's minimap, the split
+between them, the outline's width, and whether the outline is showing.
+« and » at the edges of the status bar show or hide the sidebar and the
+outline. Drag the lines between the sidebar, the panes, and the outline
+to set those widths. F1 lists the keys in effect.
 
 ### Settings
 
@@ -215,7 +223,7 @@ code_size = 14            # points
 text_size = 16
 
 [keys]
-bold = "Ctrl+Shift+B"     # one chord, or a list of them
+bold = "Ctrl+Shift+L"     # one chord, or a list of them
 italic = []               # an empty list unbinds; anything left out keeps its default
 ```
 

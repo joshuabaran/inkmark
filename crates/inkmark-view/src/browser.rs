@@ -30,6 +30,10 @@ pub struct BrowserOutput {
     pub open_folder: bool,
     /// New file, in the selected folder or the root.
     pub new_file: bool,
+    /// New folder, in the selected folder or the root.
+    pub new_folder: bool,
+    /// Search the open folder. The app opens the same bar as Ctrl+Shift+F.
+    pub search: bool,
     /// Rename… (F2 or the context menu). The app asks for the new name.
     pub rename: Option<PathBuf>,
     /// Move to Trash (Delete or the context menu). The app confirms first.
@@ -49,6 +53,7 @@ enum MenuAction {
     MoveTo(PathBuf),
     Trash(PathBuf),
     NewFileIn(PathBuf),
+    NewFolderIn(PathBuf),
 }
 
 struct Listed {
@@ -86,6 +91,10 @@ pub struct FileBrowser {
     open_folder_rect: Option<Rect>,
     refresh_rect: Option<Rect>,
     new_file_rect: Option<Rect>,
+    new_folder_rect: Option<Rect>,
+    search_rect: Option<Rect>,
+    /// A folder just created here, scrolled into view once its row is listed.
+    reveal_path: Option<PathBuf>,
     watch: Option<Watch>,
     /// Colors, refreshed from the context every frame.
     theme: std::sync::Arc<Theme>,
@@ -116,6 +125,9 @@ impl FileBrowser {
             open_folder_rect: None,
             refresh_rect: None,
             new_file_rect: None,
+            new_folder_rect: None,
+            search_rect: None,
+            reveal_path: None,
             watch: None,
             theme: std::sync::Arc::new(Theme::dark()),
             keys: keys::KeyMap::builtin(),
@@ -141,6 +153,7 @@ impl FileBrowser {
         self.selected = None;
         self.scroll_to = Some(0.0);
         self.revealed = false;
+        self.reveal_path = None;
         self.bump_epoch();
     }
 
@@ -209,6 +222,14 @@ impl FileBrowser {
         self.new_file_rect
     }
 
+    pub fn new_folder_rect(&self) -> Option<Rect> {
+        self.new_folder_rect
+    }
+
+    pub fn search_rect(&self) -> Option<Rect> {
+        self.search_rect
+    }
+
     /// Folder a new file would be created in: the selected folder, the
     /// parent of the selected file, or the root.
     pub fn new_file_dir(&mut self) -> PathBuf {
@@ -241,6 +262,17 @@ impl FileBrowser {
         for index in self.tree.dirs_at(dir) {
             self.tree.invalidate(index);
         }
+    }
+
+    /// The folder was just created here: re-read its parent, expand the way
+    /// to it, and select it once the row is listed.
+    pub fn note_dir_created(&mut self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            self.refresh_dir(parent);
+        }
+        self.tree.reveal(path);
+        self.selected = Some(path.to_path_buf());
+        self.reveal_path = Some(path.to_path_buf());
     }
 
     /// The file was just created here: re-read its folder and reveal it.
@@ -367,16 +399,30 @@ impl FileBrowser {
     }
 
     fn reveal_if_listed(&mut self) {
-        if self.revealed {
-            return;
-        }
-        let Some(path) = self.current.clone() else {
-            return;
-        };
-        if let Some(index) = self.tree.rows().iter().position(|row| row.path == path) {
+        if !self.revealed
+            && let Some(path) = self.current.clone()
+            && let Some(index) = self.tree.rows().iter().position(|row| row.path == path)
+        {
             self.selected = Some(path);
             self.scroll_to = Some(index as f32 * ROW_H);
             self.revealed = true;
+        }
+        if let Some(path) = self.reveal_path.clone()
+            && let Some(index) = self.tree.rows().iter().position(|row| row.path == path)
+        {
+            self.selected = Some(path);
+            self.scroll_to = Some(index as f32 * ROW_H);
+            self.reveal_path = None;
+        }
+    }
+
+    /// `label`, plus the chord when one is bound.
+    fn action_tip(&self, label: &str, action: Action) -> String {
+        let chord = self.keys.shortcut_text(action);
+        if chord.is_empty() {
+            label.to_owned()
+        } else {
+            format!("{label} ({chord})")
         }
     }
 
@@ -384,28 +430,55 @@ impl FileBrowser {
         let name = self.tree.root_name().to_string();
         ui.add_space(4.0);
         ui.label(RichText::new(name).strong().color(self.theme.text));
-        // Wrapped, so a narrow sidebar doesn't spill the buttons over the panes.
+        // Marks Hack draws. Wrapped, so a narrow sidebar doesn't spill them
+        // over the panes. The tooltip names the command.
+        let open_tip = self.action_tip("Open folder", Action::OpenFolder);
+        let new_file_tip = self.action_tip("New file", Action::NewFile);
+        let new_folder_tip = self.action_tip("New folder", Action::NewFolder);
+        let search_tip = self.action_tip("Search", Action::SearchFolder);
         ui.horizontal_wrapped(|ui| {
             let can_up = self.tree.parent_root().is_some();
-            let up = ui.add_enabled(can_up, egui::Button::new("Up"));
+            let up = ui
+                .add_enabled(can_up, egui::Button::new("↑").small())
+                .on_hover_text("Up");
             self.up_rect = Some(up.rect);
             if up.clicked() {
                 self.go_up();
             }
-            let open = ui.button("Open Folder…");
+            let open = ui
+                .add(egui::Button::new("↗").small())
+                .on_hover_text(open_tip);
             self.open_folder_rect = Some(open.rect);
             if open.clicked() {
                 output.open_folder = true;
             }
-            let refresh = ui.button("Refresh");
+            let refresh = ui
+                .add(egui::Button::new("↻").small())
+                .on_hover_text("Refresh");
             self.refresh_rect = Some(refresh.rect);
             if refresh.clicked() {
                 self.refresh();
             }
-            let new_file = ui.button("New file");
+            let new_file = ui
+                .add(egui::Button::new("+").small())
+                .on_hover_text(new_file_tip);
             self.new_file_rect = Some(new_file.rect);
             if new_file.clicked() {
                 output.new_file = true;
+            }
+            let new_folder = ui
+                .add(egui::Button::new("⊞").small())
+                .on_hover_text(new_folder_tip);
+            self.new_folder_rect = Some(new_folder.rect);
+            if new_folder.clicked() {
+                output.new_folder = true;
+            }
+            let search = ui
+                .add(egui::Button::new("∗").small())
+                .on_hover_text(search_tip);
+            self.search_rect = Some(search.rect);
+            if search.clicked() {
+                output.search = true;
             }
             let mut show_all = self.tree.show_all();
             if ui.checkbox(&mut show_all, "All files").changed() {
@@ -651,11 +724,15 @@ impl FileBrowser {
                                 menu = Some(MenuAction::Trash(path.clone()));
                                 ui.close();
                             }
-                            if let Some(dir) = Self::drop_dir(row)
-                                && ui.button("New file here…").clicked()
-                            {
-                                menu = Some(MenuAction::NewFileIn(dir));
-                                ui.close();
+                            if let Some(dir) = Self::drop_dir(row) {
+                                if ui.button("New file here…").clicked() {
+                                    menu = Some(MenuAction::NewFileIn(dir.clone()));
+                                    ui.close();
+                                }
+                                if ui.button("New folder here…").clicked() {
+                                    menu = Some(MenuAction::NewFolderIn(dir));
+                                    ui.close();
+                                }
                             }
                         });
                     }
@@ -677,6 +754,10 @@ impl FileBrowser {
                 // New file goes into the selected folder.
                 self.selected = Some(dir);
                 output.new_file = true;
+            }
+            Some(MenuAction::NewFolderIn(dir)) => {
+                self.selected = Some(dir);
+                output.new_folder = true;
             }
             None => {}
         }

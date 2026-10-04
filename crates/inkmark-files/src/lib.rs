@@ -5,6 +5,7 @@
 
 mod list;
 mod new_file;
+mod new_folder;
 mod ops;
 mod root;
 mod search;
@@ -14,6 +15,7 @@ mod watch;
 
 pub use list::{Entry, Kind, is_markdown_name, list_dir};
 pub use new_file::{NewFileError, create_new_file};
+pub use new_folder::{NewFolderError, create_new_folder};
 pub use ops::{OpError, SystemTrash, Trash, move_into, rename};
 pub use root::{Launch, choose_root};
 pub use search::{NoteFile, walk_notes};

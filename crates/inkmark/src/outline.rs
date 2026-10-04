@@ -44,15 +44,26 @@ const INDENT: f32 = 12.0;
 /// Sidebar width (0 when the sidebar is hidden) and outline width for a
 /// window `total` pixels wide. `sidebar_wanted` is already clamped to the
 /// sidebar's own min and max. `outline_wanted` is the width the user set,
-/// clamped here to 120–480. The panes keep about 240px while the outline
-/// can shrink toward 120, then the sidebar shrinks toward its minimum.
-/// The returned outline can be narrower than `outline_wanted`; the caller
-/// keeps the wanted width and writes it only when the user drags.
+/// clamped here to 120–480, or `None` when the outline is hidden. The panes
+/// keep about 240px while the outline can shrink toward 120, then the
+/// sidebar shrinks toward its minimum. The returned outline can be narrower
+/// than `outline_wanted`; the caller keeps the wanted width and writes it
+/// only when the user drags.
 pub(crate) fn column_widths(
     total: f32,
     sidebar_wanted: Option<f32>,
-    outline_wanted: f32,
+    outline_wanted: Option<f32>,
 ) -> (f32, f32) {
+    let Some(outline_wanted) = outline_wanted else {
+        let mut sidebar = sidebar_wanted.unwrap_or(0.0);
+        let gaps = if sidebar_wanted.is_some() { GAP } else { 0.0 };
+        let panes_room = total - sidebar - gaps;
+        if panes_room < PANES_RESERVE && sidebar_wanted.is_some() {
+            let need = PANES_RESERVE - panes_room;
+            sidebar = (sidebar - need).max(crate::sidebar::MIN_WIDTH);
+        }
+        return (sidebar.max(0.0), 0.0);
+    };
     let mut outline = outline_wanted.clamp(MIN_WIDTH, MAX_WIDTH);
     let mut sidebar = sidebar_wanted.unwrap_or(0.0);
     let gaps = GAP + if sidebar_wanted.is_some() { GAP } else { 0.0 };

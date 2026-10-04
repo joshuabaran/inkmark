@@ -5,7 +5,9 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::time::{Duration, Instant};
 
-use inkmark_files::{NewFileError, Tree, Watch, create_new_file};
+use inkmark_files::{
+    NewFileError, NewFolderError, Tree, Watch, create_new_file, create_new_folder,
+};
 
 fn wait_until(mut pred: impl FnMut() -> bool) {
     let start = Instant::now();
@@ -135,6 +137,55 @@ fn a_dangling_symlink_is_not_created_through() {
     );
     assert!(
         fs::symlink_metadata(dir.path().join("new.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn new_folder_keeps_the_name_and_refuses_an_existing_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = create_new_folder(dir.path(), "  Pics  ").unwrap();
+    assert_eq!(path, dir.path().join("Pics"));
+    assert!(path.is_dir());
+
+    assert_eq!(
+        create_new_folder(dir.path(), "Pics"),
+        Err(NewFolderError::Exists(path.clone()))
+    );
+    fs::write(dir.path().join("notes.md"), "").unwrap();
+    assert_eq!(
+        create_new_folder(dir.path(), "notes.md"),
+        Err(NewFolderError::Exists(dir.path().join("notes.md")))
+    );
+    assert_eq!(
+        create_new_folder(dir.path(), "  "),
+        Err(NewFolderError::Empty)
+    );
+    assert_eq!(
+        create_new_folder(dir.path(), "nested/nope"),
+        Err(NewFolderError::Invalid)
+    );
+    assert_eq!(
+        create_new_folder(dir.path(), "."),
+        Err(NewFolderError::Invalid)
+    );
+    assert_eq!(
+        create_new_folder(dir.path(), ".."),
+        Err(NewFolderError::Invalid)
+    );
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let target = elsewhere.path().join("gone");
+    symlink(&target, dir.path().join("link")).unwrap();
+    assert_eq!(
+        create_new_folder(dir.path(), "link"),
+        Err(NewFolderError::Exists(dir.path().join("link")))
+    );
+    assert!(!target.exists(), "create followed the dangling symlink");
+    assert!(
+        fs::symlink_metadata(dir.path().join("link"))
             .unwrap()
             .file_type()
             .is_symlink()

@@ -8,7 +8,8 @@ use eframe::egui::{
 };
 use inkmark_buffer::{DiskStatus, Document, LineEnding, OpenError, Selection};
 use inkmark_files::{
-    Launch, NewFileError, SystemTrash, Trash, choose_root, create_new_file, move_into, rename,
+    Launch, NewFileError, NewFolderError, SystemTrash, Trash, choose_root, create_new_file,
+    create_new_folder, move_into, rename,
 };
 use inkmark_parse::{GfmParser, ParseState};
 use inkmark_text::Fonts;
@@ -308,6 +309,10 @@ struct App {
     split_drag_from: Option<f32>,
     /// Asks for a name, then creates the file and opens it.
     new_file: Option<NewFilePrompt>,
+    /// Asks for a name, then creates the folder and selects it.
+    new_folder: Option<NewFilePrompt>,
+    /// F1. The chords in effect, in the same order as `--list-keys`.
+    show_keys: bool,
     /// Asks for a new name for this file or folder.
     rename: Option<RenamePrompt>,
     /// Asks before moving this file or folder to the trash.
@@ -415,6 +420,8 @@ impl App {
             outline_drag_from: None,
             split_drag_from: None,
             new_file: None,
+            new_folder: None,
+            show_keys: false,
             rename: None,
             trash_confirm: None,
             trash: Box::new(SystemTrash),
@@ -811,20 +818,18 @@ impl App {
 
     fn run_app_action(&mut self, ctx: &egui::Context, action: Action) {
         match action {
-            Action::ToggleSidebar => {
-                self.sidebar.visible = !self.sidebar.visible;
-                self.sidebar.save();
-                if self.sidebar.visible {
-                    self.browser.request_focus();
-                } else {
-                    self.focus_pane(ctx, self.focus);
-                }
+            Action::ToggleSidebar => self.toggle_sidebar(ctx),
+            Action::ToggleOutline => {
+                self.layout.outline_visible = !self.layout.outline_visible;
+                self.remember_layout();
             }
             Action::RecentFiles => {
+                self.show_keys = false;
                 self.recent_list = match self.recent_list {
                     Some(_) => None,
                     None => {
                         self.new_file = None;
+                        self.new_folder = None;
                         Some(0)
                     }
                 };
@@ -853,6 +858,8 @@ impl App {
                 }
             }
             Action::NewFile => self.begin_new_file(),
+            Action::NewFolder => self.begin_new_folder(),
+            Action::ShowKeys => self.toggle_keys(ctx),
             Action::Find => self.open_find(ctx, false),
             Action::Replace => self.open_find(ctx, true),
             Action::FindNext => self.find_move(true),
@@ -919,10 +926,37 @@ impl App {
         }
     }
 
+    fn toggle_sidebar(&mut self, ctx: &egui::Context) {
+        self.sidebar.visible = !self.sidebar.visible;
+        self.sidebar.save();
+        if self.sidebar.visible {
+            self.browser.request_focus();
+        } else {
+            self.focus_pane(ctx, self.focus);
+        }
+    }
+
+    /// F1 opens the list, and F1 again closes it. Another dialog keeps it shut.
+    fn toggle_keys(&mut self, ctx: &egui::Context) {
+        if self.show_keys {
+            self.show_keys = false;
+            return;
+        }
+        if self.modal_open() {
+            return;
+        }
+        self.recent_list = None;
+        self.show_keys = true;
+        self.code.release_focus(ctx);
+        self.live.release_focus(ctx);
+    }
+
     fn modal_open(&self) -> bool {
         self.recent_list.is_some()
             || self.confirm.is_some()
             || self.new_file.is_some()
+            || self.new_folder.is_some()
+            || self.show_keys
             || self.rename.is_some()
             || self.trash_confirm.is_some()
             || self.dialog.is_some()
@@ -1107,7 +1141,7 @@ impl App {
         }
     }
 
-    fn status_ui(&self, ui: &mut egui::Ui) {
+    fn status_ui(&mut self, ui: &mut egui::Ui) {
         let head = self.selection().head;
         let line = self.doc.byte_to_line(head);
         let column = self
@@ -1117,7 +1151,18 @@ impl App {
             .count()
             + 1;
         let encoding = self.doc.encoding();
+        let files_tip = binding_tip(&self.keys, Action::ToggleSidebar);
+        let outline_tip = binding_tip(&self.keys, Action::ToggleOutline);
+        let mut toggle_files = false;
+        let mut toggle_outline = false;
         ui.horizontal(|ui| {
+            // « and » are drawn by Hack. They sit at the outer edges.
+            let files = ui
+                .add(egui::Button::new("«").small())
+                .on_hover_text(&files_tip);
+            if files.clicked() {
+                toggle_files = true;
+            }
             let path = self
                 .doc
                 .path()
@@ -1130,6 +1175,12 @@ impl App {
                 ui.label(RichText::new(hint).color(theme::current(ui.ctx()).hint));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let outline = ui
+                    .add(egui::Button::new("»").small())
+                    .on_hover_text(&outline_tip);
+                if outline.clicked() {
+                    toggle_outline = true;
+                }
                 ui.label(if encoding.bom { "UTF-8 BOM" } else { "UTF-8" });
                 ui.label(match encoding.line_ending {
                     LineEnding::Lf => "LF",
@@ -1138,6 +1189,14 @@ impl App {
                 ui.label(format!("Ln {}, Col {column}", line + 1));
             });
         });
+        let ctx = ui.ctx().clone();
+        if toggle_files {
+            self.toggle_sidebar(&ctx);
+        }
+        if toggle_outline {
+            self.layout.outline_visible = !self.layout.outline_visible;
+            self.remember_layout();
+        }
     }
 
     /// While a dialog is open the panes don't get keys (typing mustn't edit
@@ -1146,6 +1205,8 @@ impl App {
         let open = self.recent_list.is_some()
             || self.confirm.is_some()
             || self.new_file.is_some()
+            || self.new_folder.is_some()
+            || self.show_keys
             || self.rename.is_some()
             || self.trash_confirm.is_some();
         if open {
@@ -1267,14 +1328,135 @@ impl App {
     }
 
     fn begin_new_file(&mut self) {
-        if self.new_file.is_some() || self.confirm.is_some() {
+        if self.new_file.is_some()
+            || self.new_folder.is_some()
+            || self.confirm.is_some()
+            || self.rename.is_some()
+            || self.trash_confirm.is_some()
+        {
             return;
         }
         self.recent_list = None;
+        self.show_keys = false;
         self.new_file = Some(NewFilePrompt {
             dir: self.browser.new_file_dir(),
             name: String::new(),
             error: None,
+        });
+    }
+
+    fn begin_new_folder(&mut self) {
+        if self.new_folder.is_some()
+            || self.new_file.is_some()
+            || self.confirm.is_some()
+            || self.rename.is_some()
+            || self.trash_confirm.is_some()
+        {
+            return;
+        }
+        self.recent_list = None;
+        self.show_keys = false;
+        self.new_folder = Some(NewFilePrompt {
+            dir: self.browser.new_file_dir(),
+            name: String::new(),
+            error: None,
+        });
+    }
+
+    /// Creates the named folder and selects it. The open document stays put.
+    fn submit_new_folder(&mut self) {
+        let Some(prompt) = self.new_folder.clone() else {
+            return;
+        };
+        match create_new_folder(&prompt.dir, &prompt.name) {
+            Ok(path) => {
+                self.new_folder = None;
+                self.browser.note_dir_created(&path);
+            }
+            Err(NewFolderError::Exists(_)) => {
+                if let Some(prompt) = &mut self.new_folder {
+                    prompt.error = Some("A folder with that name already exists.".into());
+                }
+            }
+            Err(NewFolderError::Empty | NewFolderError::Invalid) => {
+                if let Some(prompt) = &mut self.new_folder {
+                    prompt.error = Some("Enter a folder name.".into());
+                }
+            }
+            Err(NewFolderError::Io(message)) => {
+                self.new_folder = None;
+                self.error = Some(format!("Couldn't create the folder: {message}"));
+            }
+        }
+    }
+
+    fn new_folder_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut prompt) = self.new_folder.clone() else {
+            return;
+        };
+        let detail = prompt.dir.display().to_string();
+        let (submit, cancel) = name_modal(
+            ctx,
+            PromptText {
+                id: "new_folder",
+                heading: "New folder",
+                detail: &detail,
+                action: "Create",
+            },
+            &mut prompt.name,
+            prompt.error.as_deref(),
+            None,
+        );
+        if cancel {
+            self.new_folder = None;
+            return;
+        }
+        self.new_folder = Some(prompt);
+        if submit {
+            self.submit_new_folder();
+        }
+    }
+
+    /// The chords in effect. Escape or F1 closes the list.
+    fn keys_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_keys {
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.show_keys = false;
+            return;
+        }
+        let rows: Vec<(String, String)> = Action::ALL
+            .into_iter()
+            .map(|action| {
+                let chord = self.keys.shortcut_text(action);
+                let chord = if chord.is_empty() {
+                    "unbound".to_owned()
+                } else {
+                    chord
+                };
+                (chord, action.description().to_owned())
+            })
+            .collect();
+        egui::Modal::new(egui::Id::new("keys")).show(ctx, |ui| {
+            ui.set_min_width(520.0);
+            ui.heading("Key bindings");
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .max_height(420.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("key_bindings")
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (chord, description) in &rows {
+                                ui.label(RichText::new(chord).strong());
+                                ui.label(description);
+                                ui.end_row();
+                            }
+                        });
+                });
+            ui.add_space(6.0);
+            ui.label(RichText::new("Esc closes").small().weak());
         });
     }
 
@@ -1337,7 +1519,11 @@ impl App {
     /// Rename… for a sidebar entry: the whole name, with the part before
     /// a file's extension selected, so typing keeps the extension.
     fn begin_rename(&mut self, path: PathBuf) {
-        if self.confirm.is_some() || self.new_file.is_some() {
+        if self.confirm.is_some()
+            || self.new_file.is_some()
+            || self.new_folder.is_some()
+            || self.show_keys
+        {
             return;
         }
         let name = path
@@ -1517,8 +1703,8 @@ impl App {
 }
 
 impl App {
-    /// Sidebar on the left, heading outline on the right. Hiding the sidebar
-    /// leaves the outline up.
+    /// Sidebar on the left, heading outline on the right. Each one can be
+    /// hidden on its own. Hiding the sidebar leaves the outline up.
     fn editor(&mut self, ui: &mut egui::Ui) {
         self.browser
             .set_current(self.doc.path().map(|path| path.to_path_buf()));
@@ -1533,8 +1719,11 @@ impl App {
                 .width
                 .clamp(sidebar::MIN_WIDTH, sidebar::MAX_WIDTH),
         );
-        let (sidebar_w, outline_w) =
-            outline::column_widths(rect.width(), wanted, self.layout.outline_width);
+        let outline_wanted = self
+            .layout
+            .outline_visible
+            .then_some(self.layout.outline_width);
+        let (sidebar_w, outline_w) = outline::column_widths(rect.width(), wanted, outline_wanted);
         let mut cursor = rect.left();
         if self.sidebar.visible {
             let left = Rect::from_min_max(rect.min, pos2(cursor + sidebar_w, rect.bottom()));
@@ -1577,6 +1766,9 @@ impl App {
                 })
                 .inner;
             self.apply_browser(&output);
+            if output.search {
+                self.open_folder_search(ui.ctx());
+            }
             if let Some(hit) = hit {
                 self.open_search_hit(hit);
             }
@@ -1710,6 +1902,9 @@ impl App {
         }
         if output.new_file {
             self.begin_new_file();
+        }
+        if output.new_folder {
+            self.begin_new_folder();
         }
         if let Some(path) = &output.rename {
             self.begin_rename(path.clone());
@@ -2065,6 +2260,7 @@ impl App {
         self.guard_close(&ctx);
         // Dialogs take the keyboard before the panes see it.
         self.recent_ui(&ctx);
+        self.keys_ui(&ctx);
         self.hold_focus_for_dialogs(&ctx);
 
         if self.banner.is_some() || self.error.is_some() {
@@ -2113,6 +2309,7 @@ impl App {
             .show(ui, |ui| self.editor(ui));
         // After the sidebar, so New file opens the prompt on the click's frame.
         self.new_file_ui(&ctx);
+        self.new_folder_ui(&ctx);
         self.rename_ui(&ctx);
         self.trash_ui(&ctx);
         self.confirm_ui(&ctx);
@@ -2137,6 +2334,16 @@ impl App {
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
         }
+    }
+}
+
+/// The action's description, and its chord when one is bound.
+fn binding_tip(keys: &keys::KeyMap, action: Action) -> String {
+    let chord = keys.shortcut_text(action);
+    if chord.is_empty() {
+        action.description().to_owned()
+    } else {
+        format!("{} ({chord})", action.description())
     }
 }
 
@@ -2271,7 +2478,7 @@ mod tests {
         install_ui_font(&ctx);
         let mut second = ctx.run_ui(egui::RawInput::default(), |_| {});
         second.textures_delta.clear();
-        for mark in ['▸', '▾', '●'] {
+        for mark in ['▸', '▾', '●', '«', '»', '↑', '↗', '↻', '⊞', '∗'] {
             let drawn = glyph_box(&ctx, mark);
             assert_ne!(
                 (drawn.1, drawn.2),
@@ -2729,7 +2936,8 @@ mod tests {
         drive(&ctx, &mut app, &mut time, vec![down(outline_end, false)]);
         let outline_width = app.layout.outline_width;
         assert!(outline_width > outline::MIN_WIDTH, "{outline_width}");
-        let (_, drawn) = outline::column_widths(1000.0, Some(app.sidebar.width), outline_width);
+        let (_, drawn) =
+            outline::column_widths(1000.0, Some(app.sidebar.width), Some(outline_width));
         assert_eq!(drawn, outline_width);
 
         let ctx = egui::Context::default();
@@ -3493,7 +3701,7 @@ mod tests {
             out.platform_output.cursor_icon
         };
         let y = 30.0;
-        let (_, outline_w) = outline::column_widths(1000.0, None, outline::PREFERRED_WIDTH);
+        let (_, outline_w) = outline::column_widths(1000.0, None, Some(outline::PREFERRED_WIDTH));
         let panes_right = 1000.0 - outline_w - outline::GAP;
         let live_left = (panes_right / 2.0) as i32 + 16;
         let live_right = panes_right as i32 - 8;
@@ -4511,6 +4719,173 @@ mod tests {
     }
 
     #[test]
+    fn the_outline_toggle_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "# Alpha\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        assert!(run.text_rect("Outline").is_some());
+        assert!(run.text_rect("«").is_some());
+        assert!(run.text_rect("»").is_some());
+
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::B, shift);
+        assert!(!run.app.layout.outline_visible);
+        assert!(run.text_rect("Outline").is_none());
+        let stored = fs::read_to_string(dir.path().join("layout")).unwrap();
+        assert!(stored.ends_with("0\n"), "{stored}");
+
+        let ctx = egui::Context::default();
+        let hidden = App::with_recent(
+            &ctx,
+            None,
+            recent::Recent::from_store(Some(dir.path().join("recent"))),
+        );
+        assert!(!hidden.layout.outline_visible);
+        assert_eq!(hidden.layout.outline_width, outline::PREFERRED_WIDTH);
+
+        run.click_text("»");
+        assert!(run.app.layout.outline_visible);
+        assert!(run.text_rect("Outline").is_some());
+        run.click_text("«");
+        assert!(!run.app.sidebar.visible);
+        assert!(run.text_rect("All files").is_none());
+        run.click_text("«");
+        assert!(run.app.sidebar.visible);
+        assert!(run.text_rect("All files").is_some());
+    }
+
+    #[test]
+    fn f1_lists_the_keys_in_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "hello\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        run.key(egui::Key::F1, egui::Modifiers::NONE);
+        assert!(run.app.show_keys);
+        for _ in 0..3 {
+            if run.text_rect("Key bindings").is_some() {
+                break;
+            }
+            run.frame(vec![]);
+        }
+        assert!(run.text_rect("Key bindings").is_some());
+        assert!(run.text_rect("Ctrl+E").is_some());
+        assert!(run.text_rect("Cycle split, code, and live").is_some());
+        assert!(run.text_rect("Ctrl+Shift+E").is_some());
+        assert_eq!(
+            run.app.keys.shortcut_text(Action::ToggleOutline),
+            "Ctrl+Shift+B"
+        );
+        assert_eq!(
+            run.app.keys.shortcut_text(Action::NewFolder),
+            "Ctrl+Shift+N"
+        );
+        assert_eq!(run.app.keys.shortcut_text(Action::ShowKeys), "F1");
+
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!run.app.show_keys);
+        assert!(run.text_rect("Key bindings").is_none());
+
+        run.key(egui::Key::F1, egui::Modifiers::NONE);
+        assert!(run.app.show_keys);
+        run.key(egui::Key::F1, egui::Modifiers::NONE);
+        assert!(!run.app.show_keys);
+    }
+
+    #[test]
+    fn a_new_folder_is_created_beside_the_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        let chapter = notes.join("chapter");
+        fs::create_dir_all(&chapter).unwrap();
+        fs::write(notes.join("a.md"), "a\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(notes.join("a.md")));
+        let start = Instant::now();
+        while run.app.browser.row_rect(&chapter).is_none() {
+            run.frame(vec![]);
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "chapter was not listed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        run.click_text("chapter");
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::N, shift);
+        let prompt = run
+            .app
+            .new_folder
+            .as_ref()
+            .expect("Ctrl+Shift+N opens the prompt");
+        assert_eq!(prompt.dir, chapter);
+        run.key(egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(
+            run.app
+                .new_folder
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("folder name")
+        );
+        assert!(!chapter.join("Pics").exists());
+
+        run.frame(vec![egui::Event::Text("Pics".into())]);
+        run.key(egui::Key::Enter, egui::Modifiers::NONE);
+        let created = chapter.join("Pics");
+        assert!(created.is_dir());
+        assert!(run.app.new_folder.is_none());
+        let start = Instant::now();
+        while run.app.browser.row_rect(&created).is_none() {
+            run.frame(vec![]);
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "Pics was not listed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        run.click_text("chapter");
+        run.click_text("⊞");
+        assert_eq!(run.app.new_folder.as_ref().unwrap().dir, chapter);
+        run.frame(vec![egui::Event::Text("Pics".into())]);
+        run.key(egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(
+            run.app
+                .new_folder
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("already exists")
+        );
+        run.app.new_folder.as_mut().unwrap().name = "a/b".into();
+        run.app.new_folder.as_mut().unwrap().error = None;
+        run.key(egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(
+            run.app
+                .new_folder
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("folder name")
+        );
+        assert!(!chapter.join("a").exists());
+
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(run.app.new_folder.is_none());
+
+        run.click_text("∗");
+        assert!(run.app.search.is_open());
+        assert!(run.text_rect("Match case").is_some());
+    }
+
+    #[test]
     fn an_empty_file_says_it_has_no_headings() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notes.md");
@@ -4538,22 +4913,33 @@ mod tests {
     #[test]
     fn outline_keeps_its_width_beside_the_sidebar() {
         assert_eq!(
-            outline::column_widths(1000.0, Some(240.0), 200.0),
+            outline::column_widths(1000.0, Some(240.0), Some(200.0)),
             (240.0, 200.0)
         );
-        assert_eq!(outline::column_widths(1000.0, None, 200.0), (0.0, 200.0));
         assert_eq!(
-            outline::column_widths(400.0, Some(240.0), 200.0),
+            outline::column_widths(1000.0, None, Some(200.0)),
+            (0.0, 200.0)
+        );
+        assert_eq!(
+            outline::column_widths(400.0, Some(240.0), Some(200.0)),
             (160.0, 120.0)
         );
         assert_eq!(
-            outline::column_widths(1000.0, Some(240.0), 360.0),
+            outline::column_widths(1000.0, Some(240.0), Some(360.0)),
             (240.0, 360.0)
         );
         // A wide preference still gives the panes their reserve on a narrow window.
         assert_eq!(
-            outline::column_widths(400.0, Some(240.0), 360.0),
+            outline::column_widths(400.0, Some(240.0), Some(360.0)),
             (160.0, 120.0)
+        );
+        assert_eq!(
+            outline::column_widths(1000.0, Some(240.0), None),
+            (240.0, 0.0)
+        );
+        assert_eq!(
+            outline::column_widths(400.0, Some(240.0), None),
+            (160.0, 0.0)
         );
     }
 

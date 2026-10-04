@@ -96,9 +96,12 @@ pub enum Action {
     SelectParagraph = 55,
     MatchBracket = 56,
     SearchFolder = 57,
+    ToggleOutline = 58,
+    NewFolder = 59,
+    ShowKeys = 60,
 }
 
-const COUNT: usize = 58;
+const COUNT: usize = 61;
 
 impl Action {
     pub const ALL: [Action; COUNT] = [
@@ -160,6 +163,9 @@ impl Action {
         Action::SelectParagraph,
         Action::MatchBracket,
         Action::SearchFolder,
+        Action::ToggleOutline,
+        Action::NewFolder,
+        Action::ShowKeys,
     ];
 
     pub const fn index(self) -> usize {
@@ -228,6 +234,9 @@ impl Action {
             SelectParagraph => "select_paragraph",
             MatchBracket => "match_bracket",
             SearchFolder => "search_folder",
+            ToggleOutline => "toggle_outline",
+            NewFolder => "new_folder",
+            ShowKeys => "show_keys",
         }
     }
 
@@ -293,6 +302,9 @@ impl Action {
             SelectParagraph => "Select paragraph",
             MatchBracket => "Jump to the matching fence or brackets",
             SearchFolder => "Search the open folder",
+            ToggleOutline => "Show or hide the outline",
+            NewFolder => "New folder in the selected folder, or the open folder",
+            ShowKeys => "Show or hide the key bindings",
         }
     }
 
@@ -301,7 +313,8 @@ impl Action {
         match self {
             CycleMode | FocusCode | FocusLive | ToggleMinimap | OpenFile | Save | SaveAs
             | OpenFolder | ToggleSidebar | NewFile | RecentFiles | Back | Forward | Find
-            | Replace | FindNext | FindPrevious | GoToLine | SearchFolder => Scope::App,
+            | Replace | FindNext | FindPrevious | GoToLine | SearchFolder | ToggleOutline
+            | NewFolder | ShowKeys => Scope::App,
             Rename | MoveToTrash => Scope::Browser,
             InsertRowAbove | InsertRowBelow | InsertColumnLeft | InsertColumnRight | DeleteRow
             | DeleteColumn | MoveRowUp | MoveRowDown | MoveColumnLeft | MoveColumnRight
@@ -932,6 +945,9 @@ fn default_chords(action: Action) -> Vec<Chord> {
         FindPrevious => vec![chord(shift, Key::F3)],
         GoToLine => vec![chord(ctrl, Key::G)],
         SearchFolder => vec![chord(ctrl_shift, Key::F)],
+        ToggleOutline => vec![chord(ctrl_shift, Key::B)],
+        NewFolder => vec![chord(ctrl_shift, Key::N)],
+        ShowKeys => vec![chord(Modifiers::NONE, Key::F1)],
         SelectWord => vec![chord(ctrl, Key::D)],
         SelectParagraph => vec![chord(ctrl_shift, Key::P)],
         MatchBracket => vec![chord(ctrl_shift, Key::Backslash)],
@@ -988,6 +1004,9 @@ mod tests {
             map.shortcut_text(Action::MatchBracket),
             "Ctrl+Shift+Backslash"
         );
+        assert_eq!(map.shortcut_text(Action::ToggleOutline), "Ctrl+Shift+B");
+        assert_eq!(map.shortcut_text(Action::NewFolder), "Ctrl+Shift+N");
+        assert_eq!(map.shortcut_text(Action::ShowKeys), "F1");
     }
 
     #[test]
@@ -1113,9 +1132,9 @@ mod tests {
 
     #[test]
     fn overrides_keep_the_rest_and_an_empty_list_unbinds() {
-        let applied = KeyMap::apply(&[entry("bold", &["Ctrl+Shift+B"]), entry("italic", &[])]);
+        let applied = KeyMap::apply(&[entry("bold", &["Ctrl+Shift+L"]), entry("italic", &[])]);
         assert!(applied.errors.is_empty(), "{:?}", applied.errors);
-        assert_eq!(applied.map.shortcut_text(Action::Bold), "Ctrl+Shift+B");
+        assert_eq!(applied.map.shortcut_text(Action::Bold), "Ctrl+Shift+L");
         assert!(applied.map.chords(Action::Italic).is_empty());
         assert_eq!(applied.map.shortcut_text(Action::Save), "Ctrl+S");
     }

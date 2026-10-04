@@ -485,6 +485,9 @@ fn the_context_menu_offers_rename_move_trash_and_new_file() {
     let output = choose(&mut h, &sub, "New file here…");
     assert!(output.new_file);
     assert_eq!(h.browser.new_file_dir(), sub);
+    let output = choose(&mut h, &b, "New folder here…");
+    assert!(output.new_folder);
+    assert_eq!(h.browser.new_file_dir(), dir.path());
 }
 
 #[test]
