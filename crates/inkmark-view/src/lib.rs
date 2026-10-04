@@ -9,6 +9,7 @@ pub mod keys;
 mod lines;
 mod live_layout;
 mod live_view;
+mod math;
 pub mod motion;
 mod structure;
 mod tables;

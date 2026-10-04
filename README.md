@@ -181,6 +181,8 @@ extends the selection.
 In the live pane, click a task's checkbox to tick it. Right-click a table cell for the
 row, column and alignment commands. When you leave a table you edited,
 its columns are padded so the pipes line up again (one undo step).
+`$...$` and `$$...$$` are drawn as formulas there. The source stays as
+written, and a caret in the formula shows those bytes.
 
 The sidebar sits to the left of the panes. Up moves to the parent folder,
 Open Folder… picks a new root, and Refresh re-reads the folders that are

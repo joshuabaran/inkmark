@@ -26,6 +26,7 @@ impl MarkdownParser for GfmParser {
     fn parse(&self, src: &str) -> ParseOutput {
         let mut out = Builder::new(src, GFM_OPTIONS).run();
         crate::autolinks::mark(src, &mut out.map);
+        crate::math::mark(src, &mut out.map);
         out
     }
 }

@@ -21,6 +21,20 @@ pub(crate) struct Piece {
     pub exact: bool,
 }
 
+/// A formula the live pane draws in place of its source. The bytes stay in
+/// the document; this is only where the gap sits.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MathAtom {
+    /// Display bytes of the stand-in. One object-replacement character until
+    /// the view widens it to the formula's width.
+    pub display: Range<usize>,
+    /// Source bytes of the whole formula, delimiters included.
+    pub source: Range<usize>,
+    /// The formula between the delimiters.
+    pub tex: String,
+    pub display_style: bool,
+}
+
 /// One visual line of a leaf: hard breaks and code-block newlines split them.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Segment {
@@ -30,6 +44,8 @@ pub(crate) struct Segment {
     pub pieces: Vec<Piece>,
     /// Display ranges with a line through them (GFM strikethrough).
     pub strikes: Vec<Range<usize>>,
+    /// Formulas drawn over a stand-in gap in `text`.
+    pub maths: Vec<MathAtom>,
     /// Source offset of the segment start, for placing a caret in an empty one.
     pub source_start: usize,
 }
@@ -135,6 +151,46 @@ impl Builder<'_> {
             exact,
         });
     }
+
+    /// A typeset formula. Inline sits in the current segment. Display math
+    /// takes a segment of its own so the row can grow to the formula's height.
+    fn push_formula(
+        &mut self,
+        source: Range<usize>,
+        tex: String,
+        display_style: bool,
+        font: FontStyle,
+    ) {
+        if display_style {
+            let seg = self.segment();
+            if !seg.text.is_empty() || !seg.pieces.is_empty() || !seg.maths.is_empty() {
+                self.segments.push(Segment {
+                    source_start: source.start,
+                    ..Segment::default()
+                });
+            }
+        }
+        let strike = self.strike;
+        self.strike = false;
+        // U+FFFC is one cluster. The view replaces it once it knows the width.
+        let end = source.end;
+        self.push("\u{FFFC}", source.clone(), false, font, None);
+        self.strike = strike;
+        let seg = self.segment();
+        let display = seg.pieces.last().expect("just pushed").display.clone();
+        seg.maths.push(MathAtom {
+            display,
+            source,
+            tex,
+            display_style,
+        });
+        if display_style {
+            self.segments.push(Segment {
+                source_start: end,
+                ..Segment::default()
+            });
+        }
+    }
 }
 
 /// What to show as raw Markdown around the caret.
@@ -183,14 +239,36 @@ fn elements_at(spans: &[inkmark_parse::Span], caret: usize) -> Vec<Range<usize>>
     runs
 }
 
+/// `start..end` spans of one formula, when `spans[start]` opens one.
+/// The closer is the last span. A lone marker is not a formula.
+fn formula_end(spans: &[Span], start: usize) -> Option<usize> {
+    if !spans[start].style.contains(Style::MATH) {
+        return None;
+    }
+    let mut end = start + 1;
+    while end < spans.len()
+        && spans[end].style.contains(Style::MATH)
+        && spans[end].range.start == spans[end - 1].range.end
+    {
+        end += 1;
+    }
+    let opens = matches!(spans[start].kind, SpanKind::Syntax(Syntax::Delimiter));
+    let closes = matches!(spans[end - 1].kind, SpanKind::Syntax(Syntax::Delimiter));
+    (end - start >= 2 && opens && closes && spans[start].range.end <= spans[end - 1].range.start)
+        .then_some(end)
+}
+
 /// Lays out `leaf`, rendered except for the syntax `reveal` picks out
-/// (shown dimmed).
+/// (shown dimmed). A formula whose source overlaps `show_source` is drawn
+/// as its bytes: that is how a formula the renderer rejected stays text.
 pub(crate) fn build(
     doc: &Document,
     map: &SourceMap,
     leaf: &Leaf,
     reveal: Option<Reveal>,
     theme: &Theme,
+    show_source: &[Range<usize>],
+    math_caret: Option<usize>,
 ) -> LeafLayout {
     let range = leaf.block.range.clone();
     let style = match leaf.block.kind {
@@ -228,7 +306,54 @@ pub(crate) fn build(
             .iter()
             .any(|e| e.start <= r.start && r.end <= e.end)
     };
-    for span in spans.iter().cloned() {
+    let mut i = 0;
+    while i < spans.len() {
+        if let Some(end) = formula_end(&spans, i) {
+            let full = spans[i].range.start..spans[end - 1].range.end;
+            let inside = full.start.max(range.start)..full.end.min(range.end);
+            let caret_in = reveal
+                .as_ref()
+                .is_some_and(|v| full.start <= v.caret && v.caret < full.end)
+                || math_caret.is_some_and(|c| full.start <= c && c < full.end);
+            let forced = show_source
+                .iter()
+                .any(|s| s.start < full.end && full.start < s.end);
+            if inside == full && !caret_in && !forced {
+                let open = spans[i].range.end;
+                let close = spans[end - 1].range.start;
+                let display_style = spans[i].range.len() == 2;
+                let font_at = spans[i + 1..end - 1]
+                    .iter()
+                    .position(|s| matches!(s.kind, SpanKind::Text | SpanKind::Replaced(_)))
+                    .map_or(i, |n| i + 1 + n);
+                let font = b.font(&spans[font_at]);
+                b.push_formula(
+                    full,
+                    doc.slice(open..close).into_owned(),
+                    display_style,
+                    font,
+                );
+            } else {
+                for span in spans[i..end].iter().cloned() {
+                    let r = span.range.start.max(range.start)..span.range.end.min(range.end);
+                    if r.is_empty() {
+                        continue;
+                    }
+                    let font = b.font(&span);
+                    b.strike = span.style.contains(Style::STRIKE)
+                        && matches!(span.kind, SpanKind::Text | SpanKind::Replaced(_));
+                    let color = match span.kind {
+                        SpanKind::Syntax(_) => Some(theme.markup),
+                        _ => theme.live_color(&span),
+                    };
+                    b.exact(r, font, color);
+                }
+            }
+            i = end;
+            continue;
+        }
+        let span = spans[i].clone();
+        i += 1;
         let r = span.range.start.max(range.start)..span.range.end.min(range.end);
         if r.is_empty() {
             continue;
@@ -322,9 +447,15 @@ impl LeafLayout {
 
     /// Source offset shown at display position `d` of segment `seg`. At a
     /// boundary between two pieces the later one wins, so a caret before
-    /// "bold" in `**bold**` lands inside the emphasis.
+    /// "bold" in `**bold**` lands inside the emphasis. A click on a typeset
+    /// formula lands on its first byte, which reveals the source.
     pub fn source_pos(&self, seg: usize, d: usize) -> usize {
         let s = &self.segments[seg];
+        for math in &s.maths {
+            if math.display.start <= d && d < math.display.end {
+                return math.source.start;
+            }
+        }
         for p in &s.pieces {
             if d < p.display.end {
                 let d = d.max(p.display.start);
@@ -357,7 +488,17 @@ mod tests {
         let leaves = out
             .blocks
             .leaves_from(0)
-            .map(|leaf| build(&doc, &out.map, &leaf, reveal.clone(), &Theme::dark()))
+            .map(|leaf| {
+                build(
+                    &doc,
+                    &out.map,
+                    &leaf,
+                    reveal.clone(),
+                    &Theme::dark(),
+                    &[],
+                    None,
+                )
+            })
             .collect();
         (doc, leaves)
     }
@@ -388,6 +529,8 @@ mod tests {
             &leaf,
             Some(Reveal { line, caret }),
             &Theme::dark(),
+            &[],
+            None,
         )
     }
 
@@ -422,7 +565,7 @@ mod tests {
         let doc = Document::from_text("a ~~old~~ b\n");
         let out = inkmark_parse::GfmParser.parse("a ~~old~~ b\n");
         let leaf = out.blocks.leaves_from(0).next().unwrap();
-        let l = build(&doc, &out.map, &leaf, None, &Theme::dark());
+        let l = build(&doc, &out.map, &leaf, None, &Theme::dark(), &[], None);
         assert_eq!(texts(&l), vec!["a old b"]);
         assert_eq!(l.segments[0].strikes, vec![2..5]);
         let l = build(
@@ -434,6 +577,8 @@ mod tests {
                 caret: 5,
             }),
             &Theme::dark(),
+            &[],
+            None,
         );
         assert_eq!(texts(&l), vec!["a ~~old~~ b"]);
         assert_eq!(l.segments[0].strikes, vec![4..7]);
@@ -499,6 +644,8 @@ mod tests {
                 &leaf,
                 Some(Reveal { line, caret }),
                 &Theme::dark(),
+                &[],
+                None,
             )
         };
         assert_eq!(texts(&at(0)), vec!["Text[1] more."]);
@@ -516,7 +663,88 @@ mod tests {
                 caret: 16,
             }),
             &Theme::dark(),
+            &[],
+            None,
         );
         assert_eq!(texts(&l), vec!["Note."]);
+    }
+
+    fn gfm_layout(src: &str, caret: Option<usize>) -> LeafLayout {
+        use inkmark_parse::GfmParser;
+
+        let doc = Document::from_text(src);
+        let out = GfmParser.parse(src);
+        let leaf = out.blocks.leaves_from(0).next().unwrap();
+        let reveal = caret.map(|caret| Reveal {
+            line: doc.line_range(doc.byte_to_line(caret)),
+            caret,
+        });
+        build(&doc, &out.map, &leaf, reveal, &Theme::dark(), &[], None)
+    }
+
+    #[test]
+    fn a_formula_stays_out_of_the_text_until_the_caret_is_inside() {
+        let src = "Energy $E=mc^2$ today.\n";
+        let hidden = gfm_layout(src, None);
+        assert_eq!(texts(&hidden), vec!["Energy \u{FFFC} today."]);
+        assert_eq!(hidden.segments[0].maths.len(), 1);
+        assert_eq!(hidden.segments[0].maths[0].tex, "E=mc^2");
+        assert!(!hidden.segments[0].maths[0].display_style);
+        let inside = src.find("mc").unwrap();
+        let shown = gfm_layout(src, Some(inside));
+        assert_eq!(texts(&shown), vec!["Energy $E=mc^2$ today."]);
+        assert!(shown.segments.iter().all(|s| s.maths.is_empty()));
+        // The byte just after the formula still typesets it.
+        let after = src.find("today").unwrap();
+        assert_eq!(
+            texts(&gfm_layout(src, Some(after))),
+            vec!["Energy \u{FFFC} today."]
+        );
+    }
+
+    #[test]
+    fn display_math_is_its_own_segment_and_code_is_not_math() {
+        let src = "See\n\n$$\\frac{1}{2}$$\n";
+        let l = gfm_layout(src, None);
+        // The first leaf is "See", not the formula.
+        assert_eq!(texts(&l), vec!["See"]);
+        let src = "$$\n\\frac{1}{2}\n$$\n";
+        let l = gfm_layout(src, None);
+        assert!(l.segments.iter().any(|s| {
+            s.maths
+                .iter()
+                .any(|m| m.display_style && m.tex.contains("frac") && !s.text.contains("frac"))
+        }));
+        let inside = src.find("frac").unwrap();
+        let shown = gfm_layout(src, Some(inside));
+        let joined: String = texts(&shown).into_iter().collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("frac"));
+        assert!(shown.segments.iter().all(|s| s.maths.is_empty()));
+
+        let src = "use `$x$` here\n";
+        let l = gfm_layout(src, None);
+        assert_eq!(texts(&l), vec!["use $x$ here"]);
+        assert!(l.segments.iter().all(|s| s.maths.is_empty()));
+    }
+
+    #[test]
+    fn a_rejected_formula_is_shown_as_source() {
+        let src = "Energy $E=mc^2$ today.\n";
+        let doc = Document::from_text(src);
+        let out = inkmark_parse::GfmParser.parse(src);
+        let leaf = out.blocks.leaves_from(0).next().unwrap();
+        let open = src.find('$').unwrap();
+        let forced = open..src.find("today").unwrap();
+        let l = build(
+            &doc,
+            &out.map,
+            &leaf,
+            None,
+            &Theme::dark(),
+            std::slice::from_ref(&forced),
+            None,
+        );
+        assert_eq!(texts(&l), vec!["Energy $E=mc^2$ today."]);
+        assert!(l.segments.iter().all(|s| s.maths.is_empty()));
     }
 }

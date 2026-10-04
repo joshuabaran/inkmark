@@ -455,6 +455,11 @@ impl TextRenderer {
         self.line_height_px / self.pixels_per_point
     }
 
+    /// Scale from the last [`begin_frame`](Self::begin_frame). One before that.
+    pub fn pixels_per_point(&self) -> f32 {
+        self.pixels_per_point
+    }
+
     /// Lays out `text` (cached) and returns its height in points.
     pub fn line_height(&mut self, text: &str) -> f32 {
         self.rich_height(RichLine::plain(text))
@@ -562,7 +567,7 @@ impl TextRenderer {
 
     /// Paints `text` with its top-left corner at `top_left` (points).
     pub fn draw_line(&mut self, out: &mut GlyphMeshes, text: &str, top_left: Pos2, color: Color32) {
-        self.draw_rich(out, RichLine::plain(text), top_left, color, &[]);
+        self.draw_rich(out, RichLine::plain(text), top_left, color, &[], &[]);
     }
 
     /// Like [`draw_line`](Self::draw_line), with byte ranges of `text` drawn
@@ -575,11 +580,12 @@ impl TextRenderer {
         color: Color32,
         colors: &[(Range<usize>, Color32)],
     ) {
-        self.draw_rich(out, RichLine::plain(text), top_left, color, colors);
+        self.draw_rich(out, RichLine::plain(text), top_left, color, colors, &[]);
     }
 
     /// Paints a rich line. `colors` must be sorted and non-overlapping; colors
-    /// apply at paint time, so recoloring never re-shapes.
+    /// apply at paint time, so recoloring never re-shapes. Glyphs whose start
+    /// lies in `skip` are omitted, so a stand-in gap can be drawn over.
     pub fn draw_rich(
         &mut self,
         out: &mut GlyphMeshes,
@@ -587,6 +593,7 @@ impl TextRenderer {
         top_left: Pos2,
         color: Color32,
         colors: &[(Range<usize>, Color32)],
+        skip: &[Range<usize>],
     ) {
         let ppp = self.pixels_per_point;
         let line_height_px = self.line_height_px;
@@ -603,6 +610,12 @@ impl TextRenderer {
         for run in buffer_line.layout_runs(None, line_height_px) {
             let cells = self.cells(run.glyphs, text);
             for (i, glyph) in run.glyphs.iter().enumerate() {
+                if skip
+                    .iter()
+                    .any(|r| r.start <= glyph.start && glyph.start < r.end)
+                {
+                    continue;
+                }
                 let mut placed = glyph.clone();
                 if let Some(cells) = &cells {
                     placed.x = cells[i].0 + cells[i].2;

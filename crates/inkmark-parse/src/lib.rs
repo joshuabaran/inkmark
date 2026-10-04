@@ -6,6 +6,7 @@ mod chunked;
 mod images;
 mod links;
 mod map;
+mod math;
 mod pulldown;
 mod state;
 mod tree;
