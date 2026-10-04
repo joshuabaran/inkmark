@@ -45,6 +45,9 @@ pub fn walk_notes(
         }
         let entries = match fs::read_dir(&dir.path) {
             Ok(entries) => entries,
+            // A nested folder that cannot be listed is skipped. The root is
+            // the search itself, so its error is the result.
+            Err(error) if dir.relative.is_empty() => return Err(error),
             Err(_) => continue,
         };
         for ent in entries {

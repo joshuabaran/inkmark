@@ -29,11 +29,19 @@ const MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 const ROW_H: f32 = 22.0;
 
+/// ScrollArea salt for the result list. Arrow-key scrolling reads the same id.
+const LIST_ID: &str = "folder_search";
+
 /// What the user asked to open from a result row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SearchOpen {
     File(PathBuf),
-    Match { path: PathBuf, range: Range<usize> },
+    Match {
+        path: PathBuf,
+        range: Range<usize>,
+        /// The bytes the match covered when it was found.
+        text: String,
+    },
 }
 
 pub(crate) struct SearchFrame {
@@ -52,9 +60,12 @@ struct ContentHit {
     path: PathBuf,
     relative: String,
     range: Range<usize>,
+    /// The matched bytes. A later edit can move the range; the text stays.
+    text: String,
     preview: String,
 }
 
+#[cfg(test)]
 struct ContentList {
     hits: Vec<ContentHit>,
     complete: bool,
@@ -77,18 +88,14 @@ enum Report {
     Content {
         generation: u64,
         hits: Vec<ContentHit>,
+        /// This batch is the last one for the pass.
+        done: bool,
         complete: bool,
     },
     Failed {
         generation: u64,
         message: String,
     },
-}
-
-enum Row {
-    Header(String),
-    Status(String),
-    Hit { index: usize, label: String },
 }
 
 pub(crate) struct FolderSearch {
@@ -158,13 +165,13 @@ impl FolderSearch {
         self.open
     }
 
-    /// Ctrl+Shift+F. A query already typed is searched again if the last
-    /// pass did not finish.
+    /// Ctrl+Shift+F. A query already typed is searched again, so a note
+    /// added while the bar was closed is included.
     pub(crate) fn open(&mut self) {
         self.open = true;
         self.pending_focus = true;
         self.select_query = !self.query.is_empty();
-        if !self.query.is_empty() && !self.content_done {
+        if !self.query.is_empty() {
             self.dirty = true;
             self.last_edit = Instant::now()
                 .checked_sub(DEBOUNCE)
@@ -300,52 +307,84 @@ impl FolderSearch {
             ui.label(RichText::new(error).color(colors.error));
             return None;
         }
-        let rows = self.rows();
+        let shape = self.shape();
+        let layout = list_layout(&shape);
         let scroll_to = self.scroll_to.take();
-        let mut area = ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .id_salt("folder_search");
-        if let Some(index) = scroll_to {
-            area = area.vertical_scroll_offset(index as f32 * ROW_H);
-        }
-        let mut clicked = None;
-        area.show_rows(ui, ROW_H, rows.len(), |ui, range| {
-            for index in range {
-                let row = &rows[index];
-                let width = ui.available_width();
-                if !width.is_finite() {
-                    continue;
+        let selected = self.selected;
+        let clicked = ui
+            .scope(|ui| {
+                // The file tree does this too. Row stride is then `ROW_H`,
+                // which is what the arrow keys scroll by.
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let mut area = ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .id_salt(LIST_ID);
+                if let Some(index) = scroll_to {
+                    let viewport = ui.available_height();
+                    if viewport <= ROW_H {
+                        self.scroll_to = Some(index);
+                    } else {
+                        let scroll_id = ui.make_persistent_id(egui::IdSalt::new(LIST_ID));
+                        let current =
+                            egui::containers::scroll_area::State::load(ui.ctx(), scroll_id)
+                                .map(|state| state.offset.y)
+                                .unwrap_or(0.0);
+                        if let Some(offset) =
+                            offset_to_reveal(index as f32 * ROW_H, current, viewport)
+                        {
+                            area = area.vertical_scroll_offset(offset);
+                        }
+                    }
                 }
-                let hit = matches!(row, Row::Hit { .. });
-                let sense = if hit { Sense::click() } else { Sense::hover() };
-                let (rect, response) = ui.allocate_exact_size(egui::vec2(width, ROW_H), sense);
-                let label = match row {
-                    Row::Header(text) | Row::Status(text) => text.clone(),
-                    Row::Hit {
-                        index: hit_index,
-                        label,
-                    } => {
-                        if *hit_index == self.selected {
+                let mut clicked = None;
+                area.show_rows(ui, ROW_H, layout.count, |ui, range| {
+                    for index in range {
+                        let Some(slot) = slot_at(&layout, index) else {
+                            continue;
+                        };
+                        let width = ui.available_width();
+                        if !width.is_finite() {
+                            continue;
+                        }
+                        let hit = match slot {
+                            Slot::Hit(hit) => Some(hit),
+                            _ => None,
+                        };
+                        let sense = if hit.is_some() {
+                            Sense::click()
+                        } else {
+                            Sense::hover()
+                        };
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(width, ROW_H), sense);
+                        if hit.is_some_and(|hit| hit == selected) {
                             ui.painter().rect_filled(rect, 0.0, colors.selection);
                         }
-                        label.clone()
+                        let color = if hit.is_some() {
+                            colors.text
+                        } else {
+                            colors.markup
+                        };
+                        let galley = fit_label(
+                            ui,
+                            self.slot_label(&shape, slot),
+                            FontId::proportional(13.0),
+                            color,
+                            (rect.width() - 16.0).max(0.0),
+                        );
+                        let pos =
+                            egui::pos2(rect.left() + 8.0, rect.center().y - galley.size().y * 0.5);
+                        ui.painter().galley(pos, galley, color);
+                        if response.clicked()
+                            && let Some(hit) = hit
+                        {
+                            clicked = Some(hit);
+                        }
                     }
-                };
-                let color = match row {
-                    Row::Header(_) | Row::Status(_) => colors.markup,
-                    Row::Hit { .. } => colors.text,
-                };
-                let font = FontId::proportional(13.0);
-                let galley = fit_label(ui, label, font, color, (rect.width() - 16.0).max(0.0));
-                let pos = egui::pos2(rect.left() + 8.0, rect.center().y - galley.size().y * 0.5);
-                ui.painter().galley(pos, galley, color);
-                if response.clicked()
-                    && let Row::Hit { index, .. } = row
-                {
-                    clicked = Some(*index);
-                }
-            }
-        });
+                });
+                clicked
+            })
+            .inner;
         clicked.and_then(|index| {
             self.selected = index;
             self.open_hit(index)
@@ -395,12 +434,15 @@ impl FolderSearch {
                 Report::Content {
                     generation,
                     hits,
+                    done,
                     complete,
                 } if generation == self.generation => {
-                    self.contents = hits;
-                    self.content_done = true;
-                    self.content_complete = complete;
-                    self.scanning = false;
+                    self.contents.extend(hits);
+                    if done {
+                        self.content_done = true;
+                        self.content_complete = complete;
+                        self.scanning = false;
+                    }
                     self.clamp_selection();
                 }
                 Report::Failed {
@@ -480,61 +522,68 @@ impl FolderSearch {
         Some(SearchOpen::Match {
             path: hit.path.clone(),
             range: hit.range.clone(),
+            text: hit.text.clone(),
         })
     }
 
-    fn rows(&self) -> Vec<Row> {
-        if !self.names_done && self.names.is_empty() {
-            return vec![Row::Status("Searching…".into())];
+    fn shape(&self) -> Shape {
+        Shape {
+            names_done: self.names_done,
+            content_done: self.content_done,
+            content_complete: self.content_complete,
+            names: self.names.len(),
+            contents: self.contents.len(),
         }
-        if self.names_done && self.content_done && self.names.is_empty() && self.contents.is_empty()
-        {
-            return vec![Row::Status("No matches".into())];
-        }
-        let mut rows = Vec::new();
-        rows.push(Row::Header(format!("Files ({})", self.names.len())));
-        if self.names.is_empty() {
-            rows.push(Row::Status("No file names".into()));
-        }
-        for (index, hit) in self.names.iter().enumerate() {
-            rows.push(Row::Hit {
-                index,
-                label: hit.relative.clone(),
-            });
-        }
-        if self.names_done {
-            let title = if self.content_done && !self.content_complete {
-                format!("In files ({}+)", self.contents.len())
-            } else if self.content_done {
-                format!("In files ({})", self.contents.len())
-            } else {
-                "In files".to_string()
-            };
-            rows.push(Row::Header(title));
-            if !self.content_done && self.contents.is_empty() {
-                rows.push(Row::Status("Searching file contents…".into()));
-            }
-            for (index, hit) in self.contents.iter().enumerate() {
-                rows.push(Row::Hit {
-                    index: self.names.len() + index,
-                    label: content_label(hit),
-                });
-            }
-            if self.content_done && self.contents.is_empty() {
-                rows.push(Row::Status("No matches in files".into()));
-            }
-            if self.content_done && !self.content_complete {
-                rows.push(Row::Status("More matches are not listed".into()));
-            }
-        }
-        rows
     }
 
     fn row_of(&self, hit: usize) -> Option<usize> {
-        self.rows().iter().position(|row| match row {
-            Row::Hit { index, .. } => *index == hit,
-            _ => false,
-        })
+        hit_row(&list_layout(&self.shape()), hit)
+    }
+
+    fn slot_label(&self, shape: &Shape, slot: Slot) -> String {
+        match slot {
+            Slot::Searching => "Searching…".into(),
+            Slot::NoMatches => "No matches".into(),
+            Slot::FilesHeader => format!("Files ({})", shape.names),
+            Slot::NoFileNames => "No file names".into(),
+            Slot::InFilesHeader => {
+                if !shape.content_done && shape.contents == 0 {
+                    "In files".into()
+                } else if shape.content_done && !shape.content_complete {
+                    format!("In files ({}+)", shape.contents)
+                } else {
+                    format!("In files ({})", shape.contents)
+                }
+            }
+            Slot::SearchingContents => "Searching file contents…".into(),
+            Slot::NoContentMatches => "No matches in files".into(),
+            Slot::MoreNotListed => "More matches are not listed".into(),
+            Slot::Hit(index) => self.hit_label(index),
+        }
+    }
+
+    fn hit_label(&self, index: usize) -> String {
+        if let Some(hit) = self.names.get(index) {
+            return hit.relative.clone();
+        }
+        self.contents
+            .get(index - self.names.len())
+            .map(content_label)
+            .unwrap_or_default()
+    }
+
+    /// Where `text` sits in `doc` now. The recorded range wins when those
+    /// bytes are still that match. Otherwise the nearest match of the same
+    /// text is used. `None` when that text is no longer a match, so a click
+    /// does not select some other span.
+    pub(crate) fn locate(
+        &self,
+        doc: &Document,
+        range: Range<usize>,
+        text: &str,
+    ) -> Option<Range<usize>> {
+        let finder = Finder::compile(&self.query, self.options()).ok()?;
+        locate_match(doc, &finder, range, text)
     }
 }
 
@@ -610,18 +659,20 @@ fn run_job(job: &Job, cancel: &AtomicU64, reports: &Sender<Report>, on_result: &
     if !live() {
         return;
     }
-    let Some(found) = content_hits(&notes, &finder, MATCH_CAP, &|| !live()) else {
-        return;
-    };
-    if !live() {
-        return;
-    }
-    let _ = reports.send(Report::Content {
-        generation: job.generation,
-        hits: found.hits,
-        complete: found.complete,
+    // Each file's matches go out as they are read. The last batch says the
+    // pass is finished, including when nothing matched.
+    let _ = scan_contents(&notes, &finder, MATCH_CAP, &|| !live(), &mut |batch| {
+        if !live() {
+            return;
+        }
+        let _ = reports.send(Report::Content {
+            generation: job.generation,
+            hits: batch.hits,
+            done: batch.done,
+            complete: batch.complete,
+        });
+        on_result();
     });
-    on_result();
 }
 
 fn filename_hits(notes: &[NoteFile], finder: &Finder) -> Vec<NameHit> {
@@ -647,20 +698,28 @@ fn text_matches(finder: &Finder, text: &str) -> bool {
     finder.next(doc.rope(), 0).is_some()
 }
 
-/// `None` when `stopped` fires, so a replaced query does not publish a partial list.
-fn content_hits(
+struct ContentBatch {
+    hits: Vec<ContentHit>,
+    done: bool,
+    complete: bool,
+}
+
+/// `None` when `stopped` fires. Each file that has matches is one batch, and
+/// the last batch has `done` set, so the list can grow while the walk continues.
+fn scan_contents(
     notes: &[NoteFile],
     finder: &Finder,
     limit: usize,
     stopped: &dyn Fn() -> bool,
-) -> Option<ContentList> {
-    let mut hits = Vec::new();
+    emit: &mut dyn FnMut(ContentBatch),
+) -> Option<()> {
+    let mut total = 0usize;
     let mut complete = true;
     for note in notes {
         if stopped() {
             return None;
         }
-        let room = limit.saturating_sub(hits.len());
+        let room = limit.saturating_sub(total);
         if room == 0 {
             complete = false;
             break;
@@ -668,23 +727,64 @@ fn content_hits(
         let Some(doc) = read_note(&note.path) else {
             continue;
         };
-        let batch = finder.first_matches(doc.rope(), room + 1);
-        let extra = batch.len() > room;
-        for range in batch.into_iter().take(room) {
+        let found = finder.first_matches(doc.rope(), room + 1);
+        let extra = found.len() > room;
+        let mut hits = Vec::new();
+        for range in found.into_iter().take(room) {
             let preview = preview(&doc, &range);
+            let text = doc.slice(range.clone()).into_owned();
             hits.push(ContentHit {
                 path: note.path.clone(),
                 relative: note.relative.clone(),
                 range,
+                text,
                 preview,
             });
         }
+        total += hits.len();
         if extra {
-            complete = false;
-            break;
+            emit(ContentBatch {
+                hits,
+                done: true,
+                complete: false,
+            });
+            return Some(());
+        }
+        if !hits.is_empty() {
+            emit(ContentBatch {
+                hits,
+                done: false,
+                complete: true,
+            });
         }
     }
-    Some(ContentList { hits, complete })
+    emit(ContentBatch {
+        hits: Vec::new(),
+        done: true,
+        complete,
+    });
+    Some(())
+}
+
+/// `None` when `stopped` fires, so a replaced query does not publish a partial list.
+#[cfg(test)]
+fn content_hits(
+    notes: &[NoteFile],
+    finder: &Finder,
+    limit: usize,
+    stopped: &dyn Fn() -> bool,
+) -> Option<ContentList> {
+    let mut list = ContentList {
+        hits: Vec::new(),
+        complete: true,
+    };
+    scan_contents(notes, finder, limit, stopped, &mut |batch| {
+        list.hits.extend(batch.hits);
+        if batch.done {
+            list.complete = batch.complete;
+        }
+    })?;
+    Some(list)
 }
 
 fn read_note(path: &Path) -> Option<Document> {
@@ -771,6 +871,226 @@ fn select_all(
     state.store(ctx, id);
 }
 
+struct Shape {
+    names_done: bool,
+    content_done: bool,
+    content_complete: bool,
+    names: usize,
+    contents: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slot {
+    Searching,
+    NoMatches,
+    FilesHeader,
+    NoFileNames,
+    Hit(usize),
+    InFilesHeader,
+    SearchingContents,
+    NoContentMatches,
+    MoreNotListed,
+}
+
+struct ListLayout {
+    count: usize,
+    banner: Option<Slot>,
+    no_names_at: Option<usize>,
+    names_at: Option<usize>,
+    name_count: usize,
+    in_files_at: Option<usize>,
+    searching_at: Option<usize>,
+    contents_at: Option<usize>,
+    content_count: usize,
+    no_content_at: Option<usize>,
+    more_at: Option<usize>,
+    still_at: Option<usize>,
+}
+
+fn list_layout(shape: &Shape) -> ListLayout {
+    if !shape.names_done && shape.names == 0 {
+        return ListLayout {
+            count: 1,
+            banner: Some(Slot::Searching),
+            ..ListLayout::empty()
+        };
+    }
+    if shape.names_done && shape.content_done && shape.names == 0 && shape.contents == 0 {
+        return ListLayout {
+            count: 1,
+            banner: Some(Slot::NoMatches),
+            ..ListLayout::empty()
+        };
+    }
+    let mut count = 1;
+    let (names_at, no_names_at) = if shape.names == 0 {
+        let at = count;
+        count += 1;
+        (None, Some(at))
+    } else {
+        let at = count;
+        count += shape.names;
+        (Some(at), None)
+    };
+    let mut in_files_at = None;
+    let mut searching_at = None;
+    let mut contents_at = None;
+    let mut no_content_at = None;
+    let mut more_at = None;
+    let mut still_at = None;
+    if shape.names_done {
+        in_files_at = Some(count);
+        count += 1;
+        if !shape.content_done && shape.contents == 0 {
+            searching_at = Some(count);
+            count += 1;
+        }
+        if shape.contents > 0 {
+            contents_at = Some(count);
+            count += shape.contents;
+        }
+        if shape.content_done && shape.contents == 0 {
+            no_content_at = Some(count);
+            count += 1;
+        }
+        if shape.content_done && !shape.content_complete {
+            more_at = Some(count);
+            count += 1;
+        }
+        if !shape.content_done && shape.contents > 0 {
+            still_at = Some(count);
+            count += 1;
+        }
+    }
+    ListLayout {
+        count,
+        banner: None,
+        no_names_at,
+        names_at,
+        name_count: shape.names,
+        in_files_at,
+        searching_at,
+        contents_at,
+        content_count: shape.contents,
+        no_content_at,
+        more_at,
+        still_at,
+    }
+}
+
+impl ListLayout {
+    fn empty() -> Self {
+        Self {
+            count: 0,
+            banner: None,
+            no_names_at: None,
+            names_at: None,
+            name_count: 0,
+            in_files_at: None,
+            searching_at: None,
+            contents_at: None,
+            content_count: 0,
+            no_content_at: None,
+            more_at: None,
+            still_at: None,
+        }
+    }
+}
+
+fn slot_at(layout: &ListLayout, index: usize) -> Option<Slot> {
+    if index >= layout.count {
+        return None;
+    }
+    if let Some(slot) = layout.banner {
+        return Some(slot);
+    }
+    if index == 0 {
+        return Some(Slot::FilesHeader);
+    }
+    if layout.no_names_at == Some(index) {
+        return Some(Slot::NoFileNames);
+    }
+    if let Some(at) = layout.names_at
+        && index >= at
+        && index < at + layout.name_count
+    {
+        return Some(Slot::Hit(index - at));
+    }
+    if layout.in_files_at == Some(index) {
+        return Some(Slot::InFilesHeader);
+    }
+    if layout.searching_at == Some(index) || layout.still_at == Some(index) {
+        return Some(Slot::SearchingContents);
+    }
+    if let Some(at) = layout.contents_at
+        && index >= at
+        && index < at + layout.content_count
+    {
+        return Some(Slot::Hit(layout.name_count + (index - at)));
+    }
+    if layout.no_content_at == Some(index) {
+        return Some(Slot::NoContentMatches);
+    }
+    if layout.more_at == Some(index) {
+        return Some(Slot::MoreNotListed);
+    }
+    None
+}
+
+fn hit_row(layout: &ListLayout, hit: usize) -> Option<usize> {
+    if hit < layout.name_count {
+        return layout.names_at.map(|at| at + hit);
+    }
+    let content = hit - layout.name_count;
+    if content < layout.content_count {
+        layout.contents_at.map(|at| at + content)
+    } else {
+        None
+    }
+}
+
+fn locate_match(
+    doc: &Document,
+    finder: &Finder,
+    range: Range<usize>,
+    text: &str,
+) -> Option<Range<usize>> {
+    if range.end <= doc.len()
+        && range.start <= range.end
+        && doc.slice(range.clone()).as_ref() == text
+        && finder.next(doc.rope(), range.start).as_ref() == Some(&range)
+    {
+        return Some(range);
+    }
+    let mut best: Option<Range<usize>> = None;
+    let mut best_dist = usize::MAX;
+    for candidate in finder.first_matches(doc.rope(), MATCH_CAP) {
+        if doc.slice(candidate.clone()).as_ref() != text {
+            continue;
+        }
+        let dist = candidate.start.abs_diff(range.start);
+        if dist < best_dist {
+            best_dist = dist;
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
+/// Smallest offset that puts `[row_y, row_y + ROW_H]` inside the window.
+/// `None` when that row is already fully visible.
+fn offset_to_reveal(row_y: f32, current: f32, viewport: f32) -> Option<f32> {
+    let row_bottom = row_y + ROW_H;
+    let view_bottom = current + viewport;
+    if row_y + 0.5 < current {
+        Some(row_y.max(0.0))
+    } else if row_bottom > view_bottom + 0.5 {
+        Some((row_bottom - viewport).max(0.0))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -812,6 +1132,7 @@ mod tests {
         let found = content_hits(&notes, &finder, 10, &|| false).unwrap();
         assert_eq!(found.hits.len(), 1);
         assert_eq!(found.hits[0].range, 2..3);
+        assert_eq!(found.hits[0].text, "b");
         assert_eq!(found.hits[0].preview, "b");
         assert!(found.complete);
     }
@@ -826,5 +1147,121 @@ mod tests {
         assert_eq!(found.hits.len(), 2);
         assert!(!found.complete);
         assert!(content_hits(&notes, &finder, 10, &|| true).is_none());
+    }
+
+    #[test]
+    fn content_matches_are_reported_as_files_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "token\n").unwrap();
+        fs::write(dir.path().join("b.md"), "token\n").unwrap();
+        let notes = walk_notes(dir.path(), false, None).unwrap();
+        let finder = Finder::compile("token", options(true)).unwrap();
+        let mut batches = 0;
+        let mut total = 0;
+        let mut finished = false;
+        scan_contents(&notes, &finder, 10, &|| false, &mut |batch| {
+            if !batch.hits.is_empty() {
+                batches += 1;
+                total += batch.hits.len();
+            }
+            if batch.done {
+                finished = true;
+                assert!(batch.complete);
+            }
+        })
+        .unwrap();
+        assert!(batches >= 2);
+        assert_eq!(total, 2);
+        assert!(finished);
+    }
+
+    #[test]
+    fn a_moved_match_keeps_its_text_and_a_missing_one_is_dropped() {
+        let finder = Finder::compile("token", options(true)).unwrap();
+        let same = Document::from_text("see token here\n");
+        assert_eq!(locate_match(&same, &finder, 4..9, "token"), Some(4..9));
+
+        let moved = Document::from_text("xxsee token here\n");
+        assert_eq!(locate_match(&moved, &finder, 4..9, "token"), Some(6..11));
+
+        let gone = Document::from_text("see nothing here\n");
+        assert_eq!(locate_match(&gone, &finder, 4..9, "token"), None);
+    }
+
+    #[test]
+    fn a_visible_row_stays_and_a_hidden_row_scrolls_to_its_edge() {
+        assert_eq!(offset_to_reveal(0.0, 0.0, 100.0), None);
+        assert_eq!(offset_to_reveal(22.0, 0.0, 100.0), None);
+        assert_eq!(offset_to_reveal(220.0, 0.0, 100.0), Some(142.0));
+        assert_eq!(offset_to_reveal(0.0, 50.0, 100.0), Some(0.0));
+    }
+
+    fn slots(shape: &Shape) -> Vec<Slot> {
+        let layout = list_layout(shape);
+        (0..layout.count)
+            .map(|index| slot_at(&layout, index).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn result_rows_follow_the_section_order() {
+        assert_eq!(
+            slots(&Shape {
+                names_done: false,
+                content_done: false,
+                content_complete: true,
+                names: 0,
+                contents: 0,
+            }),
+            vec![Slot::Searching]
+        );
+        assert_eq!(
+            slots(&Shape {
+                names_done: true,
+                content_done: true,
+                content_complete: true,
+                names: 0,
+                contents: 0,
+            }),
+            vec![Slot::NoMatches]
+        );
+        assert_eq!(
+            slots(&Shape {
+                names_done: true,
+                content_done: false,
+                content_complete: true,
+                names: 1,
+                contents: 1,
+            }),
+            vec![
+                Slot::FilesHeader,
+                Slot::Hit(0),
+                Slot::InFilesHeader,
+                Slot::Hit(1),
+                Slot::SearchingContents,
+            ]
+        );
+        let done = Shape {
+            names_done: true,
+            content_done: true,
+            content_complete: false,
+            names: 0,
+            contents: 2,
+        };
+        assert_eq!(
+            slots(&done),
+            vec![
+                Slot::FilesHeader,
+                Slot::NoFileNames,
+                Slot::InFilesHeader,
+                Slot::Hit(0),
+                Slot::Hit(1),
+                Slot::MoreNotListed,
+            ]
+        );
+        let layout = list_layout(&done);
+        assert_eq!(hit_row(&layout, 0), Some(3));
+        assert_eq!(hit_row(&layout, 1), Some(4));
+        assert_eq!(hit_row(&layout, 2), None);
     }
 }

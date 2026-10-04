@@ -2,7 +2,8 @@
 //! expanded directory; this does, and it has to stop for a symlink cycle.
 
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::io;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 
 use inkmark_files::walk_notes;
@@ -54,4 +55,36 @@ fn a_symlink_cycle_is_walked_once() {
     assert_eq!(notes.len(), 1);
     assert_eq!(notes[0].relative, "sub/note.md");
     assert_eq!(notes[0].name, "note.md");
+}
+
+#[test]
+fn an_unreadable_root_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o0);
+    fs::set_permissions(path, perms).unwrap();
+    let result = walk_notes(path, false, None);
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o700);
+    fs::set_permissions(path, perms).unwrap();
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+}
+
+#[test]
+fn an_unreadable_subdirectory_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir.path().join("note.md"), "a\n");
+    let locked = dir.path().join("locked");
+    write(&locked.join("secret.md"), "b\n");
+    let mut perms = fs::metadata(&locked).unwrap().permissions();
+    perms.set_mode(0o0);
+    fs::set_permissions(&locked, perms).unwrap();
+    let result = walk_notes(dir.path(), false, None);
+    let mut perms = fs::metadata(&locked).unwrap().permissions();
+    perms.set_mode(0o700);
+    fs::set_permissions(&locked, perms).unwrap();
+    let notes = result.unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].relative, "note.md");
 }

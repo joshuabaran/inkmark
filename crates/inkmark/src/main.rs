@@ -229,8 +229,11 @@ enum Travel {
 enum Jump {
     Anchor(String),
     Offset(usize),
-    /// A folder-search match. The range is in the opened document's bytes.
-    Select(std::ops::Range<usize>),
+    /// A folder-search match. `text` is what the range covered when it was found.
+    Select {
+        range: std::ops::Range<usize>,
+        text: String,
+    },
 }
 
 #[derive(Clone)]
@@ -1679,18 +1682,19 @@ impl App {
                     self.request_open(path);
                 }
             }
-            SearchOpen::Match { path, range } => {
+            SearchOpen::Match { path, range, text } => {
                 if self.doc.path() == Some(path.as_path()) {
+                    let Some(range) = self.search.locate(&self.doc, range, &text) else {
+                        return;
+                    };
                     let here = self.here();
-                    let end = range.end.min(self.doc.len());
-                    let start = range.start.min(end);
                     self.show_match(Selection {
-                        anchor: start,
-                        head: end,
+                        anchor: range.start,
+                        head: range.end,
                     });
                     self.remember(here);
                 } else {
-                    self.pending_jump = Some((path.clone(), Jump::Select(range)));
+                    self.pending_jump = Some((path.clone(), Jump::Select { range, text }));
                     self.request_open(path);
                 }
             }
@@ -1914,13 +1918,13 @@ impl App {
                 self.jump_to_anchor(&anchor);
             }
             Jump::Offset(offset) => self.jump_to(offset.min(self.doc.len())),
-            Jump::Select(range) => {
-                let end = range.end.min(self.doc.len());
-                let start = range.start.min(end);
-                self.show_match(Selection {
-                    anchor: start,
-                    head: end,
-                });
+            Jump::Select { range, text } => {
+                if let Some(range) = self.search.locate(&self.doc, range, &text) {
+                    self.show_match(Selection {
+                        anchor: range.start,
+                        head: range.end,
+                    });
+                }
             }
         }
     }
@@ -3795,6 +3799,79 @@ mod tests {
             run.app.doc.slice(run.app.code.selection().range()).as_ref(),
             "token"
         );
+    }
+
+    #[test]
+    fn a_match_in_an_edited_file_selects_the_moved_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let beta = dir.path().join("beta.md");
+        fs::write(&beta, "see token here\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(beta));
+        run.app
+            .doc
+            .apply(
+                vec![inkmark_buffer::Edit::insert(0, "xx")],
+                Selection::caret(0),
+                Selection::caret(2),
+                inkmark_buffer::EditKind::Other,
+            )
+            .unwrap();
+        assert!(run.app.doc.is_dirty());
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("token".into())]);
+        run.wait_search();
+        run.click_text("beta.md  see token here");
+        assert_eq!(
+            run.app.doc.slice(run.app.code.selection().range()).as_ref(),
+            "token"
+        );
+        assert_eq!(run.app.code.selection().range(), 6..11);
+    }
+
+    #[test]
+    fn a_changed_file_selects_the_match_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = dir.path().join("alpha.md");
+        fs::write(&alpha, "hello\n").unwrap();
+        let beta = dir.path().join("beta.md");
+        fs::write(&beta, "see token here\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(alpha));
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("token".into())]);
+        run.wait_search();
+        fs::write(&beta, "xxsee token here\n").unwrap();
+        run.click_text("beta.md  see token here");
+        run.settle();
+        assert_eq!(
+            run.app.doc.slice(run.app.code.selection().range()).as_ref(),
+            "token"
+        );
+        assert_eq!(run.app.code.selection().range(), 6..11);
+    }
+
+    #[test]
+    fn reopening_search_lists_a_note_added_while_it_was_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("alpha.md"), "hello\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(dir.path().to_path_buf()));
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("gamma".into())]);
+        run.wait_search();
+        assert!(run.text_rect("gamma.md").is_none());
+        fs::write(dir.path().join("gamma.md"), "x\n").unwrap();
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!run.app.search.is_open());
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        assert!(run.app.search.is_open());
+        run.wait_search();
+        assert!(run.text_rect("gamma.md").is_some());
     }
 
     #[test]
