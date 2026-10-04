@@ -131,6 +131,11 @@ impl FileBrowser {
         self.tree.root()
     }
 
+    /// The sidebar's "All files" toggle. A folder search uses the same filter.
+    pub fn show_all(&self) -> bool {
+        self.tree.show_all()
+    }
+
     pub fn set_root(&mut self, root: PathBuf) {
         self.tree.set_root(root);
         self.selected = None;

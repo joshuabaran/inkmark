@@ -37,6 +37,7 @@ enum Pane {
 
 mod config;
 mod findbar;
+mod folder_search;
 mod gotoline;
 mod layout;
 mod links;
@@ -47,6 +48,7 @@ mod recent;
 mod session;
 
 use findbar::FindBar;
+use folder_search::{FolderSearch, SearchOpen};
 use gotoline::GoToLine;
 pub(crate) use layout::Mode;
 mod sidebar;
@@ -227,6 +229,8 @@ enum Travel {
 enum Jump {
     Anchor(String),
     Offset(usize),
+    /// A folder-search match. The range is in the opened document's bytes.
+    Select(std::ops::Range<usize>),
 }
 
 #[derive(Clone)]
@@ -324,6 +328,8 @@ struct App {
     find: FindBar,
     /// Ctrl+G. Closed, it keeps nothing: the next open starts empty.
     goto: GoToLine,
+    /// Ctrl+Shift+F. File names, then matches inside those files.
+    search: FolderSearch,
     /// Heading rows for the outline, rebuilt when the parse revision changes.
     outline: outline::Outline,
     /// The error banner text the settings put up, to take down once fixed.
@@ -362,6 +368,7 @@ impl App {
         let mode = layout.mode;
         let code_minimap = layout.code_minimap;
         let live_minimap = layout.live_minimap;
+        let search_ctx = ctx.clone();
         let mut app = Self {
             doc: Document::default(),
             code: CodeView::with_fonts(fonts.clone(), egui::Id::new("code_view")),
@@ -399,7 +406,7 @@ impl App {
             measure: None,
             recent,
             recent_list: None,
-            browser: FileBrowser::new(root),
+            browser: FileBrowser::new(root.clone()),
             sidebar: sidebar::Sidebar::load(sidebar_store),
             layout,
             outline_drag_from: None,
@@ -416,6 +423,7 @@ impl App {
             keys: keys::KeyMap::builtin(),
             find: FindBar::default(),
             goto: GoToLine::default(),
+            search: FolderSearch::new(root, move || search_ctx.request_repaint()),
             outline: outline::Outline::default(),
             settings_error: None,
             modal_was_open: false,
@@ -847,6 +855,7 @@ impl App {
             Action::FindNext => self.find_move(true),
             Action::FindPrevious => self.find_move(false),
             Action::GoToLine => self.open_goto(ctx),
+            Action::SearchFolder => self.open_folder_search(ctx),
             _ => {}
         }
     }
@@ -857,6 +866,7 @@ impl App {
             return;
         }
         self.goto.close();
+        self.search.close();
         let selection = self.selection();
         let range = selection.range();
         let seed = FindBar::seed(self.doc.slice(range.clone()).as_ref());
@@ -872,7 +882,24 @@ impl App {
             return;
         }
         self.find.close();
+        self.search.close();
         self.goto.open();
+        self.code.release_focus(ctx);
+        self.live.release_focus(ctx);
+    }
+
+    /// Ctrl+Shift+F. A hidden sidebar is shown, and the query takes the keys.
+    fn open_folder_search(&mut self, ctx: &egui::Context) {
+        if self.modal_open() {
+            return;
+        }
+        self.find.close();
+        self.goto.close();
+        if !self.sidebar.visible {
+            self.sidebar.visible = true;
+            self.sidebar.save();
+        }
+        self.search.open();
         self.code.release_focus(ctx);
         self.live.release_focus(ctx);
     }
@@ -1510,10 +1537,50 @@ impl App {
             let left = Rect::from_min_max(rect.min, pos2(cursor + sidebar_w, rect.bottom()));
             cursor = left.right();
             let mut output = BrowserOutput::default();
-            ui.scope_builder(UiBuilder::new().max_rect(left), |ui| {
-                output = self.browser.show(ui);
-            });
+            let root = self.browser.root().to_path_buf();
+            let show_all = self.browser.show_all();
+            let modal = self.modal_open();
+            let search_open = self.search.is_open();
+            let (hit, closed) = ui
+                .scope_builder(UiBuilder::new().max_rect(left), |ui| {
+                    let bar = if search_open {
+                        Some(self.search.show_bar(ui, &root, show_all, modal))
+                    } else {
+                        None
+                    };
+                    let body_top = bar.as_ref().map(|bar| bar.body_top).unwrap_or(left.top());
+                    let body = Rect::from_min_max(
+                        pos2(left.left(), body_top.min(left.bottom())),
+                        left.max,
+                    );
+                    let mut hit = None;
+                    ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+                        if bar.as_ref().is_some_and(|bar| bar.showing_results) {
+                            self.browser.poll_listings(ui.ctx());
+                            hit = self.search.show_results(ui);
+                        } else {
+                            output = self.browser.show(ui);
+                        }
+                    });
+                    let mut opened = hit;
+                    let mut closed = false;
+                    if let Some(bar) = bar {
+                        closed = bar.closed;
+                        if opened.is_none() {
+                            opened = bar.open;
+                        }
+                    }
+                    (opened, closed)
+                })
+                .inner;
             self.apply_browser(&output);
+            if let Some(hit) = hit {
+                self.open_search_hit(hit);
+            }
+            if closed {
+                self.search.close();
+                self.focus_pane(ui.ctx(), self.focus);
+            }
             let handle =
                 Rect::from_min_max(pos2(cursor, rect.top()), pos2(cursor + gap, rect.bottom()));
             cursor = handle.right();
@@ -1599,6 +1666,33 @@ impl App {
                 self.jump_to(offset);
                 self.remember(here);
                 self.focus_pane(ui.ctx(), self.focus);
+            }
+        }
+    }
+
+    /// A folder-search row. The same file selects the match; another file
+    /// opens, and the match is selected once that file is parsed.
+    fn open_search_hit(&mut self, hit: SearchOpen) {
+        match hit {
+            SearchOpen::File(path) => {
+                if self.doc.path() != Some(path.as_path()) {
+                    self.request_open(path);
+                }
+            }
+            SearchOpen::Match { path, range } => {
+                if self.doc.path() == Some(path.as_path()) {
+                    let here = self.here();
+                    let end = range.end.min(self.doc.len());
+                    let start = range.start.min(end);
+                    self.show_match(Selection {
+                        anchor: start,
+                        head: end,
+                    });
+                    self.remember(here);
+                } else {
+                    self.pending_jump = Some((path.clone(), Jump::Select(range)));
+                    self.request_open(path);
+                }
             }
         }
     }
@@ -1820,6 +1914,14 @@ impl App {
                 self.jump_to_anchor(&anchor);
             }
             Jump::Offset(offset) => self.jump_to(offset.min(self.doc.len())),
+            Jump::Select(range) => {
+                let end = range.end.min(self.doc.len());
+                let start = range.start.min(end);
+                self.show_match(Selection {
+                    anchor: start,
+                    head: end,
+                });
+            }
         }
     }
 
@@ -3601,6 +3703,19 @@ mod tests {
             self.frame(vec![]);
         }
 
+        fn wait_search(&mut self) {
+            let start = Instant::now();
+            while !self.app.search.settled() {
+                self.frame(vec![]);
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "folder search did not finish"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            self.frame(vec![]);
+        }
+
         fn check_disk_now(&mut self) {
             self.app.next_disk_check = Instant::now();
             self.frame(vec![]);
@@ -3628,6 +3743,72 @@ mod tests {
         run.key(egui::Key::Z, egui::Modifiers::COMMAND);
         assert_eq!(text(&run.app), "one cat\ntwo cat\n");
         assert!(!run.app.doc.can_undo());
+    }
+
+    #[test]
+    fn a_filename_query_opens_that_note() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("alpha.md"), "hello\n").unwrap();
+        fs::write(dir.path().join("beta.md"), "token\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(dir.path().to_path_buf()));
+        run.app.sidebar.visible = false;
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        assert!(run.app.sidebar.visible);
+        assert!(run.app.search.is_open());
+        run.frame(vec![egui::Event::Text("alpha".into())]);
+        run.wait_search();
+        run.click_text("alpha.md");
+        assert_eq!(
+            run.app
+                .doc
+                .path()
+                .and_then(|path| path.file_name().map(|n| n.to_owned())),
+            Some(std::ffi::OsString::from("alpha.md"))
+        );
+        assert_eq!(text(&run.app), "hello\n");
+    }
+
+    #[test]
+    fn a_content_query_opens_the_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = dir.path().join("alpha.md");
+        fs::write(&alpha, "hello\n").unwrap();
+        fs::write(dir.path().join("beta.md"), "see token here\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(alpha));
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("token".into())]);
+        run.wait_search();
+        run.click_text("beta.md  see token here");
+        run.settle();
+        assert_eq!(
+            run.app
+                .doc
+                .path()
+                .and_then(|path| path.file_name().map(|n| n.to_owned())),
+            Some(std::ffi::OsString::from("beta.md"))
+        );
+        assert_eq!(
+            run.app.doc.slice(run.app.code.selection().range()).as_ref(),
+            "token"
+        );
+    }
+
+    #[test]
+    fn an_invalid_folder_pattern_stays_in_the_sidebar() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("alpha.md"), "hello\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(dir.path().to_path_buf()));
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("(".into())]);
+        run.click_text("Regex");
+        assert!(run.app.search.error().is_some());
+        assert!(run.text_rect("New file").is_none());
     }
 
     #[test]

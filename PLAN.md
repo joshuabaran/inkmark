@@ -507,6 +507,8 @@ From `~/Projects/inkmark/PRODUCT_REVIEW.md`, outside the repo. This is the order
 
 **P7, as built:** `$...$` and `$$...$$` in ordinary text are drawn in the live pane. The source bytes stay as typed, and the editor does not write the formula back. A caret in the formula shows those bytes. Code, code blocks, and HTML are left as text. A formula that does not parse is shown as its source. `a_formula_is_drawn_and_the_source_stays` and `a_wide_formula_stays_on_one_line` cover it.
 
+**P8, as built:** Ctrl+Shift+F searches the open folder. A file whose name matches is listed first. Matches inside those files follow, from a worker thread, the same way a parse does. Opening a file name opens that note. Opening a match inside a file selects it. The search covers the Markdown files the sidebar would list. `a_filename_query_opens_that_note` and `a_content_query_opens_the_match` cover it.
+
 **Not this round:** vim mode, multi-cursor, LSP or Marksman-style diagnostics, tabs, backlinks, a graph, tags, Mermaid and other diagrams, images from the network, rewriting links in other notes when one is renamed or moved, screen-reader support (AccessKit). Link rewriting waits on P8 and a change preview. Network images still need a policy: inkmark makes no network requests.
 
 **Crashes.** Issue 35: the window closed during ordinary use and left no core dump and no Omarchy notification. Leaving the 5 MB file idle reproduced `overflow when subtracting durations`, exit 101, no core. The theme settle (150 ms) and the status hint (4 s) each read the clock twice and subtracted. Both now use one `checked_sub`. Fixed in #36. A separate clipboard-thread segfault on shutdown does dump core; those exits did not.
