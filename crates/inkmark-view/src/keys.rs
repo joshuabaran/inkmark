@@ -92,9 +92,12 @@ pub enum Action {
     FindNext = 51,
     FindPrevious = 52,
     GoToLine = 53,
+    SelectWord = 54,
+    SelectParagraph = 55,
+    MatchBracket = 56,
 }
 
-const COUNT: usize = 54;
+const COUNT: usize = 57;
 
 impl Action {
     pub const ALL: [Action; COUNT] = [
@@ -152,6 +155,9 @@ impl Action {
         Action::FindNext,
         Action::FindPrevious,
         Action::GoToLine,
+        Action::SelectWord,
+        Action::SelectParagraph,
+        Action::MatchBracket,
     ];
 
     pub const fn index(self) -> usize {
@@ -216,6 +222,9 @@ impl Action {
             FindNext => "find_next",
             FindPrevious => "find_previous",
             GoToLine => "go_to_line",
+            SelectWord => "select_word",
+            SelectParagraph => "select_paragraph",
+            MatchBracket => "match_bracket",
         }
     }
 
@@ -277,6 +286,9 @@ impl Action {
             FindNext => "Find the next match",
             FindPrevious => "Find the previous match",
             GoToLine => "Go to line",
+            SelectWord => "Select word",
+            SelectParagraph => "Select paragraph",
+            MatchBracket => "Jump to the matching fence or brackets",
         }
     }
 
@@ -915,6 +927,9 @@ fn default_chords(action: Action) -> Vec<Chord> {
         FindNext => vec![chord(Modifiers::NONE, Key::F3)],
         FindPrevious => vec![chord(shift, Key::F3)],
         GoToLine => vec![chord(ctrl, Key::G)],
+        SelectWord => vec![chord(ctrl, Key::D)],
+        SelectParagraph => vec![chord(ctrl_shift, Key::P)],
+        MatchBracket => vec![chord(ctrl_shift, Key::Backslash)],
     }
 }
 
@@ -961,6 +976,12 @@ mod tests {
         assert_eq!(
             map.shortcut_text(Action::DeleteColumn),
             "Ctrl+Alt+Shift+Backspace"
+        );
+        assert_eq!(map.shortcut_text(Action::SelectWord), "Ctrl+D");
+        assert_eq!(map.shortcut_text(Action::SelectParagraph), "Ctrl+Shift+P");
+        assert_eq!(
+            map.shortcut_text(Action::MatchBracket),
+            "Ctrl+Shift+Backslash"
         );
     }
 
