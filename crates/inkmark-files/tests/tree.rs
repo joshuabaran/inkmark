@@ -455,6 +455,42 @@ fn expanding_again_reads_the_folder() {
     assert!(listed.iter().any(|name| name == "  b.md"));
 }
 
+#[test]
+fn a_finished_listing_says_when_a_path_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let pics = dir.path().join("Pics");
+    let mut tree = Tree::new(dir.path());
+    assert!(
+        !tree.settled_without(&pics),
+        "the root has not been read yet"
+    );
+
+    tree.load_pending();
+    assert!(tree.settled_without(&pics));
+    assert!(tree.settled_without(Path::new("/tmp/inkmark-not-in-this-tree")));
+
+    fs::create_dir(&pics).unwrap();
+    let root = tree.dirs_at(dir.path())[0];
+    tree.invalidate(root);
+    assert!(
+        !tree.settled_without(&pics),
+        "a reload in flight still counts as waiting"
+    );
+    tree.load_pending();
+    assert!(!tree.settled_without(&pics));
+
+    let nested = pics.join("More");
+    tree.reveal(&nested);
+    tree.load_pending();
+    assert!(tree.settled_without(&nested));
+    fs::create_dir(&nested).unwrap();
+    let pics_index = row(&mut tree, "Pics").index;
+    tree.invalidate(pics_index);
+    assert!(!tree.settled_without(&nested));
+    tree.load_pending();
+    assert!(!tree.settled_without(&nested));
+}
+
 struct ModeGuard(PathBuf);
 
 impl Drop for ModeGuard {

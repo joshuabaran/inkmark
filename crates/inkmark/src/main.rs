@@ -1378,9 +1378,15 @@ impl App {
                     prompt.error = Some("A folder with that name already exists.".into());
                 }
             }
-            Err(NewFolderError::Empty | NewFolderError::Invalid) => {
+            Err(NewFolderError::Empty) => {
                 if let Some(prompt) = &mut self.new_folder {
                     prompt.error = Some("Enter a folder name.".into());
+                }
+            }
+            Err(NewFolderError::Invalid) => {
+                if let Some(prompt) = &mut self.new_folder {
+                    prompt.error =
+                        Some("A folder name can't contain / or \\, or be . or ..".into());
                 }
             }
             Err(NewFolderError::Io(message)) => {
@@ -4820,15 +4826,9 @@ mod tests {
             .expect("Ctrl+Shift+N opens the prompt");
         assert_eq!(prompt.dir, chapter);
         run.key(egui::Key::Enter, egui::Modifiers::NONE);
-        assert!(
-            run.app
-                .new_folder
-                .as_ref()
-                .unwrap()
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("folder name")
+        assert_eq!(
+            run.app.new_folder.as_ref().unwrap().error.as_deref(),
+            Some("Enter a folder name.")
         );
         assert!(!chapter.join("Pics").exists());
 
@@ -4865,17 +4865,18 @@ mod tests {
         run.app.new_folder.as_mut().unwrap().name = "a/b".into();
         run.app.new_folder.as_mut().unwrap().error = None;
         run.key(egui::Key::Enter, egui::Modifiers::NONE);
-        assert!(
-            run.app
-                .new_folder
-                .as_ref()
-                .unwrap()
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("folder name")
+        assert_eq!(
+            run.app.new_folder.as_ref().unwrap().error.as_deref(),
+            Some("A folder name can't contain / or \\, or be . or ..")
         );
         assert!(!chapter.join("a").exists());
+        run.app.new_folder.as_mut().unwrap().name = "..".into();
+        run.app.new_folder.as_mut().unwrap().error = None;
+        run.key(egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(
+            run.app.new_folder.as_ref().unwrap().error.as_deref(),
+            Some("A folder name can't contain / or \\, or be . or ..")
+        );
 
         run.key(egui::Key::Escape, egui::Modifiers::NONE);
         assert!(run.app.new_folder.is_none());

@@ -197,7 +197,8 @@ tree, Left and Right collapse and expand a folder, and Enter opens a
 Markdown file. Ctrl+Shift+F searches this folder, and so does ∗. A file
 name is listed first, and a match inside a file follows; opening either
 one opens that note. A name without a Markdown extension gets `.md`. A
-new folder keeps the name you type. Right-click an entry to rename it,
+new folder keeps the name you type. A blank name, a slash, `.`, or `..`
+is refused. Right-click an entry to rename it,
 move it (or drag it onto a folder), move it to the trash, or create a
 file or a folder next to it. Nothing is ever overwritten: a name that's
 taken is refused. If the open file is renamed or moved, it stays open

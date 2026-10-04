@@ -292,6 +292,44 @@ impl Tree {
         self.reveal.as_deref()
     }
 
+    /// `true` once a finished listing shows `path` is not a row. An ancestor
+    /// that is still being read keeps this `false`, so a folder created a
+    /// moment ago is not treated as missing. A path outside this tree, or
+    /// under a collapsed directory that has not been read, is missing.
+    pub fn settled_without(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return true;
+        };
+        let components: Vec<_> = relative.components().collect();
+        if components.is_empty() {
+            return true;
+        }
+        let mut index = 0usize;
+        for (i, component) in components.iter().enumerate() {
+            if !self.nodes[index].loaded {
+                // Expanded directories are read off the UI thread. A collapsed
+                // one is not, so a path under it will not become a row.
+                return !self.nodes[index].expanded;
+            }
+            let name = component.as_os_str().to_string_lossy();
+            let children = self.nodes[index].children.clone();
+            let found = children
+                .into_iter()
+                .find(|child| self.nodes[*child].alive && self.nodes[*child].name == name);
+            let Some(child) = found else {
+                return true;
+            };
+            if i + 1 == components.len() {
+                return false;
+            }
+            if !self.nodes[child].kind.is_dir() || self.nodes[child].looped() {
+                return true;
+            }
+            index = child;
+        }
+        false
+    }
+
     fn load_sync(&mut self, index: usize) {
         let Some(node) = self.nodes.get(index) else {
             return;

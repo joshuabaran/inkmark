@@ -94,6 +94,8 @@ pub struct FileBrowser {
     new_folder_rect: Option<Rect>,
     search_rect: Option<Rect>,
     /// A folder just created here, scrolled into view once its row is listed.
+    /// Cleared when the row appears, or when a finished listing shows it will
+    /// not. A hidden name is never stored here.
     reveal_path: Option<PathBuf>,
     watch: Option<Watch>,
     /// Colors, refreshed from the context every frame.
@@ -264,11 +266,20 @@ impl FileBrowser {
         }
     }
 
-    /// The folder was just created here: re-read its parent, expand the way
-    /// to it, and select it once the row is listed.
+    /// The folder was just created here: re-read its parent. When the sidebar
+    /// will list it, expand the way to it and select it once the row is
+    /// listed. A name the current filter hides (a dot folder while All files
+    /// is off) is left unselected, so the next new file stays in the folder
+    /// that was already selected.
     pub fn note_dir_created(&mut self, path: &Path) {
         if let Some(parent) = path.parent() {
             self.refresh_dir(parent);
+        }
+        let listed = path
+            .file_name()
+            .is_some_and(|name| self.tree.show_all() || !name.to_string_lossy().starts_with('.'));
+        if !listed {
+            return;
         }
         self.tree.reveal(path);
         self.selected = Some(path.to_path_buf());
@@ -407,12 +418,24 @@ impl FileBrowser {
             self.scroll_to = Some(index as f32 * ROW_H);
             self.revealed = true;
         }
-        if let Some(path) = self.reveal_path.clone()
-            && let Some(index) = self.tree.rows().iter().position(|row| row.path == path)
-        {
+        let Some(path) = self.reveal_path.clone() else {
+            return;
+        };
+        let listed = self.tree.rows().iter().position(|row| row.path == path);
+        if let Some(index) = listed {
             self.selected = Some(path);
             self.scroll_to = Some(index as f32 * ROW_H);
             self.reveal_path = None;
+            return;
+        }
+        // The parent was read and this folder is not in it: a delete or a
+        // rename landed first. Drop the target so a later folder of the
+        // same name does not take the selection.
+        if self.tree.settled_without(&path) {
+            self.reveal_path = None;
+            if self.selected.as_deref() == Some(path.as_path()) {
+                self.selected = path.parent().map(Path::to_path_buf);
+            }
         }
     }
 
@@ -929,4 +952,75 @@ fn spawn_lister() -> (Sender<Job>, Receiver<Listed>, Arc<AtomicU64>) {
         }
     });
     (job_tx, done_rx, epoch)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn pump(browser: &mut FileBrowser, ctx: &egui::Context, time: f64) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_max(pos2(0.0, 0.0), pos2(800.0, 600.0))),
+            time: Some(time),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            browser.show(ui);
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn a_missing_folder_does_not_keep_the_reveal() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "a\n").unwrap();
+        let mut browser = FileBrowser::new(dir.path());
+        let ctx = egui::Context::default();
+        let mut time = 0.0;
+        let start = Instant::now();
+        while !browser.row_names().iter().any(|name| name == "a.md") {
+            time += 1.0 / 60.0;
+            pump(&mut browser, &ctx, time);
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "root was not listed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let pics = dir.path().join("Pics");
+        browser.note_dir_created(&pics);
+        assert_eq!(browser.reveal_path.as_deref(), Some(pics.as_path()));
+
+        let start = Instant::now();
+        while browser.reveal_path.is_some() {
+            time += 1.0 / 60.0;
+            pump(&mut browser, &ctx, time);
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "a missing folder kept its reveal"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(browser.selected.as_deref(), Some(pics.as_path()));
+
+        fs::create_dir(&pics).unwrap();
+        browser.refresh_dir(dir.path());
+        let start = Instant::now();
+        while !browser.row_names().iter().any(|name| name == "Pics") {
+            time += 1.0 / 60.0;
+            pump(&mut browser, &ctx, time);
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "Pics was not listed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(browser.reveal_path.is_none());
+        assert_ne!(browser.selected.as_deref(), Some(pics.as_path()));
+        assert_eq!(browser.new_file_dir(), dir.path());
+    }
 }
