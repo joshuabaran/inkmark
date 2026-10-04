@@ -210,6 +210,16 @@ fn link_pairs(doc: &Document, parse: &ParseOutput) -> Vec<LinkPair> {
                     close: span.range,
                 });
             }
+        } else if (text.contains('[') || text.contains('<'))
+            && (text.contains(']') || text.contains('>'))
+        {
+            // `[](u)` and `![](img.png)` arrive as one span. Pushing that
+            // span leaves it on the stack, and the closer of an image whose
+            // alt holds the empty link then binds to the empty link.
+            pairs.push(LinkPair {
+                open: span.range.clone(),
+                close: span.range,
+            });
         } else if text.contains('[') || text.contains('<') {
             stack.push(span.range);
         }
@@ -223,8 +233,7 @@ fn link_target(doc: &Document, head: usize, parse: &ParseOutput) -> Option<usize
     let pair = pairs
         .iter()
         .find(|pair| contains(&pair.open, at) || contains(&pair.close, at))?;
-    let mut brackets = bracket_positions(doc, &pair.open);
-    brackets.extend(bracket_positions(doc, &pair.close));
+    let brackets = structural_brackets(doc, &pair.open, &pair.close);
     partner(&brackets, at)
 }
 
@@ -232,16 +241,86 @@ fn contains(range: &Range<usize>, offset: usize) -> bool {
     range.contains(&offset)
 }
 
-fn bracket_positions(doc: &Document, range: &Range<usize>) -> Vec<(usize, char)> {
-    let mut out = Vec::new();
+/// Brackets a jump can land on, in source order. `[` `]` `<` `>` stay, and
+/// so do the `(` `)` that delimit a destination. A parenthesis inside the
+/// URL or the title stays put, including one written `\(` or `\)`.
+fn structural_brackets(
+    doc: &Document,
+    open: &Range<usize>,
+    close: &Range<usize>,
+) -> Vec<(usize, char)> {
+    let mut brackets = Vec::new();
+    collect_brackets(&mut brackets, doc, open);
+    if open != close {
+        collect_brackets(&mut brackets, doc, close);
+    }
+    let dest = destination_parens(doc, close);
+    brackets.retain(|(at, ch)| match ch {
+        '(' => dest.is_some_and(|(open_at, _)| *at == open_at),
+        ')' => dest.is_some_and(|(_, close_at)| *at == close_at),
+        _ => true,
+    });
+    brackets
+}
+
+fn collect_brackets(out: &mut Vec<(usize, char)>, doc: &Document, range: &Range<usize>) {
     let mut i = range.start;
     for ch in doc.slice(range.clone()).chars() {
-        if matches!(ch, '[' | ']' | '(' | ')' | '<' | '>') {
+        if matches!(ch, '[' | ']' | '(' | ')' | '<' | '>') && !escaped(doc, i) {
             out.push((i, ch));
         }
         i += ch.len_utf8();
     }
-    out
+}
+
+/// The `(` just after the label's `]`, and the last unescaped `)` in the
+/// closing span. That last `)` is the one that ends the destination.
+fn destination_parens(doc: &Document, close: &Range<usize>) -> Option<(usize, usize)> {
+    let bracket = first_unescaped(doc, close, ']')?;
+    let after = bracket + ']'.len_utf8();
+    if after >= close.end || escaped(doc, after) || char_at(doc, after) != Some('(') {
+        return None;
+    }
+    let end = last_unescaped(doc, close, ')')?;
+    (end > after).then_some((after, end))
+}
+
+fn first_unescaped(doc: &Document, range: &Range<usize>, want: char) -> Option<usize> {
+    let mut i = range.start;
+    for ch in doc.slice(range.clone()).chars() {
+        if ch == want && !escaped(doc, i) {
+            return Some(i);
+        }
+        i += ch.len_utf8();
+    }
+    None
+}
+
+fn last_unescaped(doc: &Document, range: &Range<usize>, want: char) -> Option<usize> {
+    let mut i = range.start;
+    let mut found = None;
+    for ch in doc.slice(range.clone()).chars() {
+        if ch == want && !escaped(doc, i) {
+            found = Some(i);
+        }
+        i += ch.len_utf8();
+    }
+    found
+}
+
+/// A bracket written `\(`, `\)`, and the same for the other brackets.
+fn escaped(doc: &Document, offset: usize) -> bool {
+    let mut at = offset;
+    let mut slashes = 0u32;
+    while at > 0 {
+        let prev = doc.prev_char_boundary(at);
+        if char_at(doc, prev) != Some('\\') {
+            break;
+        }
+        slashes += 1;
+        at = prev;
+    }
+    slashes % 2 == 1
 }
 
 fn partner(brackets: &[(usize, char)], at: usize) -> Option<usize> {
@@ -433,7 +512,9 @@ mod tests {
         let open_paren = src.find('(').unwrap();
         let title_paren = src.find("(y)").unwrap();
         assert_eq!(jump_at(src, open_paren), Some(src.rfind(')').unwrap()));
-        assert_eq!(jump_at(src, title_paren), Some(src.find(')').unwrap()));
+        assert_eq!(jump_at(src, title_paren), None);
+        assert_eq!(jump_at(src, src.find(')').unwrap()), None);
+        assert_eq!(jump_at(src, src.rfind(')').unwrap()), Some(open_paren));
 
         let src = "see [foo] and [bar](http://x.com)\n\n[foo]: http://x.com\n";
         let def = src.rfind('[').unwrap();
@@ -459,6 +540,96 @@ mod tests {
         assert_eq!(
             bracket_target(&doc, Selection::caret(doc.len()), None),
             None
+        );
+    }
+
+    #[test]
+    fn destination_parens_and_empty_links_stay_with_their_own_pair() {
+        // A `(` in the title used to take the destination's `)`.
+        let src = "[a](u \"t(y\")";
+        let open = src.find('(').unwrap();
+        assert_eq!(jump_at(src, open), Some(src.rfind(')').unwrap()));
+        assert_eq!(jump_at(src, src.find("t(").unwrap() + 1), None);
+
+        // Balanced parentheses inside the URL stay put.
+        let src = "[a](foo(bar))";
+        let open = src.find('(').unwrap();
+        let inner = src.find("(bar)").unwrap();
+        assert_eq!(jump_at(src, open), Some(src.rfind(')').unwrap()));
+        assert_eq!(jump_at(src, inner), None);
+        assert_eq!(jump_at(src, src.rfind(')').unwrap()), Some(open));
+
+        // A backslash-escaped parenthesis is not a partner.
+        let src = "[a](foo\\(bar)";
+        let open = src.find('(').unwrap();
+        let escaped = src.find("\\(").unwrap() + 1;
+        assert_eq!(jump_at(src, open), Some(src.rfind(')').unwrap()));
+        assert_eq!(jump_at(src, escaped), None);
+        assert_eq!(jump_at(src, src.rfind(')').unwrap()), Some(open));
+
+        let src = "[a](u \"say \\) hi\")";
+        let open = src.find('(').unwrap();
+        let escaped = src.find("\\)").unwrap() + 1;
+        let end = src.rfind(')').unwrap();
+        assert_ne!(escaped, end);
+        assert_eq!(jump_at(src, open), Some(end));
+        assert_eq!(jump_at(src, escaped), None);
+        assert_eq!(jump_at(src, end), Some(open));
+
+        // Pointy destinations still jump on the parentheses around them.
+        let src = "[a](<http://x.com>)";
+        assert_eq!(
+            jump_at(src, src.find('(').unwrap()),
+            Some(src.rfind(')').unwrap())
+        );
+        assert_eq!(
+            jump_at(src, src.find('<').unwrap()),
+            Some(src.find('>').unwrap())
+        );
+
+        // An empty link is one span, and it jumps inside itself.
+        let src = "[](u)";
+        assert_eq!(jump_at(src, 0), Some(1));
+        assert_eq!(jump_at(src, 1), Some(0));
+        assert_eq!(jump_at(src, 2), Some(4));
+        assert_eq!(jump_at(src, 4), Some(2));
+
+        let src = "![](img.png)";
+        assert_eq!(jump_at(src, 0), None);
+        assert_eq!(jump_at(src, 1), Some(2));
+        assert_eq!(
+            jump_at(src, src.find('(').unwrap()),
+            Some(src.find(')').unwrap())
+        );
+
+        // The empty link does not take the following link's brackets.
+        let src = "[](u) and [b](v)";
+        assert_eq!(jump_at(src, 0), Some(1));
+        let second = src.rfind('[').unwrap();
+        assert_eq!(jump_at(src, second), Some(src.rfind(']').unwrap()));
+
+        // Nor the closer of an image whose alt text holds it.
+        let src = "![a [](u) b](i.png)";
+        assert_eq!(jump_at(src, 1), Some(src.rfind(']').unwrap()));
+        let empty = src.find("[](u)").unwrap();
+        assert_eq!(jump_at(src, empty), Some(empty + 1));
+        assert_eq!(jump_at(src, empty + 2), Some(src.find(')').unwrap()));
+        assert_eq!(
+            jump_at(src, src.rfind('(').unwrap()),
+            Some(src.rfind(')').unwrap())
+        );
+
+        let src = "![a ![](u) b](i.png)";
+        assert_eq!(jump_at(src, 1), Some(src.rfind(']').unwrap()));
+        let inner = src.find("![]").unwrap() + 1;
+        assert_eq!(jump_at(src, inner), Some(inner + 1));
+
+        // An unclosed `[` is not link markup, so the next link keeps its pair.
+        let src = "text [unclosed then [b](y)";
+        assert_eq!(jump_at(src, src.find('[').unwrap()), None);
+        assert_eq!(
+            jump_at(src, src.rfind('[').unwrap()),
+            Some(src.rfind(']').unwrap())
         );
     }
 }

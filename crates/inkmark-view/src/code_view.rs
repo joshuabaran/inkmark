@@ -342,9 +342,7 @@ impl CodeView {
         self.sync(doc, true);
         if self.pending_reveal {
             self.pending_reveal = false;
-            if self.folds.reveal(doc, self.selection.head)
-                || self.folds.reveal(doc, self.selection.anchor)
-            {
+            if self.reveal_selection(doc) {
                 self.lines.invalidate();
                 self.fold_resync = true;
             }
@@ -694,12 +692,18 @@ impl CodeView {
         self.preferred_x = None;
         self.reveal_caret = REVEAL_FRAMES;
         doc.seal_undo_step();
-        if self.folds.reveal(doc, self.selection.head)
-            || self.folds.reveal(doc, self.selection.anchor)
-        {
+        if self.reveal_selection(doc) {
             self.lines.invalidate();
             self.fold_resync = true;
         }
+    }
+
+    /// Opens every fold hiding the head or the anchor. Both calls run:
+    /// `||` would skip the anchor once the head's fold opens.
+    fn reveal_selection(&mut self, doc: &Document) -> bool {
+        let head = self.folds.reveal(doc, self.selection.head);
+        let anchor = self.folds.reveal(doc, self.selection.anchor);
+        head || anchor
     }
 
     fn move_to(&mut self, doc: &mut Document, target: usize, extend: bool) {
@@ -712,9 +716,7 @@ impl CodeView {
         self.reveal_caret = REVEAL_FRAMES;
         doc.seal_undo_step();
         // A jump that lands in a folded body opens it, so the caret is visible.
-        if self.folds.reveal(doc, self.selection.head)
-            || self.folds.reveal(doc, self.selection.anchor)
-        {
+        if self.reveal_selection(doc) {
             self.lines.invalidate();
             self.fold_resync = true;
         }
@@ -1413,5 +1415,55 @@ impl CodeView {
             self.theme.mini_viewport
         };
         m.paint_viewport(painter, fill, self.theme.mini_viewport_edge);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `# One\nbody one\n# Two\nbody two\n`, with each body folded.
+    fn two_folds() -> (CodeView, Document) {
+        let ctx = egui::Context::default();
+        let mut view = CodeView::new(&ctx, Id::new("fold-ends"));
+        let doc = Document::from_text("# One\nbody one\n# Two\nbody two\n");
+        assert_eq!(doc.slice(6..15).as_ref(), "body one\n");
+        assert_eq!(doc.slice(21..30).as_ref(), "body two\n");
+        view.folds.toggle(6..15, None);
+        view.folds.toggle(21..30, None);
+        (view, doc)
+    }
+
+    #[test]
+    fn place_opens_a_fold_at_each_end() {
+        let (mut view, mut doc) = two_folds();
+        // Head's fold is the one `||` used to open and then skip past.
+        view.place(
+            &mut doc,
+            Selection {
+                anchor: 21,
+                head: 6,
+            },
+        );
+        assert!(view.folds.ranges().is_empty(), "{:?}", view.folds.ranges());
+
+        view.folds.toggle(6..15, None);
+        view.folds.toggle(21..30, None);
+        view.place(
+            &mut doc,
+            Selection {
+                anchor: 6,
+                head: 21,
+            },
+        );
+        assert!(view.folds.ranges().is_empty(), "{:?}", view.folds.ranges());
+    }
+
+    #[test]
+    fn move_to_opens_the_anchor_fold_when_the_head_fold_opens() {
+        let (mut view, mut doc) = two_folds();
+        view.selection = Selection { anchor: 6, head: 6 };
+        view.move_to(&mut doc, 21, true);
+        assert!(view.folds.ranges().is_empty(), "{:?}", view.folds.ranges());
     }
 }
