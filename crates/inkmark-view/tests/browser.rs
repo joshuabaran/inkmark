@@ -485,6 +485,31 @@ fn the_context_menu_offers_rename_move_trash_and_new_file() {
     let output = choose(&mut h, &sub, "New file here…");
     assert!(output.new_file);
     assert_eq!(h.browser.new_file_dir(), sub);
+    let output = choose(&mut h, &b, "New folder here…");
+    assert!(output.new_folder);
+    assert_eq!(h.browser.new_file_dir(), dir.path());
+}
+
+#[test]
+fn a_hidden_new_folder_stays_unselected() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.md"), "a\n").unwrap();
+    let mut h = Harness::new(dir.path());
+    h.wait_until(|browser| browser.row_names() == ["a.md"]);
+
+    let hidden = dir.path().join(".drafts");
+    fs::create_dir(&hidden).unwrap();
+    h.browser.note_dir_created(&hidden);
+    assert_eq!(h.browser.new_file_dir(), dir.path());
+
+    let all = h.text_rect("All files").expect("All files");
+    h.click(all.center());
+    h.wait_until(|browser| browser.row_names().iter().any(|name| name == ".drafts"));
+    assert_eq!(
+        h.browser.new_file_dir(),
+        dir.path(),
+        "turning All files on selected the hidden folder"
+    );
 }
 
 #[test]

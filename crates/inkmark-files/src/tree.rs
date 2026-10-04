@@ -110,20 +110,24 @@ impl Tree {
         self.show_all
     }
 
-    /// Changing the filter drops every listing. Expanded folders are read again.
+    /// Changing the filter drops every listing, including one still being
+    /// read. Expanded folders are read again with the new filter.
     pub fn set_show_all(&mut self, show_all: bool) {
         if self.show_all == show_all {
             return;
         }
         self.show_all = show_all;
-        let loaded: Vec<usize> = self
+        // A directory that is expanded but not loaded has a listing in
+        // flight. Bumping its generation drops that result, which was
+        // started with the old filter.
+        let dirs: Vec<usize> = self
             .nodes
             .iter()
             .enumerate()
-            .filter(|(_, node)| node.alive && node.loaded)
+            .filter(|(_, node)| node.alive && node.kind.is_dir() && (node.loaded || node.expanded))
             .map(|(index, _)| index)
             .collect();
-        for index in loaded {
+        for index in dirs {
             self.invalidate(index);
         }
     }
@@ -290,6 +294,44 @@ impl Tree {
 
     pub fn reveal_target(&self) -> Option<&Path> {
         self.reveal.as_deref()
+    }
+
+    /// `true` once a finished listing shows `path` is not a row. An ancestor
+    /// that is still being read keeps this `false`, so a folder created a
+    /// moment ago is not treated as missing. A path outside this tree, or
+    /// under a collapsed directory that has not been read, is missing.
+    pub fn settled_without(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return true;
+        };
+        let components: Vec<_> = relative.components().collect();
+        if components.is_empty() {
+            return true;
+        }
+        let mut index = 0usize;
+        for (i, component) in components.iter().enumerate() {
+            if !self.nodes[index].loaded {
+                // Expanded directories are read off the UI thread. A collapsed
+                // one is not, so a path under it will not become a row.
+                return !self.nodes[index].expanded;
+            }
+            let name = component.as_os_str().to_string_lossy();
+            let children = self.nodes[index].children.clone();
+            let found = children
+                .into_iter()
+                .find(|child| self.nodes[*child].alive && self.nodes[*child].name == name);
+            let Some(child) = found else {
+                return true;
+            };
+            if i + 1 == components.len() {
+                return false;
+            }
+            if !self.nodes[child].kind.is_dir() || self.nodes[child].looped() {
+                return true;
+            }
+            index = child;
+        }
+        false
     }
 
     fn load_sync(&mut self, index: usize) {

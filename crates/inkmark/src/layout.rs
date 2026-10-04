@@ -54,6 +54,8 @@ pub(crate) struct Layout {
     pub code_fraction: f32,
     /// Outline width the user set. A narrow window may draw it smaller.
     pub outline_width: f32,
+    /// Whether the outline is showing. A hidden outline keeps its width.
+    pub outline_visible: bool,
 }
 
 impl Layout {
@@ -63,6 +65,7 @@ impl Layout {
         let mut live_minimap = true;
         let mut code_fraction = DEFAULT_FRACTION;
         let mut outline_width = outline::PREFERRED_WIDTH;
+        let mut outline_visible = true;
         if let Some(path) = &store
             && let Ok(text) = std::fs::read_to_string(path)
         {
@@ -88,6 +91,11 @@ impl Layout {
             {
                 outline_width = parsed.clamp(outline::MIN_WIDTH, outline::MAX_WIDTH);
             }
+            // A file written before the outline could be hidden has no line
+            // here, and the outline stays up.
+            if let Some(flag) = lines.next() {
+                outline_visible = flag != "0";
+            }
         }
         Self {
             store,
@@ -96,6 +104,7 @@ impl Layout {
             live_minimap,
             code_fraction,
             outline_width,
+            outline_visible,
         }
     }
 
@@ -108,10 +117,11 @@ impl Layout {
         }
         let code = if self.code_minimap { "1" } else { "0" };
         let live = if self.live_minimap { "1" } else { "0" };
+        let outline = if self.outline_visible { "1" } else { "0" };
         let _ = std::fs::write(
             store,
             format!(
-                "{}\n{code}\n{live}\n{}\n{}\n",
+                "{}\n{code}\n{live}\n{}\n{}\n{outline}\n",
                 self.mode.as_str(),
                 self.code_fraction,
                 self.outline_width,
@@ -190,6 +200,7 @@ mod tests {
         assert!(missing.code_minimap && missing.live_minimap);
         assert_eq!(missing.code_fraction, 0.5);
         assert_eq!(missing.outline_width, outline::PREFERRED_WIDTH);
+        assert!(missing.outline_visible);
 
         let path = dir.path().join("layout");
         std::fs::write(&path, "nope\nxyz\nabc\nnope\nwide\n").unwrap();
@@ -198,6 +209,7 @@ mod tests {
         assert!(garbage.code_minimap && garbage.live_minimap);
         assert_eq!(garbage.code_fraction, 0.5);
         assert_eq!(garbage.outline_width, outline::PREFERRED_WIDTH);
+        assert!(garbage.outline_visible);
     }
 
     #[test]
@@ -211,13 +223,20 @@ mod tests {
         assert!(layout.live_minimap);
         assert_eq!(layout.code_fraction, FRACTION_MAX);
         assert_eq!(layout.outline_width, outline::MIN_WIDTH);
+        assert!(layout.outline_visible);
         layout.save();
-        let again = Layout::load(Some(path));
+        let again = Layout::load(Some(path.clone()));
         assert_eq!(again.mode, layout.mode);
         assert_eq!(again.code_minimap, layout.code_minimap);
         assert_eq!(again.live_minimap, layout.live_minimap);
         assert_eq!(again.code_fraction, layout.code_fraction);
         assert_eq!(again.outline_width, layout.outline_width);
+        assert!(again.outline_visible);
+
+        std::fs::write(&path, "split\n1\n1\n0.5\n200\n0\n").unwrap();
+        let hidden = Layout::load(Some(path));
+        assert!(!hidden.outline_visible);
+        assert_eq!(hidden.outline_width, 200.0);
     }
 
     #[test]
@@ -256,10 +275,10 @@ mod tests {
     fn an_outline_drag_starts_from_the_drawn_width() {
         let mut layout = Layout::load(None);
         layout.outline_width = 400.0;
-        let (_, drawn) = outline::column_widths(700.0, Some(240.0), layout.outline_width);
+        let (_, drawn) = outline::column_widths(700.0, Some(240.0), Some(layout.outline_width));
         assert!(drawn < layout.outline_width, "{drawn}");
         layout.drag_outline(drawn, 20.0);
-        let (_, after) = outline::column_widths(700.0, Some(240.0), layout.outline_width);
+        let (_, after) = outline::column_widths(700.0, Some(240.0), Some(layout.outline_width));
         assert!(
             (after - (drawn - 20.0)).abs() < 0.1,
             "drawn {drawn}, after {after}, stored {}",
