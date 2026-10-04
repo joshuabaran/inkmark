@@ -30,13 +30,6 @@ const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd", "txt"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Split,
-    Code,
-    Live,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
     Code,
     Live,
@@ -45,6 +38,7 @@ enum Pane {
 mod config;
 mod findbar;
 mod gotoline;
+mod layout;
 mod links;
 mod measure;
 mod os_theme;
@@ -54,6 +48,7 @@ mod session;
 
 use findbar::FindBar;
 use gotoline::GoToLine;
+pub(crate) use layout::Mode;
 mod sidebar;
 
 const USAGE: &str = "\
@@ -298,6 +293,8 @@ struct App {
     recent_list: Option<usize>,
     browser: FileBrowser,
     sidebar: sidebar::Sidebar,
+    /// Mode, minimaps, the split, and the outline width, restored on open.
+    layout: layout::Layout,
     /// Asks for a name, then creates the file and opens it.
     new_file: Option<NewFilePrompt>,
     /// Asks for a new name for this file or folder.
@@ -352,14 +349,20 @@ impl App {
         let root = match &launch {
             Launch::File { root, .. } | Launch::Folder { root } => root.clone(),
         };
-        let sidebar_store = recent
+        let state_dir = recent
             .store_path()
-            .and_then(|store| store.parent().map(|dir| dir.join("sidebar")));
+            .and_then(|store| store.parent().map(Path::to_path_buf));
+        let sidebar_store = state_dir.as_ref().map(|dir| dir.join("sidebar"));
+        let layout_store = state_dir.as_ref().map(|dir| dir.join("layout"));
+        let layout = layout::Layout::load(layout_store);
+        let mode = layout.mode;
+        let code_minimap = layout.code_minimap;
+        let live_minimap = layout.live_minimap;
         let mut app = Self {
             doc: Document::default(),
             code: CodeView::with_fonts(fonts.clone(), egui::Id::new("code_view")),
             live: LiveView::with_fonts(fonts.clone(), egui::Id::new("live_view")),
-            mode: Mode::Split,
+            mode,
             focus: Pane::Code,
             parse: {
                 let ctx = ctx.clone();
@@ -394,6 +397,7 @@ impl App {
             recent_list: None,
             browser: FileBrowser::new(root),
             sidebar: sidebar::Sidebar::load(sidebar_store),
+            layout,
             new_file: None,
             rename: None,
             trash_confirm: None,
@@ -423,8 +427,16 @@ impl App {
                 }
             }
         }
+        app.code.show_minimap = code_minimap;
+        app.live.show_minimap = live_minimap;
         app.install_keys();
-        app.code.request_focus(ctx);
+        // A live-only window keeps the keyboard on the pane that is showing.
+        if app.mode == Mode::Live {
+            app.focus = Pane::Live;
+            app.live.request_focus(ctx);
+        } else {
+            app.code.request_focus(ctx);
+        }
         app
     }
 
@@ -714,6 +726,7 @@ impl App {
     fn focus_pane(&mut self, ctx: &egui::Context, pane: Pane) {
         let selection = self.selection();
         let parse = self.parse.output();
+        let mode_before = self.mode;
         match pane {
             Pane::Code => {
                 if self.mode == Mode::Live {
@@ -735,6 +748,9 @@ impl App {
             }
         }
         self.focus = pane;
+        if self.mode != mode_before {
+            self.remember_layout();
+        }
     }
 
     /// Split → code → live → split.
@@ -754,6 +770,16 @@ impl App {
                 self.focus_pane(ctx, Pane::Live);
             }
         }
+        self.remember_layout();
+    }
+
+    /// Writes the mode, both minimaps, and the widths. A resize that only
+    /// draws a pane narrower does not call this.
+    fn remember_layout(&mut self) {
+        self.layout.mode = self.mode;
+        self.layout.code_minimap = self.code.show_minimap;
+        self.layout.live_minimap = self.live.show_minimap;
+        self.layout.save();
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -792,6 +818,7 @@ impl App {
                     Pane::Code => self.code.show_minimap ^= true,
                     Pane::Live => self.live.show_minimap ^= true,
                 }
+                self.remember_layout();
             }
             Action::CycleMode => self.cycle_mode(ctx),
             Action::FocusCode => self.focus_pane(ctx, Pane::Code),
@@ -1470,7 +1497,8 @@ impl App {
                 .width
                 .clamp(sidebar::MIN_WIDTH, sidebar::MAX_WIDTH),
         );
-        let (sidebar_w, outline_w) = outline::column_widths(rect.width(), wanted);
+        let (sidebar_w, outline_w) =
+            outline::column_widths(rect.width(), wanted, self.layout.outline_width);
         let mut cursor = rect.left();
         if self.sidebar.visible {
             let left = Rect::from_min_max(rect.min, pos2(cursor + sidebar_w, rect.bottom()));
@@ -1523,6 +1551,21 @@ impl App {
                 pos2(panes_right + gap, rect.bottom()),
             );
             let outline_rect = Rect::from_min_max(pos2(divider.right(), rect.top()), rect.max);
+            let handle_resp =
+                ui.interact(divider, egui::Id::new("outline_split"), egui::Sense::drag());
+            if handle_resp.hovered() || handle_resp.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            if handle_resp.dragged() {
+                // The handle is the outline's left edge. Dragging it right
+                // gives that space to the panes.
+                self.layout.outline_width = (self.layout.outline_width
+                    - handle_resp.drag_delta().x)
+                    .clamp(outline::MIN_WIDTH, outline::MAX_WIDTH);
+            }
+            if handle_resp.drag_stopped() {
+                self.remember_layout();
+            }
             let colors = theme::current(ui.ctx());
             ui.painter().rect_filled(divider, 0.0, colors.background);
             ui.painter().vline(
@@ -1811,15 +1854,37 @@ impl App {
             }
             Mode::Split => {
                 let rect = ui.available_rect_before_wrap();
-                let mid = rect.center().x.round();
-                let left = Rect::from_min_max(rect.min, pos2(mid - 1.0, rect.bottom()));
-                let right = Rect::from_min_max(pos2(mid + 1.0, rect.top()), rect.max);
+                let fraction = self.layout.split_fraction(rect.width());
+                let mid = layout::split_mid(rect.left(), rect.width(), fraction);
+                let half = layout::SPLIT_GAP / 2.0;
+                let left = Rect::from_min_max(rect.min, pos2(mid - half, rect.bottom()));
+                let right = Rect::from_min_max(pos2(mid + half, rect.top()), rect.max);
                 ui.scope_builder(UiBuilder::new().max_rect(left), |ui| {
                     self.code.show(ui, &mut self.doc, Some(&mut self.parse));
                 });
                 ui.scope_builder(UiBuilder::new().max_rect(right), |ui| {
                     self.live.show(ui, &mut self.doc, Some(&mut self.parse));
                 });
+                let hit_half = layout::SPLIT_HIT / 2.0;
+                let hit = Rect::from_min_max(
+                    pos2(mid - hit_half, rect.top()),
+                    pos2(mid + hit_half, rect.bottom()),
+                );
+                let handle = ui.interact(hit, egui::Id::new("pane_split"), egui::Sense::drag());
+                if handle.hovered() || handle.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                if handle.dragged()
+                    && let Some(pos) = handle.interact_pointer_pos()
+                {
+                    // Store the fraction the pointer asks for. split_fraction
+                    // may draw it closer to the middle on a narrow window,
+                    // and that draw is not what gets written.
+                    self.layout.set_split_at(rect.left(), rect.width(), pos.x);
+                }
+                if handle.drag_stopped() {
+                    self.remember_layout();
+                }
                 ui.painter().vline(
                     mid,
                     rect.y_range(),
@@ -2395,6 +2460,162 @@ mod tests {
         );
         assert!(reloaded.sidebar.visible);
         assert_eq!(reloaded.sidebar.width, app.sidebar.width);
+    }
+
+    #[test]
+    fn reopening_restores_panes_and_minimaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("recent");
+        let layout_path = dir.path().join("layout");
+        let ctx = egui::Context::default();
+        let mut app = App::with_recent(&ctx, None, recent::Recent::from_store(Some(store.clone())));
+        let mut time = 0.0;
+        drive(&ctx, &mut app, &mut time, vec![]);
+        assert!(!layout_path.exists(), "a frame wrote the layout");
+        assert!(app.mode == Mode::Split);
+        assert!(app.code.show_minimap && app.live.show_minimap);
+
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::E, egui::Modifiers::COMMAND)],
+        );
+        assert!(app.mode == Mode::Code && app.focus == Pane::Code);
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::M, egui::Modifiers::COMMAND)],
+        );
+        assert!(!app.code.show_minimap);
+        assert!(app.live.show_minimap);
+        let stored = fs::read_to_string(&layout_path).unwrap();
+        assert!(stored.starts_with("code\n0\n1\n"), "{stored}");
+
+        let ctx = egui::Context::default();
+        let mut app = App::with_recent(&ctx, None, recent::Recent::from_store(Some(store.clone())));
+        assert!(app.mode == Mode::Code && app.focus == Pane::Code);
+        assert!(!app.code.show_minimap);
+        assert!(app.live.show_minimap);
+
+        // Ctrl+2 leaves code-only and shows the live pane.
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Num2, egui::Modifiers::COMMAND)],
+        );
+        assert!(app.mode == Mode::Live && app.focus == Pane::Live);
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::M, egui::Modifiers::COMMAND)],
+        );
+        assert!(!app.code.show_minimap && !app.live.show_minimap);
+
+        let ctx = egui::Context::default();
+        let app = App::with_recent(&ctx, None, recent::Recent::from_store(Some(store)));
+        assert!(app.mode == Mode::Live && app.focus == Pane::Live);
+        assert!(!app.code.show_minimap && !app.live.show_minimap);
+    }
+
+    #[test]
+    fn reopening_restores_the_split_and_the_outline() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout_path = dir.path().join("layout");
+        let ctx = egui::Context::default();
+        let mut app = App::with_recent(
+            &ctx,
+            None,
+            recent::Recent::from_store(Some(dir.path().join("recent"))),
+        );
+        let mut time = 0.0;
+        // The divider has to be drawn once before a press can grab it.
+        drive(&ctx, &mut app, &mut time, vec![]);
+        let panes_left = app.sidebar.width + outline::GAP;
+        let panes_right = 1000.0 - outline::PREFERRED_WIDTH - outline::GAP;
+        let width = panes_right - panes_left;
+        let mid = layout::split_mid(panes_left, width, app.layout.split_fraction(width));
+        let start = egui::pos2(mid, 80.0);
+        let end = egui::pos2(mid + 80.0, 80.0);
+        let down = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![egui::Event::PointerMoved(start), down(start, true)],
+        );
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![egui::Event::PointerMoved(end)],
+        );
+        assert!(
+            app.layout.code_fraction > 0.5,
+            "split stayed {}",
+            app.layout.code_fraction
+        );
+        assert!(
+            !layout_path.exists(),
+            "the split was written during the drag"
+        );
+        drive(&ctx, &mut app, &mut time, vec![down(end, false)]);
+        let fraction = app.layout.code_fraction;
+        let after_split = fs::read_to_string(&layout_path).unwrap();
+        assert!(after_split.starts_with("split\n1\n1\n"), "{after_split}");
+
+        let outline_x = panes_right + outline::GAP / 2.0;
+        let outline_start = egui::pos2(outline_x, 80.0);
+        let outline_end = egui::pos2(outline_x + 40.0, 80.0);
+        // Arrive at the handle before the press, so the jump from the split
+        // is not part of this drag.
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![egui::Event::PointerMoved(outline_start)],
+        );
+        drive(&ctx, &mut app, &mut time, vec![down(outline_start, true)]);
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![egui::Event::PointerMoved(outline_end)],
+        );
+        assert!(
+            app.layout.outline_width < outline::PREFERRED_WIDTH,
+            "outline grew to {}",
+            app.layout.outline_width
+        );
+        let during = fs::read_to_string(&layout_path).unwrap();
+        assert_eq!(
+            during, after_split,
+            "the outline was written during the drag"
+        );
+        drive(&ctx, &mut app, &mut time, vec![down(outline_end, false)]);
+        let outline_width = app.layout.outline_width;
+        assert!(outline_width > outline::MIN_WIDTH, "{outline_width}");
+        let (_, drawn) = outline::column_widths(1000.0, Some(app.sidebar.width), outline_width);
+        assert_eq!(drawn, outline_width);
+
+        let ctx = egui::Context::default();
+        let reloaded = App::with_recent(
+            &ctx,
+            None,
+            recent::Recent::from_store(Some(dir.path().join("recent"))),
+        );
+        assert_eq!(reloaded.layout.code_fraction, fraction);
+        assert_eq!(reloaded.layout.outline_width, outline_width);
+        assert!(reloaded.mode == Mode::Split);
+        assert!(reloaded.code.show_minimap && reloaded.live.show_minimap);
     }
 
     #[test]
@@ -3146,7 +3367,7 @@ mod tests {
             out.platform_output.cursor_icon
         };
         let y = 30.0;
-        let (_, outline_w) = outline::column_widths(1000.0, None);
+        let (_, outline_w) = outline::column_widths(1000.0, None, outline::PREFERRED_WIDTH);
         let panes_right = 1000.0 - outline_w - outline::GAP;
         let live_left = (panes_right / 2.0) as i32 + 16;
         let live_right = panes_right as i32 - 8;
@@ -4038,9 +4259,24 @@ mod tests {
 
     #[test]
     fn outline_keeps_its_width_beside_the_sidebar() {
-        assert_eq!(outline::column_widths(1000.0, Some(240.0)), (240.0, 200.0));
-        assert_eq!(outline::column_widths(1000.0, None), (0.0, 200.0));
-        assert_eq!(outline::column_widths(400.0, Some(240.0)), (160.0, 120.0));
+        assert_eq!(
+            outline::column_widths(1000.0, Some(240.0), 200.0),
+            (240.0, 200.0)
+        );
+        assert_eq!(outline::column_widths(1000.0, None, 200.0), (0.0, 200.0));
+        assert_eq!(
+            outline::column_widths(400.0, Some(240.0), 200.0),
+            (160.0, 120.0)
+        );
+        assert_eq!(
+            outline::column_widths(1000.0, Some(240.0), 360.0),
+            (240.0, 360.0)
+        );
+        // A wide preference still gives the panes their reserve on a narrow window.
+        assert_eq!(
+            outline::column_widths(400.0, Some(240.0), 360.0),
+            (160.0, 120.0)
+        );
     }
 
     #[test]

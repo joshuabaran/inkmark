@@ -32,6 +32,8 @@ impl Outline {
 pub const PREFERRED_WIDTH: f32 = 200.0;
 /// Narrowest the outline gets before the panes give up more room.
 pub const MIN_WIDTH: f32 = 120.0;
+/// Widest the outline keeps. A wider drag stops here.
+pub const MAX_WIDTH: f32 = 480.0;
 /// Gap between the outline and the panes, and between the sidebar and the panes.
 pub const GAP: f32 = 4.0;
 
@@ -41,10 +43,17 @@ const INDENT: f32 = 12.0;
 
 /// Sidebar width (0 when the sidebar is hidden) and outline width for a
 /// window `total` pixels wide. `sidebar_wanted` is already clamped to the
-/// sidebar's own min and max. The panes keep about 240px while the outline
-/// can shrink from 200 to 120, then the sidebar shrinks toward its minimum.
-pub(crate) fn column_widths(total: f32, sidebar_wanted: Option<f32>) -> (f32, f32) {
-    let mut outline = PREFERRED_WIDTH;
+/// sidebar's own min and max. `outline_wanted` is the width the user set,
+/// clamped here to 120–480. The panes keep about 240px while the outline
+/// can shrink toward 120, then the sidebar shrinks toward its minimum.
+/// The returned outline can be narrower than `outline_wanted`; the caller
+/// keeps the wanted width and writes it only when the user drags.
+pub(crate) fn column_widths(
+    total: f32,
+    sidebar_wanted: Option<f32>,
+    outline_wanted: f32,
+) -> (f32, f32) {
+    let mut outline = outline_wanted.clamp(MIN_WIDTH, MAX_WIDTH);
     let mut sidebar = sidebar_wanted.unwrap_or(0.0);
     let gaps = GAP + if sidebar_wanted.is_some() { GAP } else { 0.0 };
     let panes_room = total - sidebar - outline - gaps;
