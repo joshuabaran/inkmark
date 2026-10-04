@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{
-    Event, FullOutput, Id, Key, Modifiers, OutputCommand, PointerButton, Pos2, RawInput, Rect, pos2,
+    Event, FullOutput, Id, Key, Modifiers, MouseWheelUnit, OutputCommand, PointerButton, Pos2,
+    RawInput, Rect, TouchPhase, pos2, vec2,
 };
-use inkmark_buffer::{Document, Selection};
+use inkmark_buffer::{Document, Edit, EditKind, Selection};
 use inkmark_parse::{ParseState, PulldownParser};
 use inkmark_view::{LiveView, ScrollPos};
 
@@ -18,10 +19,15 @@ struct Harness {
     doc: Document,
     parse: ParseState,
     time: f64,
+    screen: Rect,
 }
 
 impl Harness {
     fn new(text: &str) -> Self {
+        Self::open(text, SCREEN)
+    }
+
+    fn open(text: &str, screen: Rect) -> Self {
         let ctx = egui::Context::default();
         let doc = Document::from_text(text);
         let parse = ParseState::new(Arc::new(PulldownParser), &doc, || {});
@@ -31,6 +37,7 @@ impl Harness {
             doc,
             parse,
             time: 0.0,
+            screen,
         };
         h.view.request_focus(&h.ctx);
         while !h.parse.is_settled() {
@@ -45,7 +52,7 @@ impl Harness {
     fn frame(&mut self, events: Vec<Event>) -> FullOutput {
         self.time += 1.0 / 60.0;
         let input = RawInput {
-            screen_rect: Some(SCREEN),
+            screen_rect: Some(self.screen),
             time: Some(self.time),
             events,
             ..Default::default()
@@ -247,6 +254,7 @@ fn image_paragraphs_show_the_loaded_image() {
         doc,
         parse,
         time: 0.0,
+        screen: SCREEN,
     };
     // Caret on "Intro", so the image paragraph shows only the image.
     h.view.request_focus(&h.ctx);
@@ -290,4 +298,158 @@ fn live_minimap_click_jumps() {
     let parse = h.parse.output().clone();
     let line = h.view.scroll_pos(&h.doc, &parse).line;
     assert!(line > 100, "jumped to line {line}");
+}
+
+#[test]
+fn live_minimap_drag_tracks() {
+    let para = "A paragraph of prose that wraps over a couple of rows in the live view.\n\n";
+    let mut h = Harness::new(&format!("# Start\n\n{}", para.repeat(3000)));
+    let x = 800.0 - 10.0 - inkmark_minimap::WIDTH / 2.0;
+    let button = |y: f32, pressed| Event::PointerButton {
+        pos: pos2(x, y),
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    // A press near the top jumps a short way. Later moves, with the button
+    // still down, have to keep scrolling. The minimap is outside the text.
+    h.frame(vec![
+        Event::PointerMoved(pos2(x, 120.0)),
+        button(120.0, true),
+    ]);
+    let parse = h.parse.output().clone();
+    let pressed_at = h.view.scroll_pos(&h.doc, &parse).line;
+    for y in [240.0, 400.0, 590.0] {
+        h.frame(vec![Event::PointerMoved(pos2(x, y))]);
+    }
+    let dragged = h.view.scroll_pos(&h.doc, &parse).line;
+    assert!(
+        dragged > pressed_at + 50,
+        "press landed on {pressed_at}, drag stayed at {dragged}"
+    );
+}
+
+/// A click in the text column, past the end of the first visual row.
+fn first_row_end(screen: Rect) -> usize {
+    let src = "word ".repeat(100);
+    let mut h = Harness::open(&src, screen);
+    let x = screen.right() - 10.0 - inkmark_minimap::WIDTH - 8.0;
+    h.click(pos2(x, 8.0));
+    h.head()
+}
+
+#[test]
+fn the_live_pane_wraps_near_seventy_five_characters() {
+    let wide = first_row_end(Rect::from_min_max(Pos2::ZERO, pos2(1800.0, 900.0)));
+    let medium = first_row_end(Rect::from_min_max(Pos2::ZERO, pos2(1000.0, 700.0)));
+    let narrow = first_row_end(Rect::from_min_max(Pos2::ZERO, pos2(480.0, 600.0)));
+    assert!(
+        (40..=110).contains(&wide) && (40..=110).contains(&medium),
+        "wide {wide}, medium {medium}"
+    );
+    assert!(
+        wide.abs_diff(medium) <= 15,
+        "wide {wide} and medium {medium} diverged"
+    );
+    assert!(
+        narrow + 20 <= wide.min(medium),
+        "narrow {narrow}, wide {wide}, medium {medium}"
+    );
+}
+
+#[test]
+fn an_edit_inside_a_block_replaces_its_height() {
+    let block = "\
+The first line of the paragraph stays measured above the viewport.
+The second line belongs to that same paragraph.
+The third line is where the edit lands.
+";
+    let src = format!("{block}\n{}", "Hello.\n\n".repeat(200));
+    let mut h = Harness::new(&src);
+    let parse = h.parse.output().clone();
+    h.view.set_scroll_pos(
+        &h.doc,
+        &parse,
+        ScrollPos {
+            line: 60,
+            frac: 0.0,
+        },
+    );
+    h.frame(vec![]);
+    let parse = h.parse.output().clone();
+    let scrolled = h.view.scroll_pos(&h.doc, &parse).line;
+    assert!(scrolled > 20, "scrolled to line {scrolled}");
+    assert!(h.view.line_measured(0), "the paragraph was measured");
+    assert_eq!(
+        h.view.measured_height(1),
+        0.0,
+        "the block's height sits on its first line"
+    );
+    let before = h.view.measured_height(0);
+
+    let at = src.find("edit lands").unwrap();
+    let sel = h.view.selection();
+    h.doc
+        .apply(
+            vec![Edit::insert(at, "XX")],
+            sel,
+            Selection::caret(at + 2),
+            EditKind::Typing,
+        )
+        .unwrap();
+    h.frame(vec![]);
+    let parse = h.parse.output().clone();
+    let still = h.view.scroll_pos(&h.doc, &parse).line;
+    assert!(still > 20, "the edit pulled the view to line {still}");
+    let after = h.view.measured_height(0);
+    let edited = format!("{}XX{}", &block[..at], &block[at..]);
+    let fresh = Harness::new(&edited);
+    let expected = fresh.view.measured_height(0);
+    assert!(
+        (after - expected).abs() < 1.0,
+        "stored {after}, one layout {expected}, before the edit {before}"
+    );
+}
+
+#[test]
+fn blocks_below_the_viewport_stay_estimated() {
+    let src = "Hello.\n\n".repeat(500);
+    let h = Harness::new(&src);
+    assert!(h.view.line_measured(0), "the first line is on screen");
+    assert!(
+        !h.view.line_measured(400),
+        "a block below the viewport stays estimated"
+    );
+}
+
+#[test]
+fn a_wheel_holds_its_place_on_the_next_frame() {
+    let para = "A paragraph of prose that wraps over a few rows in the live view, \
+                with *some emphasis* and a [link](http://x) to make it realistic.\n\n";
+    let mut h = Harness::new(&para.repeat(400));
+    let mut events = vec![Event::PointerMoved(pos2(80.0, 80.0))];
+    for _ in 0..40 {
+        events.push(Event::MouseWheel {
+            unit: MouseWheelUnit::Point,
+            delta: vec2(0.0, -7.0),
+            phase: TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        });
+    }
+    h.frame(events);
+    let parse = h.parse.output().clone();
+    let after = h.view.scroll_pos(&h.doc, &parse);
+    h.frame(vec![]);
+    let settled = h.view.scroll_pos(&h.doc, &parse);
+    assert_eq!(after.line, settled.line, "wheel {after:?} then {settled:?}");
+    assert!(
+        (after.frac - settled.frac).abs() < 0.02,
+        "wheel {after:?} then {settled:?}"
+    );
+    assert!(after.line > 0, "the wheel moved down to {after:?}");
+    let below = (after.line + 80).min(h.doc.line_count().saturating_sub(1));
+    assert!(
+        below > after.line && !h.view.line_measured(below),
+        "line {below} is below the viewport and stays estimated"
+    );
 }

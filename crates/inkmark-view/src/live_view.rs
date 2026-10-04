@@ -20,7 +20,7 @@ use inkmark_text::{
 use crate::commands::{self, EditPlan, EnterContext};
 use crate::images::{ImageCache, ImageSlot};
 use crate::keys::{self, Action};
-use crate::lines::{LineIndex, SCROLLBAR_WIDTH, ScrollPos, Synced};
+use crate::lines::{self, LineIndex, SCROLLBAR_WIDTH, ScrollPos, Synced};
 use crate::live_layout::{self, LeafLayout, LeafStyle, Reveal};
 use crate::motion;
 use crate::tables;
@@ -45,6 +45,10 @@ const MIN_COLUMN: f32 = 48.0;
 const REVEAL_FRAMES: u8 = 3;
 /// Height of a blank source line, in rows.
 const BLANK_LINE: f32 = 0.6;
+/// Live-pane measure, in characters of the live font (the middle of 70–80).
+const READING_CHARS: f32 = 75.0;
+/// Narrowest that measure gets. A narrower pane wraps at the pane's width.
+const READING_FLOOR: f32 = 40.0;
 
 /// Laid-out text: a leaf's (or a table cell's) display segments.
 struct Body {
@@ -270,6 +274,9 @@ pub struct LiveView {
     selection_current: bool,
     /// A scroll position set from outside, applied after the next sync.
     pending_scroll: Option<ScrollPos>,
+    /// Lines `[0, measured_prefix)` have a real height. An edit or a layout
+    /// change drops this to the first line that has to be measured again.
+    measured_prefix: usize,
     /// Task checkboxes drawn last frame: hit area, source offset of the
     /// `[ ]` marker, checked.
     checkboxes: Vec<(Rect, usize, bool)>,
@@ -308,6 +315,7 @@ impl LiveView {
             hit_upstream: false,
             selection_current: false,
             pending_scroll: None,
+            measured_prefix: 0,
             checkboxes: Vec::new(),
             images: None,
             font_size: 16.0,
@@ -344,6 +352,11 @@ impl LiveView {
         }
     }
 
+    /// Whether `line` has a laid-out height rather than an estimate.
+    pub fn line_measured(&self, line: usize) -> bool {
+        line < self.lines.heights.len() && self.lines.heights.is_measured(line)
+    }
+
     pub fn set_selection(&mut self, selection: Selection) {
         self.selection = selection;
         self.selection_current = true;
@@ -359,6 +372,7 @@ impl LiveView {
 
     pub fn reset(&mut self) {
         self.lines.reset();
+        self.measured_prefix = 0;
         self.selection = Selection::default();
         self.preferred_x = None;
     }
@@ -445,10 +459,7 @@ impl LiveView {
         // Lay the block out first, so the position inside it uses its real
         // height rather than estimates that drawing would then collapse.
         let p = self.place(doc, parse, leaf, width);
-        self.lines.heights.set_measured(p.first_line, p.height);
-        for l in p.first_line + 1..=p.last_line {
-            self.lines.heights.set_measured(l, 0.0);
-        }
+        self.record_block(p.first_line, p.first_line, p.last_line, p.height);
         let progress =
             ((pos.line - p.first_line) as f32 + pos.frac) / (p.last_line - p.first_line + 1) as f32;
         self.lines.anchor = ScrollAnchor {
@@ -466,22 +477,12 @@ impl LiveView {
         self.theme = theme::current(ui.ctx());
         let rect = ui.available_rect_before_wrap();
         ui.advance_cursor_after_rect(rect);
-        let bar = Rect::from_min_max(pos2(rect.right() - SCROLLBAR_WIDTH, rect.top()), rect.max);
-        let text_right = if self.show_minimap {
-            bar.left() - inkmark_minimap::WIDTH
-        } else {
-            bar.left()
-        };
-        let minimap = self.show_minimap.then(|| {
-            Rect::from_min_max(
-                pos2(text_right, rect.top()),
-                pos2(bar.left(), rect.bottom()),
-            )
-        });
-        let frame = Frame {
+        let (bar, text_right, minimap) = self.pane_bounds(rect);
+        let available = (text_right - rect.left() - 2.0 * PADDING).max(80.0);
+        let mut frame = Frame {
             rect,
             left: rect.left() + PADDING,
-            width: (text_right - rect.left() - 2.0 * PADDING).max(80.0),
+            width: available,
         };
         let text_rect = Rect::from_min_max(rect.min, pos2(text_right, rect.bottom()));
         let response = ui.interact(text_rect, self.id, Sense::click_and_drag());
@@ -504,15 +505,32 @@ impl LiveView {
         });
         self.focused = response.has_focus();
 
-        let config = TextConfig {
+        let ppp = ui.ctx().pixels_per_point();
+        let config_for = |width: f32| TextConfig {
             monospace: false,
             font_size: self.font_size,
             line_height: self.line_height,
-            wrap_width: Some(frame.width),
+            wrap_width: Some(width),
         };
-        if self.text.begin_frame(config, ui.ctx().pixels_per_point()) {
+        // The advance is 0 until the first frame and does not depend on the
+        // wrap, so a frame that already knows it starts at the capped width.
+        // Starting from the pane width every frame would invalidate the
+        // cache on the way back from last frame's cap.
+        let mut width = available;
+        if self.text.avg_advance() > 0.0 {
+            width = self.reading_width(available);
+        }
+        if self.text.begin_frame(config_for(width), ppp) {
             self.lines.invalidate();
         }
+        let reading = self.reading_width(available);
+        if (reading - width).abs() > 0.5 {
+            width = reading;
+            if self.text.begin_frame(config_for(width), ppp) {
+                self.lines.invalidate();
+            }
+        }
+        frame.width = width;
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, self.theme.background);
         if self.images.is_none() {
@@ -587,20 +605,13 @@ impl LiveView {
         }
         self.repad_left_table(doc, state);
         let parse = state.output();
-        let mut minimap_hovered = false;
-        if let Some(r) = minimap {
-            let (scrolled, hovered) = self.lines.minimap_input(ui, self.id, r, rect.height());
-            self.scrolled |= scrolled;
-            minimap_hovered = hovered;
-        }
-        if self
-            .lines
-            .scroll_input(ui, self.id, response.hovered() || minimap_hovered, bar)
-        {
+        let viewport = rect.height();
+        if self.reading_scroll(ui, doc, parse, &response, frame) {
             self.scrolled = true;
         }
-        if self.reveal_caret > 0 {
-            self.scroll_caret_into_view(ui, doc, parse, frame);
+        if self.reveal_caret > 0 && self.scroll_caret_into_view(ui, doc, parse, frame) {
+            self.scrolled = true;
+            self.settle(doc, parse, frame.width, viewport, 0.0);
         }
         let caret = self.paint(&painter, doc, parse, frame);
         self.lines.paint_scrollbar(&painter, bar, &self.theme);
@@ -631,16 +642,357 @@ impl LiveView {
         let text = &self.text;
         // A selection set from outside is already in current offsets.
         let map_selection = map_selection && !std::mem::take(&mut self.selection_current);
-        if let Synced::Changed(changes) = self.lines.sync(doc, |chars| text.estimate_height(chars))
-            && map_selection
-        {
-            for c in &changes {
-                self.selection.anchor = c.map(self.selection.anchor, Bias::Left);
-                self.selection.head = c.map(self.selection.head, Bias::Left);
+        match self.lines.sync(doc, |chars| text.estimate_height(chars)) {
+            Synced::Rebuilt => self.measured_prefix = 0,
+            Synced::Changed(changes) => {
+                // A rebuild that still had edits to map clears every
+                // measurement and reports Changed. A splice leaves the
+                // lines above the edit measured.
+                if self.lines.heights.measured_count() == 0 {
+                    self.measured_prefix = 0;
+                } else if let Some(start) = changes.iter().map(|c| c.lines.start).min() {
+                    self.measured_prefix = self.measured_prefix.min(start);
+                }
+                if map_selection {
+                    for c in &changes {
+                        self.selection.anchor = c.map(self.selection.anchor, Bias::Left);
+                        self.selection.head = c.map(self.selection.head, Bias::Left);
+                    }
+                }
             }
+            Synced::Unchanged => {}
         }
         self.selection.anchor = self.selection.anchor.min(doc.len());
         self.selection.head = self.selection.head.min(doc.len());
+    }
+
+    /// The live wrap: about 75 characters, and the pane's width when that
+    /// is narrower. `available` is the content column in points.
+    fn reading_width(&self, available: f32) -> f32 {
+        let measure = READING_CHARS * self.text.avg_advance();
+        available.min(measure).max(READING_FLOOR).min(available)
+    }
+
+    /// `lines [0, measured_prefix)` stay measured. `to` is the first line
+    /// after a block that was just measured from `from`.
+    fn advance_prefix(&mut self, from: usize, to: usize) {
+        if from <= self.measured_prefix && to > self.measured_prefix {
+            self.measured_prefix = to;
+        }
+    }
+
+    /// Height of one source line that is not part of a leaf, matching paint.
+    fn raw_line_height(&mut self, text: &str) -> f32 {
+        let blank = text
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '>')
+            .is_empty();
+        if blank {
+            self.text.row_height() * BLANK_LINE
+        } else {
+            self.text.line_height(text)
+        }
+    }
+
+    /// Records a leaf the way paint does: the whole height on the first
+    /// line, and the rest of its lines at zero. A second leaf that starts
+    /// on `walked`'s line stacks under the height already stored there.
+    fn record_block(&mut self, walked: usize, first: usize, last: usize, height: f32) {
+        let len = self.lines.heights.len();
+        if first >= len {
+            return;
+        }
+        if first < walked {
+            let prev = self.lines.heights.height(first);
+            self.lines.heights.set_measured(first, prev + height);
+        } else {
+            self.lines.heights.set_measured(first, height);
+        }
+        for l in first + 1..=last {
+            if l < len {
+                self.lines.heights.set_measured(l, 0.0);
+            }
+        }
+    }
+
+    /// Lays out the block on `line` and stores its height. Returns the
+    /// first line after that block.
+    fn store_block(
+        &mut self,
+        doc: &Document,
+        parse: &ParseOutput,
+        line: usize,
+        width: f32,
+    ) -> usize {
+        if line >= self.lines.heights.len() {
+            return line;
+        }
+        let Some(leaf) = leaf_at_line(doc, parse, line) else {
+            let text = doc.slice(doc.line_range(line));
+            let height = self.raw_line_height(&text);
+            self.lines.heights.set_measured(line, height);
+            return line + 1;
+        };
+        let placed = self.place(doc, parse, leaf, width);
+        // `line` can sit in the middle of the leaf after an edit. The height
+        // lives on the first line, so record from there and replace what was
+        // stored. Paint stacks a second leaf on that line by walking past it.
+        self.record_block(
+            placed.first_line,
+            placed.first_line,
+            placed.last_line,
+            placed.height,
+        );
+        placed.last_line.max(line) + 1
+    }
+
+    /// If the anchor sits in a block that is still estimated, remember how
+    /// far through that estimate it was, measure the block, and park on the
+    /// first line at the same fraction of the real height.
+    fn collapse_anchor_block(&mut self, doc: &Document, parse: &ParseOutput, width: f32) {
+        let line = self.lines.anchor.line;
+        if line >= self.lines.heights.len() {
+            return;
+        }
+        if let Some((first, last)) = leaf_lines(doc, parse, line) {
+            if self.lines.heights.is_measured(first) {
+                return;
+            }
+            let top = self.lines.heights.offset_of(first);
+            let bottom = self
+                .lines
+                .heights
+                .offset_of((last + 1).min(self.lines.heights.len()));
+            let span = (bottom - top).max(1e-3);
+            let y = self.lines.heights.anchor_y(self.lines.anchor);
+            let progress = ((y - top) / span).clamp(0.0, 1.0);
+            let next = self.store_block(doc, parse, first, width);
+            self.advance_prefix(first, next);
+            let real = self.lines.heights.height(first);
+            self.lines.anchor = ScrollAnchor {
+                line: first,
+                offset: (progress as f32) * real,
+            };
+            return;
+        }
+        if self.lines.heights.is_measured(line) {
+            return;
+        }
+        let old = self.lines.heights.height(line).max(0.001);
+        let frac = (self.lines.anchor.offset / old).clamp(0.0, 1.0);
+        let text = doc.slice(doc.line_range(line));
+        let height = self.raw_line_height(&text);
+        self.lines.heights.set_measured(line, height);
+        self.advance_prefix(line, line + 1);
+        self.lines.anchor.offset = frac * height;
+    }
+
+    /// Measures every unmeasured block from the prefix through `extra`
+    /// points past the bottom of the viewport. Blocks already measured are
+    /// left as they are. A block that starts inside the limit is measured
+    /// whole, including the part that hangs below it.
+    fn measure_down(
+        &mut self,
+        doc: &Document,
+        parse: &ParseOutput,
+        width: f32,
+        viewport: f32,
+        extra: f64,
+    ) {
+        let count = doc.line_count().min(self.lines.heights.len());
+        let mut line = self.measured_prefix.min(count);
+        let mut steps = 0;
+        while line < count && steps <= count {
+            steps += 1;
+            let limit =
+                self.lines.heights.anchor_y(self.lines.anchor) + f64::from(viewport) + extra;
+            if line > self.lines.anchor.line && self.lines.heights.offset_of(line) >= limit {
+                break;
+            }
+            if self.lines.heights.is_measured(line) {
+                self.advance_prefix(line, line + 1);
+                line += 1;
+                continue;
+            }
+            let next = self.store_block(doc, parse, line, width);
+            self.advance_prefix(line, next);
+            if next <= line {
+                break;
+            }
+            line = next;
+        }
+    }
+
+    /// Lays the visible blocks out again so a caret reveal matches paint.
+    fn remeasure_visible(
+        &mut self,
+        doc: &Document,
+        parse: &ParseOutput,
+        width: f32,
+        viewport: f32,
+    ) {
+        let count = doc.line_count().min(self.lines.heights.len());
+        if count == 0 {
+            return;
+        }
+        let mut line = self.lines.anchor.line.min(count - 1);
+        if let Some((first, _)) = leaf_lines(doc, parse, line) {
+            line = first;
+        }
+        let mut steps = 0;
+        while line < count && steps <= count {
+            steps += 1;
+            let limit = self.lines.heights.anchor_y(self.lines.anchor) + f64::from(viewport);
+            if line > self.lines.anchor.line && self.lines.heights.offset_of(line) >= limit {
+                break;
+            }
+            let next = self.store_block(doc, parse, line, width);
+            self.advance_prefix(line, next);
+            if next <= line {
+                break;
+            }
+            line = next;
+        }
+    }
+
+    /// Measures through the viewport, then snaps the anchor the way paint
+    /// does, so paint's own measurement does not move the view.
+    fn settle(
+        &mut self,
+        doc: &Document,
+        parse: &ParseOutput,
+        width: f32,
+        viewport: f32,
+        extra: f64,
+    ) {
+        if self.lines.heights.is_empty() {
+            return;
+        }
+        self.collapse_anchor_block(doc, parse, width);
+        self.measure_down(doc, parse, width, viewport, extra);
+        self.remeasure_visible(doc, parse, width, viewport);
+        let y = self.lines.heights.anchor_y(self.lines.anchor);
+        self.lines.anchor = self.lines.heights.line_at(y);
+        let line = self.lines.anchor.line;
+        if line < self.lines.heights.len() && !self.lines.heights.is_measured(line) {
+            self.store_block(doc, parse, line, width);
+            self.remeasure_visible(doc, parse, width, viewport);
+            let y = self.lines.heights.anchor_y(self.lines.anchor);
+            self.lines.anchor = self.lines.heights.line_at(y);
+        }
+    }
+
+    /// Measures from the prefix through source `line`, so a caret above or
+    /// below the viewport has a real height before the view moves to it.
+    fn measure_through_line(
+        &mut self,
+        doc: &Document,
+        parse: &ParseOutput,
+        line: usize,
+        width: f32,
+    ) {
+        let count = doc.line_count().min(self.lines.heights.len());
+        let goal = line.min(count.saturating_sub(1));
+        let mut at = self.measured_prefix.min(count);
+        let mut steps = 0;
+        while at < count && at <= goal && steps <= count {
+            steps += 1;
+            if self.lines.heights.is_measured(at) {
+                self.advance_prefix(at, at + 1);
+                at += 1;
+                continue;
+            }
+            let next = self.store_block(doc, parse, at, width);
+            self.advance_prefix(at, next);
+            if next <= at {
+                break;
+            }
+            at = next;
+        }
+    }
+
+    /// Scrollbar, the text column's right edge, and the minimap rect.
+    fn pane_bounds(&self, rect: Rect) -> (Rect, f32, Option<Rect>) {
+        let bar = Rect::from_min_max(pos2(rect.right() - SCROLLBAR_WIDTH, rect.top()), rect.max);
+        let text_right = if self.show_minimap {
+            bar.left() - inkmark_minimap::WIDTH
+        } else {
+            bar.left()
+        };
+        let minimap = self.show_minimap.then(|| {
+            Rect::from_min_max(
+                pos2(text_right, rect.top()),
+                pos2(bar.left(), rect.bottom()),
+            )
+        });
+        (bar, text_right, minimap)
+    }
+
+    /// Wheel, scrollbar, and minimap for the live pane. A wheel measures the
+    /// lines it is about to reveal, and every path measures the viewport
+    /// again before paint.
+    fn reading_scroll(
+        &mut self,
+        ui: &Ui,
+        doc: &Document,
+        parse: &ParseOutput,
+        response: &Response,
+        frame: Frame,
+    ) -> bool {
+        let (bar, _, minimap) = self.pane_bounds(frame.rect);
+        let viewport = frame.rect.height();
+        let width = frame.width;
+        let hovered = response.hovered();
+        let mut scrolled = false;
+        let mut minimap_hovered = false;
+        if let Some(rect) = minimap {
+            let hit = ui.interact(rect, self.id.with("minimap"), Sense::click_and_drag());
+            lines::keep_focus(ui, self.id, &hit);
+            minimap_hovered = hit.hovered();
+            let pressed =
+                hit.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed());
+            let map = self.lines.minimap(rect, viewport);
+            // The minimap sits outside the text area, so the drag is `hit`'s.
+            let target = match hit.interact_pointer_pos() {
+                Some(p) if pressed => Some(map.jump_target(p.y)),
+                Some(p) if hit.dragged() => Some(map.drag_target(p.y)),
+                _ => None,
+            };
+            if let Some(top) = target {
+                self.lines.anchor = self.lines.heights.line_at(top);
+                self.lines.anchor = self
+                    .lines
+                    .heights
+                    .scroll_by(self.lines.anchor, 0.0, viewport);
+                scrolled = true;
+            }
+        }
+        let bar_response = ui.interact(bar, self.id.with("scrollbar"), Sense::click_and_drag());
+        lines::keep_focus(ui, self.id, &bar_response);
+        if (bar_response.dragged() || bar_response.clicked())
+            && let Some(pos) = bar_response.interact_pointer_pos()
+        {
+            let frac = ((pos.y - bar.top()) / bar.height()).clamp(0.0, 1.0);
+            let target = f64::from(frac) * self.lines.heights.total() - f64::from(viewport) / 2.0;
+            self.lines.anchor = self.lines.heights.line_at(target.max(0.0));
+            self.lines.anchor = self
+                .lines
+                .heights
+                .scroll_by(self.lines.anchor, 0.0, viewport);
+            scrolled = true;
+        }
+        let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+        if (hovered || bar_response.hovered() || minimap_hovered) && wheel != 0.0 {
+            let delta = -wheel;
+            let extra = f64::from(delta.max(0.0));
+            self.settle(doc, parse, width, viewport, extra);
+            self.lines.anchor = self
+                .lines
+                .heights
+                .scroll_by(self.lines.anchor, delta, viewport);
+            scrolled = true;
+        }
+        self.settle(doc, parse, width, viewport, 0.0);
+        scrolled
     }
 
     /// What raw syntax to show: around the caret, while focused.
@@ -1761,30 +2113,38 @@ impl LiveView {
         }
     }
 
+    /// Scrolls the caret on screen. Returns whether the anchor moved; the
+    /// caller measures that new viewport before paint.
     fn scroll_caret_into_view(
         &mut self,
         ui: &Ui,
         doc: &Document,
         parse: &ParseOutput,
         frame: Frame,
-    ) {
+    ) -> bool {
         self.reveal_caret -= 1;
+        let caret_line = doc.byte_to_line(self.selection.head.min(doc.len()));
+        self.measure_through_line(doc, parse, caret_line, frame.width);
         let (top, _, height) = self.caret_doc(doc, parse, frame);
         let bottom = top + f64::from(height);
         let viewport = f64::from(frame.rect.height());
         let view_top = self.lines.heights.anchor_y(self.lines.anchor);
-        if top < view_top {
-            self.lines.anchor = self.lines.heights.line_at(top);
+        let new_top = if top < view_top {
+            Some(top)
         } else if bottom > view_top + viewport {
-            self.lines.anchor = self.lines.heights.line_at(bottom - viewport);
+            Some((bottom - viewport).max(0.0))
         } else {
+            None
+        };
+        let Some(new_top) = new_top else {
             self.reveal_caret = 0;
-            return;
-        }
-        self.scrolled = true;
+            return false;
+        };
+        self.lines.anchor = self.lines.heights.line_at(new_top);
         if self.reveal_caret > 0 {
             ui.ctx().request_repaint();
         }
+        true
     }
 
     // ---- painting ----------------------------------------------------------------
@@ -1823,15 +2183,14 @@ impl LiveView {
             if next_first.is_none_or(|f| f > line) {
                 // A line outside any leaf: blank, or raw (e.g. a link definition).
                 let text = doc.slice(doc.line_range(line));
-                let raw = text.trim_start_matches(|c: char| c.is_whitespace() || c == '>');
-                let height = if raw.is_empty() {
-                    row * BLANK_LINE
-                } else {
-                    let h = self.text.line_height(&text);
+                let height = self.raw_line_height(&text);
+                let blank = text
+                    .trim_start_matches(|c: char| c.is_whitespace() || c == '>')
+                    .is_empty();
+                if !blank {
                     self.text
                         .draw_line(&mut meshes, &text, pos2(frame.left, y), self.theme.markup);
-                    h
-                };
+                }
                 self.lines.heights.set_measured(line, height);
                 if line == caret_line {
                     caret = Some(Rect::from_min_size(
@@ -1845,18 +2204,8 @@ impl LiveView {
             }
             let leaf = leaves.next().expect("peeked");
             let p = self.place(doc, parse, leaf, frame.width);
-            if p.first_line < line {
-                // Shares a line with the previous leaf: stack below it.
-                let prev = self.lines.heights.height(p.first_line);
-                self.lines
-                    .heights
-                    .set_measured(p.first_line, prev + p.height);
-            } else {
-                self.lines.heights.set_measured(p.first_line, p.height);
-            }
-            for l in p.first_line + 1..=p.last_line {
-                self.lines.heights.set_measured(l, 0.0);
-            }
+            // A second leaf on this line stacks under the height already there.
+            self.record_block(line, p.first_line, p.last_line, p.height);
             self.draw_leaf(painter, &mut meshes, doc, parse, &p, frame, y, &selection);
             if (p.first_line..=p.last_line).contains(&caret_line) {
                 let r = p.caret_rect(self.selection.head, self.upstream());
