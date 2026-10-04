@@ -406,6 +406,12 @@ impl TextRenderer {
         Some(out)
     }
 
+    /// Average advance of typical text, in points. Zero before the first
+    /// [`begin_frame`](Self::begin_frame).
+    pub fn avg_advance(&self) -> f32 {
+        self.avg_advance_px / self.pixels_per_point.max(1.0)
+    }
+
     fn measure_avg_advance(&mut self) -> f32 {
         const SAMPLE: &str = "The quick brown fox jumps over the lazy dog, then naps; 0123456789.";
         let (config, ppp) = (self.config(), self.pixels_per_point);
