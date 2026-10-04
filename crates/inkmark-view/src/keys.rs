@@ -95,9 +95,10 @@ pub enum Action {
     SelectWord = 54,
     SelectParagraph = 55,
     MatchBracket = 56,
+    SearchFolder = 57,
 }
 
-const COUNT: usize = 57;
+const COUNT: usize = 58;
 
 impl Action {
     pub const ALL: [Action; COUNT] = [
@@ -158,6 +159,7 @@ impl Action {
         Action::SelectWord,
         Action::SelectParagraph,
         Action::MatchBracket,
+        Action::SearchFolder,
     ];
 
     pub const fn index(self) -> usize {
@@ -225,6 +227,7 @@ impl Action {
             SelectWord => "select_word",
             SelectParagraph => "select_paragraph",
             MatchBracket => "match_bracket",
+            SearchFolder => "search_folder",
         }
     }
 
@@ -289,6 +292,7 @@ impl Action {
             SelectWord => "Select word",
             SelectParagraph => "Select paragraph",
             MatchBracket => "Jump to the matching fence or brackets",
+            SearchFolder => "Search the open folder",
         }
     }
 
@@ -297,7 +301,7 @@ impl Action {
         match self {
             CycleMode | FocusCode | FocusLive | ToggleMinimap | OpenFile | Save | SaveAs
             | OpenFolder | ToggleSidebar | NewFile | RecentFiles | Back | Forward | Find
-            | Replace | FindNext | FindPrevious | GoToLine => Scope::App,
+            | Replace | FindNext | FindPrevious | GoToLine | SearchFolder => Scope::App,
             Rename | MoveToTrash => Scope::Browser,
             InsertRowAbove | InsertRowBelow | InsertColumnLeft | InsertColumnRight | DeleteRow
             | DeleteColumn | MoveRowUp | MoveRowDown | MoveColumnLeft | MoveColumnRight
@@ -927,6 +931,7 @@ fn default_chords(action: Action) -> Vec<Chord> {
         FindNext => vec![chord(Modifiers::NONE, Key::F3)],
         FindPrevious => vec![chord(shift, Key::F3)],
         GoToLine => vec![chord(ctrl, Key::G)],
+        SearchFolder => vec![chord(ctrl_shift, Key::F)],
         SelectWord => vec![chord(ctrl, Key::D)],
         SelectParagraph => vec![chord(ctrl_shift, Key::P)],
         MatchBracket => vec![chord(ctrl_shift, Key::Backslash)],

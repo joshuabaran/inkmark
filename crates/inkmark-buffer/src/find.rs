@@ -87,6 +87,11 @@ impl Finder {
         self.prev(rope, usize::MAX)
     }
 
+    /// The first `limit` matches. The caller decides whether to keep looking.
+    pub fn first_matches(&self, rope: &Rope, limit: usize) -> Vec<Range<usize>> {
+        self.iter(rope, 0).take(limit).collect()
+    }
+
     /// `true` when `range` is exactly a match.
     pub fn covers(&self, rope: &Rope, range: &Range<usize>) -> bool {
         self.next(rope, range.start).as_ref() == Some(range)
@@ -470,5 +475,13 @@ mod tests {
         }
         assert!(seen.len() <= 4, "{seen:?}");
         assert!(seen.contains(&(0..1)));
+    }
+
+    #[test]
+    fn first_matches_stops_at_the_limit() {
+        let rope = rope("a a a");
+        let finder = plain("a");
+        assert_eq!(finder.first_matches(&rope, 2), vec![0..1, 2..3]);
+        assert_eq!(finder.first_matches(&rope, 10).len(), 3);
     }
 }
