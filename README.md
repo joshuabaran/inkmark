@@ -163,6 +163,9 @@ inkmark               # browses the current directory and shows recent files
 | F3 | Find the next match (`find_next`) |
 | Shift+F3 | Find the previous match (`find_previous`) |
 | Ctrl+G | Go to line (`go_to_line`) |
+| Ctrl+D | Select word (`select_word`) |
+| Ctrl+Shift+P | Select paragraph (`select_paragraph`) |
+| Ctrl+Shift+Backslash | Jump to the matching fence or brackets (`match_bracket`) |
 
 Arrows, Home, End, Page Up, Page Down, Backspace, Delete, Enter and Tab edit
 as usual, and holding Shift extends a selection. Those keys are not in the

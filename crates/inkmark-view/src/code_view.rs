@@ -20,6 +20,7 @@ use crate::keys::{self, Action};
 use crate::lines::SCROLLBAR_WIDTH;
 use crate::lines::{LineIndex, ScrollPos, Synced};
 use crate::motion;
+use crate::structure;
 use crate::tables;
 use crate::theme::{self, Theme};
 
@@ -687,6 +688,20 @@ impl CodeView {
 
     // ---- caret movement -----------------------------------------------------
 
+    /// Replaces the selection and opens a fold that was hiding either end.
+    fn place(&mut self, doc: &mut Document, selection: Selection) {
+        self.selection = selection;
+        self.preferred_x = None;
+        self.reveal_caret = REVEAL_FRAMES;
+        doc.seal_undo_step();
+        if self.folds.reveal(doc, self.selection.head)
+            || self.folds.reveal(doc, self.selection.anchor)
+        {
+            self.lines.invalidate();
+            self.fold_resync = true;
+        }
+    }
+
     fn move_to(&mut self, doc: &mut Document, target: usize, extend: bool) {
         if extend {
             self.selection.head = target;
@@ -1012,6 +1027,31 @@ impl CodeView {
             }
             Action::DocumentStart => self.move_to(doc, 0, extend),
             Action::DocumentEnd => self.move_to(doc, doc.len(), extend),
+            Action::SelectWord => {
+                let range = structure::word_range(doc, sel);
+                self.place(
+                    doc,
+                    Selection {
+                        anchor: range.start,
+                        head: range.end,
+                    },
+                );
+            }
+            Action::SelectParagraph => {
+                let range = structure::paragraph_range(doc, sel, parse);
+                self.place(
+                    doc,
+                    Selection {
+                        anchor: range.start,
+                        head: range.end,
+                    },
+                );
+            }
+            Action::MatchBracket => {
+                if let Some(at) = structure::bracket_target(doc, sel, parse) {
+                    self.place(doc, Selection::caret(at));
+                }
+            }
             _ => return false,
         }
         true

@@ -10,6 +10,7 @@ mod lines;
 mod live_layout;
 mod live_view;
 pub mod motion;
+mod structure;
 mod tables;
 pub mod theme;
 

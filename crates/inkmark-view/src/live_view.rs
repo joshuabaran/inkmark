@@ -1714,6 +1714,9 @@ impl LiveView {
                 self.move_to(doc.len(), extend);
                 Some(false)
             }
+            // Structural selection is a code-pane command. Swallow the chord
+            // so it does not fall through into typing.
+            Action::SelectWord | Action::SelectParagraph | Action::MatchBracket => Some(false),
             _ => None,
         }
     }

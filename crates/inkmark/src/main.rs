@@ -4240,4 +4240,97 @@ mod tests {
         assert_eq!(hidden[0].end, end + inserted.len());
         assert!(start < hidden[0].start);
     }
+
+    #[test]
+    fn structural_selection_runs_in_the_code_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        let src = "one two\n\nsee [a](http://x.com) there\n";
+        fs::write(&path, src).unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+
+        run.key(egui::Key::D, egui::Modifiers::COMMAND);
+        let word = run.app.code.selection().range();
+        assert_eq!(&text(&run.app)[word.clone()], "one");
+        assert_eq!(run.app.live.selection().range(), word);
+
+        run.key(
+            egui::Key::P,
+            egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+        );
+        let para = run.app.code.selection().range();
+        assert_eq!(&text(&run.app)[para.clone()], "one two\n");
+        assert_eq!(run.app.live.selection().range(), para);
+
+        let open = text(&run.app).find('[').unwrap();
+        let close = text(&run.app).find(']').unwrap();
+        run.app.code.set_selection(Selection::caret(open));
+        run.frame(vec![]);
+        run.key(
+            egui::Key::Backslash,
+            egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+        );
+        assert_eq!(run.app.code.selection(), Selection::caret(close));
+        assert_eq!(run.app.live.selection(), Selection::caret(close));
+        run.key(
+            egui::Key::Backslash,
+            egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+        );
+        assert_eq!(run.app.code.selection(), Selection::caret(open));
+
+        // The live pane swallows the chord and leaves the caret where it is.
+        run.app.focus_pane(&run.ctx, Pane::Live);
+        run.frame(vec![]);
+        run.key(egui::Key::D, egui::Modifiers::COMMAND);
+        run.key(
+            egui::Key::Backslash,
+            egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+        );
+        assert_eq!(text(&run.app), src);
+        assert_eq!(run.app.live.selection(), Selection::caret(open));
+        assert_eq!(run.app.code.selection(), Selection::caret(open));
+    }
+
+    #[test]
+    fn structural_selection_inside_a_fold_opens_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        let src = "# Title\n\n```\ncode\n```\n\n# Next\n";
+        fs::write(&path, src).unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        run.click_code_mark("▾");
+        let open = text(&run.app).find("```").unwrap();
+        let close = text(&run.app).rfind("```").unwrap();
+        assert!(
+            run.app
+                .code
+                .hidden_ranges()
+                .iter()
+                .any(|range| range.start <= open && close < range.end),
+            "{:?}",
+            run.app.code.hidden_ranges()
+        );
+
+        run.app.code.request_focus(&run.ctx);
+        run.app.code.mirror_selection(Selection::caret(open));
+        run.key(
+            egui::Key::Backslash,
+            egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+        );
+        run.frame(vec![]);
+        assert_eq!(run.app.code.selection(), Selection::caret(close));
+        assert_eq!(run.app.live.selection(), Selection::caret(close));
+        assert!(
+            run.app
+                .code
+                .hidden_ranges()
+                .iter()
+                .all(|range| close < range.start || close >= range.end),
+            "{:?}",
+            run.app.code.hidden_ranges()
+        );
+        let line = run.app.doc.byte_to_line(close);
+        assert!(run.app.code.measured_height(line) > 0.0);
+        assert_eq!(text(&run.app), src);
+    }
 }
