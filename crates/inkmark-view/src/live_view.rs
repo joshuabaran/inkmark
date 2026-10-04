@@ -517,6 +517,7 @@ impl LiveView {
         self.focused = response.has_focus();
 
         self.ctx = Some(ui.ctx().clone());
+        self.math.begin_frame();
         let ppp = ui.ctx().pixels_per_point();
         let config_for = |width: f32| TextConfig {
             monospace: false,
@@ -3021,13 +3022,13 @@ mod tests {
                 .any(|s| { s.maths.iter().any(|m| m.display_style) && !s.text.contains("frac") })
         );
         let row = view.text.row_height();
-        let drawn = display
-            .body
-            .geometry
-            .iter()
-            .map(|g| g.height())
-            .fold(0.0, f32::max);
+        assert_eq!(display.body.layout.segments.len(), 1);
+        assert_eq!(display.body.geometry.len(), 1);
+        assert_eq!(display.body.geometry[0].rows.len(), 1);
+        let drawn = display.body.geometry[0].height();
         assert!(drawn > row, "display row {drawn} vs text {row}");
+        let end = display.body.layout.segments[0].maths[0].source.end;
+        assert_eq!(display.body.layout.display_pos(end).0, 0);
 
         let bad = view.place(
             &doc,

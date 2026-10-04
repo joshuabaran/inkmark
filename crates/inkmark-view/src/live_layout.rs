@@ -240,22 +240,36 @@ fn elements_at(spans: &[inkmark_parse::Span], caret: usize) -> Vec<Range<usize>>
 }
 
 /// `start..end` spans of one formula, when `spans[start]` opens one.
-/// The closer is the last span. A lone marker is not a formula.
-fn formula_end(spans: &[Span], start: usize) -> Option<usize> {
-    if !spans[start].style.contains(Style::MATH) {
+/// The closer is the matching `$` or `$$`. A later formula written against
+/// this one stays its own formula, and an emphasis marker inside the body
+/// is not a closer.
+fn formula_end(doc: &Document, spans: &[Span], start: usize) -> Option<usize> {
+    if !math_delim(doc, &spans[start]) {
         return None;
     }
-    let mut end = start + 1;
-    while end < spans.len()
-        && spans[end].style.contains(Style::MATH)
-        && spans[end].range.start == spans[end - 1].range.end
+    let width = spans[start].range.len();
+    let mut i = start + 1;
+    while i < spans.len()
+        && spans[i].style.contains(Style::MATH)
+        && spans[i].range.start == spans[i - 1].range.end
     {
-        end += 1;
+        if math_delim(doc, &spans[i]) && spans[i].range.len() == width {
+            return (spans[start].range.end <= spans[i].range.start).then_some(i + 1);
+        }
+        i += 1;
     }
-    let opens = matches!(spans[start].kind, SpanKind::Syntax(Syntax::Delimiter));
-    let closes = matches!(spans[end - 1].kind, SpanKind::Syntax(Syntax::Delimiter));
-    (end - start >= 2 && opens && closes && spans[start].range.end <= spans[end - 1].range.start)
-        .then_some(end)
+    None
+}
+
+fn math_delim(doc: &Document, span: &Span) -> bool {
+    if !span.style.contains(Style::MATH) {
+        return false;
+    }
+    if !matches!(span.kind, SpanKind::Syntax(Syntax::Delimiter)) {
+        return false;
+    }
+    let text = doc.slice(span.range.clone());
+    text == "$" || text == "$$"
 }
 
 /// Lays out `leaf`, rendered except for the syntax `reveal` picks out
@@ -308,7 +322,7 @@ pub(crate) fn build(
     };
     let mut i = 0;
     while i < spans.len() {
-        if let Some(end) = formula_end(&spans, i) {
+        if let Some(end) = formula_end(doc, &spans, i) {
             let full = spans[i].range.start..spans[end - 1].range.end;
             let inside = full.start.max(range.start)..full.end.min(range.end);
             let caret_in = reveal
@@ -447,8 +461,8 @@ impl LeafLayout {
 
     /// Source offset shown at display position `d` of segment `seg`. At a
     /// boundary between two pieces the later one wins, so a caret before
-    /// "bold" in `**bold**` lands inside the emphasis. A click on a typeset
-    /// formula lands on its first byte, which reveals the source.
+    /// "bold" in `**bold**` lands inside the emphasis. The interior of a
+    /// typeset formula maps to its first byte.
     pub fn source_pos(&self, seg: usize, d: usize) -> usize {
         let s = &self.segments[seg];
         for math in &s.maths {
@@ -710,11 +724,19 @@ mod tests {
         assert_eq!(texts(&l), vec!["See"]);
         let src = "$$\n\\frac{1}{2}\n$$\n";
         let l = gfm_layout(src, None);
-        assert!(l.segments.iter().any(|s| {
-            s.maths
+        // The segment pushed so later text starts a new row is dropped when
+        // nothing follows, so a formula on its own is one row. The caret at
+        // the formula's end stays on that row.
+        assert_eq!(l.segments.len(), 1);
+        let seg = &l.segments[0];
+        assert!(
+            seg.maths
                 .iter()
-                .any(|m| m.display_style && m.tex.contains("frac") && !s.text.contains("frac"))
-        }));
+                .any(|m| m.display_style && m.tex.contains("frac"))
+        );
+        assert!(!seg.text.contains("frac"));
+        let end = seg.maths[0].source.end;
+        assert_eq!(l.display_pos(end).0, 0);
         let inside = src.find("frac").unwrap();
         let shown = gfm_layout(src, Some(inside));
         let joined: String = texts(&shown).into_iter().collect::<Vec<_>>().join("\n");
@@ -725,6 +747,31 @@ mod tests {
         let l = gfm_layout(src, None);
         assert_eq!(texts(&l), vec!["use $x$ here"]);
         assert!(l.segments.iter().all(|s| s.maths.is_empty()));
+
+        // Text after a display formula keeps its own segment, and that
+        // segment is the words, not an empty row.
+        let src = "$$a$$ then\n";
+        let l = gfm_layout(src, None);
+        assert!(
+            l.segments
+                .iter()
+                .any(|s| s.maths.iter().any(|m| m.tex == "a"))
+        );
+        let last = l.segments.last().unwrap();
+        assert!(last.text.contains("then"), "{:?}", texts(&l));
+        assert!(!last.text.is_empty());
+    }
+
+    #[test]
+    fn adjacent_formulas_stay_apart() {
+        let src = "$$a$$$$b$$\n";
+        let l = gfm_layout(src, None);
+        let tex: Vec<_> = l
+            .segments
+            .iter()
+            .flat_map(|s| s.maths.iter().map(|m| m.tex.as_str()))
+            .collect();
+        assert_eq!(tex, vec!["a", "b"]);
     }
 
     #[test]

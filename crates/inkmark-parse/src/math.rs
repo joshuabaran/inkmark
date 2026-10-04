@@ -75,7 +75,11 @@ fn covers_only_allowed(spans: &[Span], range: Range<usize>, hint: usize) -> bool
         if span.range.start >= range.end {
             break;
         }
-        if span.range.start > at || !allowed(span) {
+        // A syntax span has to sit wholly inside the formula. Splitting one
+        // would leave a delimiter on each side of the cut.
+        let splits_syntax = matches!(span.kind, SpanKind::Syntax(_))
+            && (span.range.start < range.start || span.range.end > range.end);
+        if span.range.start > at || !allowed(span) || splits_syntax {
             return false;
         }
         at = at.max(span.range.end);
@@ -84,6 +88,57 @@ fn covers_only_allowed(spans: &[Span], range: Range<usize>, hint: usize) -> bool
         }
     }
     at >= range.end
+}
+
+/// Emphasis, strong, strike, and link runs must sit wholly inside the
+/// formula, or the formula wholly inside them. `*a $b* c$` does neither.
+fn nested_styles(spans: &[Span], range: &Range<usize>) -> bool {
+    const FLAGS: [Style; 6] = [
+        Style::EMPHASIS,
+        Style::STRONG,
+        Style::STRIKE,
+        Style::LINK,
+        Style::IMAGE,
+        Style::FOOTNOTE,
+    ];
+    for flag in FLAGS {
+        let mut i = 0;
+        while i < spans.len() && spans[i].range.end <= range.start {
+            i += 1;
+        }
+        while i < spans.len() && spans[i].range.start < range.end {
+            if !spans[i].style.contains(flag) {
+                i += 1;
+                continue;
+            }
+            let run = style_run(spans, i, flag);
+            let inside = range.start <= run.start && run.end <= range.end;
+            let around = run.start <= range.start && range.end <= run.end;
+            if !inside && !around {
+                return false;
+            }
+            while i < spans.len() && spans[i].range.start < run.end {
+                i += 1;
+            }
+        }
+    }
+    true
+}
+
+fn style_run(spans: &[Span], index: usize, flag: Style) -> Range<usize> {
+    let mut a = index;
+    while a > 0 && spans[a - 1].style.contains(flag) {
+        a -= 1;
+    }
+    let mut b = index;
+    while b + 1 < spans.len() && spans[b + 1].style.contains(flag) {
+        b += 1;
+    }
+    spans[a].range.start..spans[b].range.end
+}
+
+fn can_mark(spans: &[Span], range: Range<usize>, hint: usize) -> bool {
+    covers_only_allowed(spans, range.clone(), hint) && nested_styles(spans, &range)
 }
 
 fn find(src: &str, spans: &[Span]) -> Vec<Formula> {
@@ -141,7 +196,7 @@ fn display_at(src: &str, spans: &[Span], si: usize, i: usize) -> Option<Formula>
             }
             let body = i + 2..j;
             let whole = i..j + 2;
-            if body_has_text(src, body.clone()) && covers_only_allowed(spans, whole, si) {
+            if body_has_text(src, body.clone()) && can_mark(spans, whole, si) {
                 return Some(Formula {
                     open: i..i + 2,
                     body,
@@ -172,16 +227,18 @@ fn inline_at(src: &str, spans: &[Span], si: usize, i: usize) -> Option<Formula> 
                 j += 1;
                 continue;
             }
+            // `$5-$10`: a closer with a digit after it is a price, not math.
+            // Keep scanning so `$5-$10$` can still close on the last `$`.
+            if j + 1 < bytes.len() && bytes[j + 1].is_ascii_digit() {
+                j += 1;
+                continue;
+            }
             let preceded_by_space = src[..j]
                 .chars()
                 .next_back()
                 .is_some_and(char::is_whitespace);
             let doubled = j + 1 < bytes.len() && bytes[j + 1] == b'$';
-            if !preceded_by_space
-                && !doubled
-                && j > i + 1
-                && covers_only_allowed(spans, i..j + 1, si)
-            {
+            if !preceded_by_space && !doubled && j > i + 1 && can_mark(spans, i..j + 1, si) {
                 return Some(Formula {
                     open: i..i + 1,
                     body: i + 1..j,
@@ -317,12 +374,43 @@ mod tests {
             "use `$x$` here\n",
             "cost is \\$5 today\n",
             "pay $5 and $10 now\n",
+            "costs $5-$10 today\n",
+            "$20/$30\n",
+            "about $1$2\n",
             "hello $.;'there\n",
             "$$\n\n$$\n",
             "```\n$x$\n```\n",
             "\\(a\\) and \\[b\\]\n",
         ] {
             assert!(marked(src).is_empty(), "marked {src:?}");
+            GfmParser.parse(src).map.validate(src.len()).unwrap();
+        }
+    }
+
+    fn joined(src: &str) -> String {
+        marked(src)
+            .iter()
+            .map(|s| src[s.range.clone()].to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_sum_of_prices_is_still_a_formula() {
+        let src = "total $5-$10$\n";
+        assert_eq!(joined(src), "$5-$10$");
+        GfmParser.parse(src).map.validate(src.len()).unwrap();
+    }
+
+    #[test]
+    fn a_formula_does_not_cross_emphasis_or_a_link() {
+        for src in ["*a $b* c$\n", "a *$b* c$\n", "[a $b](u) c$\n"] {
+            assert!(marked(src).is_empty(), "marked {src:?}");
+            GfmParser.parse(src).map.validate(src.len()).unwrap();
+        }
+        assert_eq!(joined("a *$b$* c\n"), "$b$");
+        assert_eq!(joined("$a *b* c$\n"), "$a *b* c$");
+        assert_eq!(joined("[a $b$](u)\n"), "$b$");
+        for src in ["a *$b$* c\n", "$a *b* c$\n", "[a $b$](u)\n"] {
             GfmParser.parse(src).map.validate(src.len()).unwrap();
         }
     }

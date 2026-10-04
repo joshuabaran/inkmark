@@ -46,12 +46,29 @@ enum Cached {
     Failed,
 }
 
+struct Stored {
+    /// Frame that last laid this formula out or painted it.
+    used: u64,
+    body: Cached,
+}
+
 #[derive(Default)]
 pub(crate) struct MathCache {
-    slots: HashMap<Key, Cached>,
+    slots: HashMap<Key, Stored>,
+    /// Bumped from the live pane once per frame. Zero until then, so a
+    /// headless layout keeps what it rasterized.
+    frame: u64,
 }
 
 impl MathCache {
+    /// Drops drawings the previous frame did not lay out or paint. A resize
+    /// or a theme change would otherwise keep a texture for every width.
+    pub(crate) fn begin_frame(&mut self) {
+        self.frame = self.frame.saturating_add(1);
+        let previous = self.frame - 1;
+        self.slots.retain(|_, slot| slot.used >= previous);
+    }
+
     /// Widen each formula's stand-in to its drawing. Returns the source
     /// ranges that did not parse; those layouts should be built again with
     /// the bytes showing. Ranges only grow across calls.
@@ -83,7 +100,7 @@ impl MathCache {
 
     /// Point size of a formula already prepared for `paint`, if it parsed.
     pub(crate) fn size(&self, tex: &str, display: bool, paint: &Paint) -> Option<Vec2> {
-        match self.slots.get(&key(tex, display, paint))? {
+        match &self.slots.get(&key(tex, display, paint))?.body {
             Cached::Ready(slot) => Some(slot.size),
             Cached::Failed => None,
         }
@@ -98,9 +115,10 @@ impl MathCache {
         paint: &Paint,
     ) -> Option<(TextureHandle, Vec2)> {
         let key = key(tex, display, paint);
-        let slot = match self.slots.get_mut(&key)? {
-            Cached::Ready(slot) => slot,
-            Cached::Failed => return None,
+        let stored = self.slots.get_mut(&key)?;
+        stored.used = self.frame;
+        let Cached::Ready(slot) = &mut stored.body else {
+            return None;
         };
         if slot.texture.is_none() {
             let image = slot.image.take()?;
@@ -115,8 +133,9 @@ impl MathCache {
 
     fn prepare(&mut self, tex: &str, display: bool, paint: &Paint) -> Option<Vec2> {
         let key = key(tex, display, paint);
-        if let Some(cached) = self.slots.get(&key) {
-            return match cached {
+        if let Some(stored) = self.slots.get_mut(&key) {
+            stored.used = self.frame;
+            return match &stored.body {
                 Cached::Ready(slot) => Some(slot.size),
                 Cached::Failed => None,
             };
@@ -133,7 +152,13 @@ impl MathCache {
             Cached::Ready(slot) => Some(slot.size),
             Cached::Failed => None,
         };
-        self.slots.insert(key, cached);
+        self.slots.insert(
+            key,
+            Stored {
+                used: self.frame,
+                body: cached,
+            },
+        );
         size
     }
 }
@@ -336,21 +361,36 @@ pub(crate) fn formula_rect(
     Some(Rect::from_center_size(union.center(), vec2(w, h)))
 }
 
-/// A click on the stand-in's ink enters the formula at its first byte.
+/// Where a pointer on a typeset formula lands. The left half is the
+/// formula's first byte, so a click there shows the source. The right half
+/// is the byte after it, so a drag or a shift-click can cover the formula.
 pub(crate) fn formula_hit(seg: &Segment, geo: &LineGeometry, x: f32, d: usize) -> Option<usize> {
     for math in &seg.maths {
-        let in_gap = math.display.start <= d && d < math.display.end;
-        let on_ink = geo.rows.iter().any(|row| {
-            row.clusters.iter().any(|c| {
-                c.end > math.display.start
-                    && c.start < math.display.end
-                    && x >= c.x
-                    && x < c.x + c.w
-            })
-        });
-        if in_gap || on_ink {
-            return Some(math.source.start);
+        let mut union: Option<Rect> = None;
+        let mut on_ink = false;
+        for row in &geo.rows {
+            for cluster in &row.clusters {
+                if cluster.end <= math.display.start || cluster.start >= math.display.end {
+                    continue;
+                }
+                let rect =
+                    Rect::from_min_size(pos2(cluster.x, row.top), vec2(cluster.w, row.height));
+                union = Some(union.map_or(rect, |u| u.union(rect)));
+                if x >= cluster.x && x < cluster.x + cluster.w {
+                    on_ink = true;
+                }
+            }
         }
+        let in_gap = math.display.start <= d && d < math.display.end;
+        if !in_gap && !on_ink {
+            continue;
+        }
+        let on_the_right = union.is_some_and(|u| x >= u.center().x);
+        return Some(if on_the_right {
+            math.source.end
+        } else {
+            math.source.start
+        });
     }
     None
 }
@@ -393,5 +433,96 @@ mod tests {
         assert!(size.x > 1.0 && size.y > 1.0);
         assert!(image.pixels.iter().any(|p| p.a() > 0));
         assert!(raster(r"\frac{", false, &paint).is_none());
+    }
+
+    #[test]
+    fn a_pointer_on_the_right_half_lands_after_the_formula() {
+        use inkmark_text::{ClusterSpan, Row};
+
+        use crate::live_layout::{MathAtom, Segment};
+
+        let seg = Segment {
+            maths: vec![MathAtom {
+                display: 0..3,
+                source: 10..20,
+                tex: "x".to_owned(),
+                display_style: false,
+            }],
+            ..Segment::default()
+        };
+        let geo = LineGeometry {
+            rows: vec![Row {
+                top: 0.0,
+                height: 10.0,
+                start: 0,
+                end: 3,
+                clusters: vec![ClusterSpan {
+                    start: 0,
+                    end: 3,
+                    x: 0.0,
+                    w: 30.0,
+                }],
+                ends_in_space: false,
+            }],
+        };
+        assert_eq!(formula_hit(&seg, &geo, 5.0, 1), Some(10));
+        assert_eq!(formula_hit(&seg, &geo, 20.0, 2), Some(20));
+        // The right half of the last cluster reports the gap's end byte.
+        assert_eq!(formula_hit(&seg, &geo, 24.0, 3), Some(20));
+    }
+
+    #[test]
+    fn a_width_the_last_frame_did_not_use_is_dropped() {
+        use inkmark_text::{Fonts, TextConfig, TextRenderer};
+
+        use crate::live_layout::{LeafLayout, LeafStyle, MathAtom, Piece, Segment};
+
+        let ctx = egui::Context::default();
+        let mut text = TextRenderer::with_fonts(Fonts::shared(&ctx));
+        text.begin_frame(
+            TextConfig {
+                monospace: false,
+                font_size: 16.0,
+                line_height: 22.0,
+                wrap_width: Some(400.0),
+            },
+            1.0,
+        );
+        let paint = |wrap| Paint {
+            wrap,
+            color: Color32::BLACK,
+            row: 20.0,
+            ppp: 1.0,
+        };
+        let layout = || LeafLayout {
+            style: LeafStyle::Paragraph,
+            segments: vec![Segment {
+                text: "\u{FFFC}".to_owned(),
+                pieces: vec![Piece {
+                    display: 0..3,
+                    source: 0..3,
+                    exact: false,
+                }],
+                maths: vec![MathAtom {
+                    display: 0..3,
+                    source: 0..3,
+                    tex: "x".to_owned(),
+                    display_style: false,
+                }],
+                ..Segment::default()
+            }],
+        };
+        let wide = paint(400.0);
+        let narrow = paint(80.0);
+        let mut cache = MathCache::default();
+        cache.begin_frame();
+        let mut wide_layout = layout();
+        assert!(cache.fit(&mut text, &mut wide_layout, &wide).is_empty());
+        cache.begin_frame();
+        let mut narrow_layout = layout();
+        assert!(cache.fit(&mut text, &mut narrow_layout, &narrow).is_empty());
+        cache.begin_frame();
+        assert!(cache.size("x", false, &wide).is_none());
+        assert!(cache.size("x", false, &narrow).is_some());
     }
 }
