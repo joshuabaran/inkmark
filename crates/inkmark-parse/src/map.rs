@@ -25,6 +25,9 @@ impl Style {
     pub const TABLE_HEAD: Self = Self(1 << 11);
     /// A footnote reference, `[^label]`.
     pub const FOOTNOTE: Self = Self(1 << 12);
+    /// A math formula. The delimiters are syntax; the body is the source
+    /// the live pane typesets. The bytes themselves are unchanged.
+    pub const MATH: Self = Self(1 << 13);
 
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0

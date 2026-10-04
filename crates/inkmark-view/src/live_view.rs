@@ -11,7 +11,7 @@ use egui::{
 };
 use inkmark_buffer::{Bias, Document, Edit, EditKind, Selection};
 use inkmark_parse::{
-    BlockKind, Leaf, ParseOutput, ParseState, SpanKind, Style, Syntax, inline_images,
+    BlockKind, Leaf, ParseOutput, ParseState, SourceMap, SpanKind, Style, Syntax, inline_images,
 };
 use inkmark_text::{
     GlyphMeshes, LineGeometry, RichLine, ScrollAnchor, SharedFonts, TextConfig, TextRenderer,
@@ -80,8 +80,13 @@ impl Body {
     /// is the end of a mid-word-wrapped row (upstream).
     fn hit(&self, local: Vec2) -> (usize, bool) {
         let seg = self.segment_at(local.y);
-        let (d, upstream) =
-            self.geometry[seg].hit_affine(vec2(local.x, local.y - self.seg_tops[seg]));
+        let at = vec2(local.x, local.y - self.seg_tops[seg]);
+        let (d, upstream) = self.geometry[seg].hit_affine(at);
+        if let Some(src) =
+            crate::math::formula_hit(&self.layout.segments[seg], &self.geometry[seg], at.x, d)
+        {
+            return (src, false);
+        }
         (self.layout.source_pos(seg, d), upstream)
     }
 
@@ -282,6 +287,10 @@ pub struct LiveView {
     checkboxes: Vec<(Rect, usize, bool)>,
     /// Created on the first frame, when an egui context is at hand.
     images: Option<ImageCache>,
+    /// Formula drawings for the live pane. The document bytes are not rewritten.
+    math: crate::math::MathCache,
+    /// Context of the frame being drawn, so a formula texture can be uploaded.
+    ctx: Option<egui::Context>,
     pub font_size: f32,
     pub line_height: f32,
     /// Shortcuts, shared with the code pane and the app shell.
@@ -318,6 +327,8 @@ impl LiveView {
             measured_prefix: 0,
             checkboxes: Vec::new(),
             images: None,
+            math: crate::math::MathCache::default(),
+            ctx: None,
             font_size: 16.0,
             line_height: 26.0,
             keys: keys::KeyMap::builtin(),
@@ -505,6 +516,8 @@ impl LiveView {
         });
         self.focused = response.has_focus();
 
+        self.ctx = Some(ui.ctx().clone());
+        self.math.begin_frame();
         let ppp = ui.ctx().pixels_per_point();
         let config_for = |width: f32| TextConfig {
             monospace: false,
@@ -1019,12 +1032,101 @@ impl LiveView {
         "[…]".into()
     }
 
+    fn paint_for(&self, wrap: f32) -> crate::math::Paint {
+        crate::math::Paint {
+            wrap,
+            color: self.theme.text,
+            row: self.text.row_height().max(self.line_height).max(1.0),
+            ppp: self.text.pixels_per_point().max(0.01),
+        }
+    }
+
+    /// Build the leaf, then size each formula. A formula that does not parse
+    /// is built again as its source. Failed ranges are only added, never dropped.
+    fn prepare_layout(
+        &mut self,
+        doc: &Document,
+        map: &SourceMap,
+        leaf: &Leaf,
+        reveal: Option<Reveal>,
+        wrap: f32,
+        math_caret: Option<usize>,
+    ) -> LeafLayout {
+        let paint = self.paint_for(wrap);
+        let mut shown: Vec<Range<usize>> = Vec::new();
+        for _ in 0..4 {
+            let mut layout = live_layout::build(
+                doc,
+                map,
+                leaf,
+                reveal.clone(),
+                &self.theme,
+                &shown,
+                math_caret,
+            );
+            let failed =
+                crate::math::MathCache::fit(&mut self.math, &mut self.text, &mut layout, &paint);
+            if failed.is_empty() {
+                return layout;
+            }
+            let before = shown.len();
+            for src in failed {
+                if !shown.contains(&src) {
+                    shown.push(src);
+                }
+            }
+            if shown.len() == before {
+                return layout;
+            }
+        }
+        live_layout::build(doc, map, leaf, reveal, &self.theme, &shown, math_caret)
+    }
+
+    /// Shape `layout` at `wrap`. Segment tops start at `origin`. When `count`
+    /// is false the tops stay at `origin`: an image-only block hides its text.
+    fn shape_segments(
+        &mut self,
+        layout: &LeafLayout,
+        wrap: f32,
+        origin: f32,
+        count: bool,
+    ) -> (Vec<f32>, Vec<LineGeometry>, f32) {
+        let paint = self.paint_for(wrap);
+        let mut y = origin;
+        let mut seg_tops = Vec::with_capacity(layout.segments.len());
+        let mut geometry = Vec::with_capacity(layout.segments.len());
+        for seg in &layout.segments {
+            let mut g = self.text.rich_geometry(RichLine {
+                text: &seg.text,
+                runs: &seg.runs,
+                wrap_width: Some(wrap),
+            });
+            if let Some(math) = seg.maths.iter().find(|m| m.display_style)
+                && let Some(size) = self.math.size(&math.tex, true, &paint)
+            {
+                crate::math::raise_display(&mut g, size, wrap);
+            }
+            seg_tops.push(y);
+            if count {
+                y += g.height();
+            }
+            geometry.push(g);
+        }
+        (seg_tops, geometry, y)
+    }
+
     fn place(&mut self, doc: &Document, parse: &ParseOutput, leaf: Leaf, width: f32) -> Placed {
         let (map, link_defs) = (&parse.map, &parse.link_defs);
-        let layout = live_layout::build(doc, map, &leaf, self.reveal(doc), &self.theme);
         let containers: f32 = leaf.containers.iter().map(container_indent).sum();
         let row = self.text.row_height();
-        let (pad_top, pad_bottom, inner) = match layout.style {
+        let style = match leaf.block.kind {
+            BlockKind::Heading(level) => LeafStyle::Heading(level),
+            BlockKind::CodeBlock { .. } => LeafStyle::Code,
+            BlockKind::HtmlBlock => LeafStyle::Html,
+            BlockKind::ThematicBreak => LeafStyle::Rule,
+            _ => LeafStyle::Paragraph,
+        };
+        let (pad_top, pad_bottom, inner) = match style {
             LeafStyle::Heading(level) => {
                 (row * if level <= 2 { 0.7 } else { 0.45 }, row * 0.25, 0.0)
             }
@@ -1052,21 +1154,15 @@ impl LiveView {
             image_only && !(self.focused && (first_line..=last_line).contains(&caret_line));
 
         let wrap = (width - containers - 2.0 * inner).max(40.0);
-        let mut y = pad_top;
-        let mut seg_tops = Vec::with_capacity(layout.segments.len());
-        let mut geometry = Vec::with_capacity(layout.segments.len());
-        for seg in &layout.segments {
-            let g = self.text.rich_geometry(RichLine {
-                text: &seg.text,
-                runs: &seg.runs,
-                wrap_width: Some(wrap),
-            });
-            seg_tops.push(y);
-            if !text_hidden {
-                y += g.height();
-            }
-            geometry.push(g);
-        }
+        let layout = self.prepare_layout(
+            doc,
+            map,
+            &leaf,
+            self.reveal(doc),
+            wrap,
+            Some(self.selection.head),
+        );
+        let (seg_tops, geometry, mut y) = self.shape_segments(&layout, wrap, pad_top, !text_hidden);
 
         let mut images = Vec::new();
         if has_image && let Some(cache) = &self.images {
@@ -1141,60 +1237,27 @@ impl LiveView {
             .max(1);
         let aligns = table_alignments(doc, &rows, columns);
         let reveal = self.reveal(doc);
-        let layouts: Vec<Vec<(inkmark_parse::Block, LeafLayout)>> = rows
+        let table_cells: Vec<Vec<inkmark_parse::Block>> = rows
             .iter()
-            .map(|(_, cells)| {
-                cells
-                    .iter()
-                    .take(columns)
-                    .map(|cell| {
-                        let leaf = Leaf {
-                            block: cell.clone(),
-                            containers: Vec::new(),
-                        };
-                        (
-                            cell.clone(),
-                            live_layout::build(doc, &parse.map, &leaf, reveal.clone(), &self.theme),
-                        )
-                    })
-                    .collect()
-            })
+            .map(|(_, row)| row.iter().take(columns).cloned().collect())
             .collect();
-        let measure = |text: &mut TextRenderer, layout: &LeafLayout, wrap: f32| -> Body {
-            let mut y = 0.0;
-            let mut seg_tops = Vec::new();
-            let mut geometry = Vec::new();
-            for seg in &layout.segments {
-                let g = text.rich_geometry(RichLine {
-                    text: &seg.text,
-                    runs: &seg.runs,
-                    wrap_width: Some(wrap),
-                });
-                seg_tops.push(y);
-                y += g.height();
-                geometry.push(g);
-            }
-            Body {
-                layout: layout.clone(),
-                seg_tops,
-                geometry,
-                range: 0..0,
-                wrap,
-            }
-        };
         // Each column's widest cell unwrapped (max) and its longest word
         // (min). Columns get their max if everything fits; otherwise the
         // space above the minimums is shared in proportion, so short
         // columns aren't broken mid-word to make room for long ones.
+        // Formulas are sized at this width, so a formula cell is as wide as
+        // its drawing rather than the one stand-in character.
         let mut max_w = vec![MIN_COLUMN; columns];
         let mut min_w = vec![MIN_COLUMN; columns];
-        for row in &layouts {
-            for (c, (_, layout)) in row.iter().enumerate() {
+        for row in &table_cells {
+            for (c, cell) in row.iter().enumerate() {
+                let body = self.lay_cell(doc, parse, cell, reveal.clone(), 100_000.0);
                 // A little slack: wrapping at exactly the measured width can
                 // still break the line after pixel rounding.
-                let natural = measure(&mut self.text, layout, 100_000.0).width() + 2.0;
-                max_w[c] = max_w[c].max(natural + 2.0 * CELL_PAD_X);
-                let word = layout
+                let width = body.width() + 2.0;
+                max_w[c] = max_w[c].max(width + 2.0 * CELL_PAD_X);
+                let word = body
+                    .layout
                     .segments
                     .iter()
                     .flat_map(|seg| seg.text.split_whitespace())
@@ -1237,13 +1300,12 @@ impl LiveView {
         let mut row_y = Vec::new();
         let mut row_h = Vec::new();
         let mut y = 0.0;
-        for row in &layouts {
+        for row in &table_cells {
             let mut h = row_min;
             let start = cells.len();
-            for (c, (block, layout)) in row.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
                 let inner = col_w[c] - 2.0 * CELL_PAD_X;
-                let mut body = measure(&mut self.text, layout, inner.max(8.0));
-                body.range = block.range.clone();
+                let body = self.lay_cell(doc, parse, cell, reveal.clone(), inner.max(8.0));
                 let text_h = body.seg_tops.last().copied().unwrap_or(0.0)
                     + body.geometry.last().map_or(0.0, |g| g.height());
                 h = h.max(text_h + 2.0 * CELL_PAD_Y);
@@ -1274,6 +1336,36 @@ impl LiveView {
             has_head: rows
                 .first()
                 .is_some_and(|r| r.0.kind == BlockKind::TableHead),
+        }
+    }
+
+    fn lay_cell(
+        &mut self,
+        doc: &Document,
+        parse: &ParseOutput,
+        cell: &inkmark_parse::Block,
+        reveal: Option<Reveal>,
+        wrap: f32,
+    ) -> Body {
+        let leaf = Leaf {
+            block: cell.clone(),
+            containers: Vec::new(),
+        };
+        let layout = self.prepare_layout(
+            doc,
+            &parse.map,
+            &leaf,
+            reveal,
+            wrap,
+            Some(self.selection.head),
+        );
+        let (seg_tops, geometry, _) = self.shape_segments(&layout, wrap, 0.0, true);
+        Body {
+            layout,
+            seg_tops,
+            geometry,
+            range: cell.range.clone(),
+            wrap,
         }
     }
 
@@ -1368,6 +1460,8 @@ impl LiveView {
             &leaf,
             Some(reveal_at(doc, offset)),
             &self.theme,
+            &[],
+            None,
         );
         let (seg, d) = layout.display_pos(offset);
         layout.source_pos(seg, d) == offset
@@ -2375,6 +2469,7 @@ impl LiveView {
             if hidden || (body.layout.style == LeafStyle::Rule && seg.text.is_empty()) {
                 continue;
             }
+            let skip: Vec<Range<usize>> = seg.maths.iter().map(|m| m.display.clone()).collect();
             self.text.draw_rich(
                 meshes,
                 RichLine {
@@ -2385,7 +2480,31 @@ impl LiveView {
                 o,
                 self.theme.text,
                 &seg.colors,
+                &skip,
             );
+            if let Some(ctx) = self.ctx.clone() {
+                let paint = self.paint_for(body.wrap);
+                for math in &seg.maths {
+                    let Some((texture, size)) =
+                        self.math
+                            .texture(&ctx, &math.tex, math.display_style, &paint)
+                    else {
+                        continue;
+                    };
+                    let Some(rect) =
+                        crate::math::formula_rect(&body.geometry[i], math.display.clone(), size)
+                    else {
+                        continue;
+                    };
+                    let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                    painter.image(
+                        texture.id(),
+                        rect.translate(o.to_vec2()),
+                        uv,
+                        Color32::WHITE,
+                    );
+                }
+            }
             for strike in &seg.strikes {
                 let mut rects = Vec::new();
                 body.geometry[i].selection_rects(strike.clone(), false, 0.0, &mut rects);
@@ -2829,5 +2948,155 @@ mod tests {
         );
         assert!(grid.col_w.iter().all(|w| *w > 20.0), "{:?}", grid.col_w);
         assert!(grid.row_h[0] > grid.row_h[1], "the long row wraps taller");
+    }
+
+    #[test]
+    fn a_formula_is_drawn_and_the_source_stays() {
+        use inkmark_parse::GfmParser;
+
+        let ctx = egui::Context::default();
+        let mut view = LiveView::with_fonts(inkmark_text::Fonts::shared(&ctx), Id::new("math"));
+        let width = 600.0;
+        view.text.begin_frame(
+            TextConfig {
+                monospace: false,
+                font_size: view.font_size,
+                line_height: view.line_height,
+                wrap_width: Some(width),
+            },
+            1.0,
+        );
+        let src = "Energy $E=mc^2$ today.\n\n$$\\frac{1}{2}$$\n\n$\\frac{$\n";
+        let doc = Document::from_text(src);
+        let parse = GfmParser.parse(src);
+        let inline = view.place(
+            &doc,
+            &parse,
+            parse.blocks.leaves_from(0).next().unwrap(),
+            width,
+        );
+        let text = inline.body.layout.segments[0].text.as_str();
+        assert!(!text.contains("E=mc"), "{text}");
+        assert!(text.contains('M'), "{text}");
+        assert!(
+            text.starts_with("Energy ") && text.ends_with(" today."),
+            "{text}"
+        );
+        assert_eq!(inline.body.layout.segments[0].maths[0].tex, "E=mc^2");
+        assert_eq!(doc.slice(0..doc.len()).as_ref(), src);
+        // The code pane can hold the caret inside the formula. The live pane
+        // then shows those bytes, focused or not, so the caret stays on them.
+        view.selection = Selection::caret(src.find("mc").unwrap());
+        let shown = view.place(
+            &doc,
+            &parse,
+            parse.blocks.leaves_from(0).next().unwrap(),
+            width,
+        );
+        let shown_text: String = shown
+            .body
+            .layout
+            .segments
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(shown_text.contains("$E=mc^2$"), "{shown_text}");
+        view.selection = Selection::caret(0);
+
+        let display = view.place(
+            &doc,
+            &parse,
+            parse
+                .blocks
+                .leaves_from(src.find("frac").unwrap())
+                .next()
+                .unwrap(),
+            width,
+        );
+        assert!(
+            display
+                .body
+                .layout
+                .segments
+                .iter()
+                .any(|s| { s.maths.iter().any(|m| m.display_style) && !s.text.contains("frac") })
+        );
+        let row = view.text.row_height();
+        assert_eq!(display.body.layout.segments.len(), 1);
+        assert_eq!(display.body.geometry.len(), 1);
+        assert_eq!(display.body.geometry[0].rows.len(), 1);
+        let drawn = display.body.geometry[0].height();
+        assert!(drawn > row, "display row {drawn} vs text {row}");
+        let end = display.body.layout.segments[0].maths[0].source.end;
+        assert_eq!(display.body.layout.display_pos(end).0, 0);
+
+        let bad = view.place(
+            &doc,
+            &parse,
+            parse
+                .blocks
+                .leaves_from(src.rfind('$').unwrap())
+                .next()
+                .unwrap(),
+            width,
+        );
+        let bad_text: String = bad
+            .body
+            .layout
+            .segments
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(bad_text.contains("frac"), "{bad_text}");
+        assert!(bad.body.layout.segments.iter().all(|s| s.maths.is_empty()));
+
+        let table_src = "| $E=mc^2$ | a |\n|---|---|\n| b | c |\n";
+        let doc = Document::from_text(table_src);
+        let parse = GfmParser.parse(table_src);
+        let placed = view.place(
+            &doc,
+            &parse,
+            parse.blocks.leaves_from(0).next().unwrap(),
+            width,
+        );
+        let grid = placed.table.expect("table");
+        assert!(grid.col_w[0] > grid.col_w[1], "{:?}", grid.col_w);
+        let cell = &grid.cells[0].body.layout.segments[0].text;
+        assert!(cell.contains('M') && !cell.contains("mc"), "{cell}");
+    }
+
+    #[test]
+    fn a_wide_formula_stays_on_one_line() {
+        use inkmark_parse::GfmParser;
+
+        let ctx = egui::Context::default();
+        let mut view = LiveView::with_fonts(inkmark_text::Fonts::shared(&ctx), Id::new("wide"));
+        let width = 220.0;
+        view.text.begin_frame(
+            TextConfig {
+                monospace: false,
+                font_size: view.font_size,
+                line_height: view.line_height,
+                wrap_width: Some(width),
+            },
+            1.0,
+        );
+        let src = format!("${}$\n", "x+".repeat(39) + "x");
+        view.selection = Selection::caret(src.len());
+        let doc = Document::from_text(&src);
+        let parse = GfmParser.parse(&src);
+        let placed = view.place(
+            &doc,
+            &parse,
+            parse.blocks.leaves_from(0).next().unwrap(),
+            width,
+        );
+        assert!(placed.body.geometry.iter().all(|g| g.rows.len() == 1));
+        assert!(
+            placed.body.width() <= width + 1.0,
+            "{}",
+            placed.body.width()
+        );
+        assert_eq!(doc.slice(0..doc.len()).as_ref(), src);
     }
 }

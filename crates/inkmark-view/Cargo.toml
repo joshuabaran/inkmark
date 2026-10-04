@@ -17,6 +17,7 @@ inkmark-minimap.workspace = true
 inkmark-parse.workspace = true
 inkmark-text.workspace = true
 unicode-segmentation.workspace = true
+latex-rust.workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"

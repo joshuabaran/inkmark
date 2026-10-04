@@ -1819,6 +1819,7 @@ dependencies = [
  "inkmark-minimap",
  "inkmark-parse",
  "inkmark-text",
+ "latex-rust",
  "resvg",
  "tempfile",
  "unicode-segmentation",
@@ -1986,6 +1987,15 @@ dependencies = [
  "euclid",
  "polycool",
  "smallvec",
+]
+
+[[package]]
+name = "latex-rust"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ced92d153ae83e138ed6ad12bb6fab5e310f37c43be94c47bf5aa5feb60bdb09"
+dependencies = [
+ "ttf-parser",
 ]
 
 [[package]]
