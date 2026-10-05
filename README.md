@@ -50,7 +50,9 @@ disk are the only source of truth: no accounts, sync or plugins.
 </tr>
 </table>
 
-The themes are Omarchy's; inkmark follows whichever one is active.
+Tokyo Night, Flexoki Light, Catppuccin Latte, and Rosé Pine are Omarchy
+themes; inkmark follows whichever one is active. With no Omarchy palette
+it uses its own dark or light theme, shown last.
 
 See [PLAN.md](PLAN.md) for the design, measurements and roadmap.
 
@@ -172,16 +174,25 @@ inkmark               # browses the current directory and shows recent files
 | Ctrl+Shift+N | New folder in the selected folder, or the open folder (`new_folder`) |
 | F1 | Show or hide the key bindings (`show_keys`) |
 
-Arrows, Home, End, Page Up, Page Down, Backspace, Delete, Enter and Tab edit
-as usual, and holding Shift extends a selection. Those keys are not in the
+Arrows, Home, End, Page Up, Page Down, Backspace, Enter and Tab edit as
+usual, and holding Shift extends a selection. Those keys are not in the
 table, so they can't be rebound; the Ctrl and Alt chords of them can, and
-are listed above. Ctrl+click follows a link (a note, `#heading`, footnote,
-or web page) and is not a binding either. In the live pane, Enter continues
-a list item or quote and leaves an empty one; Shift+Enter inserts a hard
+are listed above. Delete in a pane deletes a character. In the sidebar it
+moves the selected file or folder to the trash, which is the binding in
+the table. Ctrl+click follows a link (a note, `#heading`, footnote, or web
+page) and is not a binding either. In the live pane, Enter continues a
+list item or quote and leaves an empty one; Shift+Enter inserts a hard
 line break. In a table, Tab and Shift+Tab move to the next and previous
 cell, and Enter moves to the cell below, adding a row on the last. Outside
 a table, a table chord keeps its ordinary meaning, so Alt+Shift+Left still
 extends the selection.
+
+Ctrl+F finds in this file and Ctrl+H replaces. A selection on one line
+becomes the query. The search ignores case until Match case is on, and it
+is plain text until Regex is on. Replace all is one undo step. Escape
+closes the bar. Ctrl+G asks for a line number and puts the caret there.
+An empty, zero, or non-numeric entry stays put, and a line past the end
+lands on the last line.
 
 In the live pane, click a task's checkbox to tick it. Right-click a table cell for the
 row, column and alignment commands. When you leave a table you edited,
@@ -189,16 +200,25 @@ its columns are padded so the pipes line up again (one undo step).
 `$...$` and `$$...$$` are drawn as formulas there. The source stays as
 written, and a caret in the formula shows those bytes.
 
+In the code pane, a heading with anything under it shows ▾ in the left
+margin. Click it to hide the body through the next heading of the same or
+higher level; the heading line stays, and ▸ shows the body again. The
+live pane still draws that text. A jump into the hidden lines opens the
+fold.
+
 The sidebar sits to the left of the panes. Its buttons are ↑ up to the
 parent folder, ↗ to open a folder, ↻ to re-read the folders that are
 expanded, + for a new note, ⊞ for a new folder, and ∗ to search. Each one
-has a tooltip, and All files stays words. Arrow keys move through the
+has a tooltip. All files stays words: checking it lists names that start
+with a dot, and files that are not Markdown. A file that is not Markdown
+is shown and not opened. While the open file has unsaved edits, its row
+shows ●, the same mark as the status bar. Arrow keys move through the
 tree, Left and Right collapse and expand a folder, and Enter opens a
 Markdown file. Ctrl+Shift+F searches this folder, and so does ∗. A file
 name is listed first, and a match inside a file follows; opening either
 one opens that note. A name without a Markdown extension gets `.md`. A
-new folder keeps the name you type. A blank name, a slash, `.`, or `..`
-is refused. Right-click an entry to rename it,
+new folder keeps the name you type. A blank name, a slash, a backslash,
+`.`, or `..` is refused. Right-click an entry to rename it,
 move it (or drag it onto a folder), move it to the trash, or create a
 file or a folder next to it. Nothing is ever overwritten: a name that's
 taken is refused. If the open file is renamed or moved, it stays open
