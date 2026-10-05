@@ -5,7 +5,7 @@
 A fast, local Markdown editor for Linux and Wayland. Plain `.md` files on
 disk are the only source of truth: no accounts, sync or plugins.
 
-![inkmark in split view: the notes folder in the sidebar, Markdown on the left and the rendered document on the right, in the Tokyo Night theme](docs/screenshots/split-tokyo-night.png)
+![inkmark in split view: the notes folder in the sidebar, Markdown on the left, the rendered document on the right, and the heading outline, in the Tokyo Night theme](docs/screenshots/split-tokyo-night.png)
 
 - **Three views of one document**: split (raw Markdown left, rendered
   right), code only, or live only. Both panes are editable; one undo history.
@@ -41,11 +41,11 @@ disk are the only source of truth: no accounts, sync or plugins.
 <td align="center">Code view · Catppuccin Latte</td>
 </tr>
 <tr>
-<td><img src="docs/screenshots/long-document-rose-pine.png" alt="A 5 MB book in split view with both minimaps, Rosé Pine theme"></td>
+<td><img src="docs/screenshots/long-document-rose-pine.png" alt="A 5 MB book in split view with the heading outline and both minimaps, Rosé Pine theme"></td>
 <td><img src="docs/screenshots/split-built-in-dark.png" alt="Split view in inkmark's built-in dark theme"></td>
 </tr>
 <tr>
-<td align="center">A 5 MB book with minimaps · Rosé Pine</td>
+<td align="center">A 5 MB book with the outline and minimaps · Rosé Pine</td>
 <td align="center">Built-in dark theme</td>
 </tr>
 </table>
