@@ -1106,3 +1106,53 @@ fn a_jump_deep_into_a_long_table_draws_the_table() {
     );
     assert_eq!(s.live.view_top().0, first, "the view is inside the table");
 }
+
+#[test]
+fn arrow_up_in_an_estimated_table_stays_on_the_real_row() {
+    // A table's rows are taller drawn (cell padding) than their per-line
+    // estimates, so an estimated table is shorter in the height cache than
+    // on screen.
+    let mut src = String::from("| a | b | c |\n|---|---|---|\n");
+    for i in 0..120 {
+        src.push_str(&format!("| row {i} | x | y |\n"));
+    }
+    src.push('\n');
+    src.push_str(&"Filler.\n\n".repeat(300));
+    let at = src.find("row 100 ").unwrap() + 4;
+    let row_line = |s: &Split| s.doc.byte_to_line(s.live.selection().head);
+
+    // On screen: the table is laid out, and Arrow Up goes to row 99.
+    let mut fresh = Split::new(&src);
+    fresh.ctx.set_zoom_factor(1.25);
+    fresh.frame(vec![]);
+    fresh.caret(at);
+    fresh.press(Key::ArrowUp);
+    let expected = row_line(&fresh);
+    assert_eq!(expected, src[..at].matches('\n').count() - 1, "one row up");
+
+    // The caret handed over without a scroll, the view far below, then a
+    // zoom: the table is estimated again when Arrow Up runs.
+    let mut s = Split::new(&src);
+    s.live
+        .mirror_selection(inkmark_buffer::Selection::caret(at));
+    let parse = s.parse.output().clone();
+    let far = s.doc.line_count() - 5;
+    s.live.set_scroll_pos(
+        &s.doc,
+        &parse,
+        inkmark_view::ScrollPos {
+            line: far,
+            frac: 0.0,
+        },
+    );
+    s.frame(vec![]);
+    s.ctx.set_zoom_factor(1.25);
+    s.frame(vec![]);
+    s.frame(vec![]);
+    assert!(
+        !s.live.line_measured(0),
+        "the zoom left the table estimated"
+    );
+    s.press(Key::ArrowUp);
+    assert_eq!(row_line(&s), expected);
+}

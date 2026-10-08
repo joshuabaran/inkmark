@@ -613,3 +613,83 @@ fn an_edit_far_above_the_view_leaves_it_in_place() {
     h.frame(vec![]);
     assert_eq!(h.view.view_top(), (top + 2, offset));
 }
+
+/// A paragraph of wide letters over many source lines. Its estimate
+/// (characters × the average advance) under-counts its rows, so its real
+/// height is well past what the height cache holds until it's laid out.
+fn wide_paragraph(words: usize) -> String {
+    (0..words)
+        .map(|i| if i % 9 == 8 { "WWWWWW\n" } else { "WWWWWW " })
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+        + "\n"
+}
+
+/// Where `key` takes the caret from `at`, when the caret's block was
+/// measured before a zoom and the view has moved far away since, so the
+/// zoom left that block estimated.
+fn key_after_rebuild(src: &str, at: usize, key: Key) -> usize {
+    let mut h = Harness::new(src);
+    // Placed without scrolling to it, as when the other pane hands the
+    // caret over.
+    h.view.mirror_selection(Selection::caret(at));
+    let parse = h.parse.output().clone();
+    let far = h.doc.line_count() - 5;
+    h.view.set_scroll_pos(
+        &h.doc,
+        &parse,
+        ScrollPos {
+            line: far,
+            frac: 0.0,
+        },
+    );
+    h.frame(vec![]);
+    h.ctx.set_zoom_factor(1.25);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(
+        !h.view.line_measured(0),
+        "the zoom left the caret's block estimated"
+    );
+    h.press(key);
+    h.head()
+}
+
+/// The same move with the caret's block on screen and laid out.
+fn key_on_screen(src: &str, at: usize, key: Key) -> usize {
+    let mut h = Harness::new(src);
+    h.ctx.set_zoom_factor(1.25);
+    h.frame(vec![]);
+    h.view.set_selection(Selection::caret(at));
+    h.frame(vec![]);
+    assert!(h.view.line_measured(0), "the caret's block is on screen");
+    h.press(key);
+    h.head()
+}
+
+#[test]
+fn arrow_up_in_an_estimated_block_stays_on_the_real_row() {
+    let wide = wide_paragraph(300);
+    let src = format!("{wide}\n{}", "Filler.\n\n".repeat(300));
+    let at = wide.len() - 10;
+    let expected = key_on_screen(&src, at, Key::ArrowUp);
+    assert!(
+        expected < at && expected > at - 120,
+        "one row up: {expected} from {at}"
+    );
+    assert_eq!(key_after_rebuild(&src, at, Key::ArrowUp), expected);
+}
+
+#[test]
+fn page_up_in_a_block_taller_than_the_view_stays_on_the_real_row() {
+    let wide = wide_paragraph(700);
+    let src = format!("{wide}\n{}", "Filler.\n\n".repeat(300));
+    let at = wide.len() - 10;
+    let expected = key_on_screen(&src, at, Key::PageUp);
+    assert!(
+        expected > 0 && expected < at,
+        "a page up inside the block: {expected}"
+    );
+    assert_eq!(key_after_rebuild(&src, at, Key::PageUp), expected);
+}

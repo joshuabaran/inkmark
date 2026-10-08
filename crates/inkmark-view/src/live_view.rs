@@ -1618,16 +1618,20 @@ impl LiveView {
         dy: f32,
         extend: bool,
     ) {
-        // The caret moves by document height, so whatever it crosses needs
-        // its real height first. One move's worth, never the whole prefix.
+        // The caret moves by document height, so its own block and whatever
+        // it crosses need their real heights first: the caret's y comes from
+        // the block's layout, and the target is found in the height cache.
+        // One move's worth, never the whole prefix.
         let caret_line = doc.byte_to_line(self.selection.head.min(doc.len()));
         let first = Self::block_start(doc, parse, caret_line);
+        let end = leaf_lines(doc, parse, first).map_or(first + 1, |(_, last)| last + 1);
+        if self.block_unmeasured(first, end) {
+            self.store_block(doc, parse, first, frame.width);
+        }
         let reach = f64::from(dy.abs() + self.text.row_height());
         if dy < 0.0 {
             self.measure_above(doc, parse, first, reach, frame.width);
         } else {
-            self.measure_below(doc, parse, first, 0.0, frame.width);
-            let end = leaf_lines(doc, parse, first).map_or(first + 1, |(_, last)| last + 1);
             let heights = &self.lines.heights;
             let block = heights.offset_of(end.min(heights.len())) - heights.offset_of(first);
             self.measure_below(doc, parse, first, block + reach, frame.width);
