@@ -825,16 +825,29 @@ impl LiveView {
         (start..end.max(start + 1).min(len)).any(|l| !self.lines.heights.is_measured(l))
     }
 
-    /// Lays out again the blocks an edit changed since the last settle.
-    /// A block whose lines are all estimates is left alone: nothing there
-    /// is stale.
-    fn remeasure_edited(&mut self, doc: &Document, parse: &ParseOutput, width: f32) {
+    /// Lays out again the blocks an edit changed since the last settle,
+    /// above or below the view. A block in view is laid out again by
+    /// `remeasure_visible` anyway, and a block whose lines are all estimates
+    /// is left alone: nothing there is stale.
+    fn remeasure_edited(&mut self, doc: &Document, parse: &ParseOutput, width: f32, viewport: f32) {
         let len = doc.line_count().min(self.lines.heights.len());
+        if len == 0 {
+            self.remeasure.clear();
+            return;
+        }
+        let heights = &self.lines.heights;
+        let view_top = Self::block_start(doc, parse, self.lines.anchor.line.min(len - 1));
+        let view_bottom = heights
+            .line_at(heights.anchor_y(self.lines.anchor) + f64::from(viewport))
+            .line;
         for line in std::mem::take(&mut self.remeasure) {
             if line >= len {
                 continue;
             }
             let (first, last) = leaf_lines(doc, parse, line).unwrap_or((line, line));
+            if first <= view_bottom && last >= view_top {
+                continue;
+            }
             let any_measured =
                 (first..=last.min(len - 1)).any(|l| self.lines.heights.is_measured(l));
             if any_measured {
@@ -892,6 +905,13 @@ impl LiveView {
             let heights = &self.lines.heights;
             if heights.offset_of(from) - heights.offset_of(line) >= amount {
                 break;
+            }
+            // A measured line needs nothing, and the rest of a measured
+            // block's lines are measured at zero, so step over them without
+            // looking the block up.
+            if heights.is_measured(line - 1) {
+                line -= 1;
+                continue;
             }
             let start = Self::block_start(doc, parse, line - 1).min(line - 1);
             if self.block_unmeasured(start, line) {
@@ -971,7 +991,7 @@ impl LiveView {
         if self.lines.heights.is_empty() {
             return;
         }
-        self.remeasure_edited(doc, parse, width);
+        self.remeasure_edited(doc, parse, width, viewport);
         self.collapse_anchor_block(doc, parse, width);
         if extra < 0.0 {
             let from = Self::block_start(doc, parse, self.lines.anchor.line);

@@ -156,11 +156,18 @@ impl BlockTree {
         // top-level block that holds it.
         let mut path: Vec<Block> = Vec::new();
         let mut min_depth = u16::MAX;
+        // The leaf holding `offset`. The forward scan below starts at the
+        // chunk that holds `offset`, which can be past the leaf's own
+        // block when the leaf is long (a table's rows and cells are blocks
+        // too), so it's found here and yielded first.
+        let mut holding: Option<Block> = None;
         for b in self.blocks.iter_back_from(offset) {
             if b.range.start <= offset && b.range.end > offset && b.depth < min_depth {
                 min_depth = b.depth;
                 if !b.kind.is_leaf() {
                     path.push(b.clone());
+                } else if !b.kind.is_table_part() {
+                    holding = Some(b.clone());
                 }
             }
             if b.depth == 0 && b.range.start <= offset {
@@ -168,33 +175,42 @@ impl BlockTree {
             }
         }
         path.reverse();
+        let first = holding.clone().map(|block| Leaf {
+            block,
+            containers: path.clone(),
+        });
         let mut stack = path;
-        self.blocks
-            .iter_from(offset)
-            .filter(move |b| {
-                if b.kind.is_table_part() {
-                    // Yielded with their table.
-                    false
-                } else if b.kind.is_leaf() {
-                    b.range.end > offset
-                } else {
-                    b.range.start > offset
-                }
-            })
-            .filter_map(move |b| {
-                while stack.last().is_some_and(|c| c.range.end <= b.range.start) {
-                    stack.pop();
-                }
-                if b.kind.is_leaf() {
-                    Some(Leaf {
-                        block: b,
-                        containers: stack.clone(),
-                    })
-                } else {
-                    stack.push(b);
-                    None
-                }
-            })
+        first.into_iter().chain(
+            self.blocks
+                .iter_from(offset)
+                .filter(move |b| {
+                    if holding.as_ref() == Some(b) {
+                        // Already yielded first.
+                        false
+                    } else if b.kind.is_table_part() {
+                        // Yielded with their table.
+                        false
+                    } else if b.kind.is_leaf() {
+                        b.range.end > offset
+                    } else {
+                        b.range.start > offset
+                    }
+                })
+                .filter_map(move |b| {
+                    while stack.last().is_some_and(|c| c.range.end <= b.range.start) {
+                        stack.pop();
+                    }
+                    if b.kind.is_leaf() {
+                        Some(Leaf {
+                            block: b,
+                            containers: stack.clone(),
+                        })
+                    } else {
+                        stack.push(b);
+                        None
+                    }
+                }),
+        )
     }
 
     /// The rows of `table` (header first), each with its cells, in order.

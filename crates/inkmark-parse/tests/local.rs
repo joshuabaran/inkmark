@@ -651,3 +651,29 @@ fn changing_a_far_destination_keeps_the_reference_a_link() {
             .any(|s| s.style.contains(inkmark_parse::Style::LINK))
     );
 }
+
+#[test]
+fn leaves_from_deep_inside_a_long_table_starts_with_the_table() {
+    // Hundreds of rows put the table's own block chunks before its last rows.
+    let mut src = String::from("Intro.\n\n| a | b |\n|---|---|\n");
+    for i in 0..600 {
+        src.push_str(&format!("| {i} | x |\n"));
+    }
+    src.push_str("\nAfter.\n");
+    let out = GfmParser.parse(&src);
+    let deep = src.find("| 550 |").unwrap() + 3;
+    let first = out.blocks.leaves_from(deep).next().unwrap();
+    assert!(
+        matches!(first.block.kind, inkmark_parse::BlockKind::Table { .. }),
+        "{:?}",
+        first.block
+    );
+    assert!(first.block.range.start < deep && deep < first.block.range.end);
+    // The leaf after it is the next paragraph, once.
+    let rest: Vec<_> = out.blocks.leaves_from(deep).skip(1).collect();
+    assert_eq!(rest.len(), 1, "{rest:?}");
+    assert_eq!(&src[rest[0].block.range.clone()], "After.\n");
+    // From inside a paragraph, that paragraph comes first as before.
+    let intro = out.blocks.leaves_from(2).next().unwrap();
+    assert_eq!(&src[intro.block.range.clone()], "Intro.\n");
+}
