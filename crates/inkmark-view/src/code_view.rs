@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use egui::output::IMEOutput;
 use egui::{
-    Align2, CursorIcon, Event, EventFilter, FontId, IMEPurpose, Id, ImeEvent, Key, Modifiers, Pos2,
-    Rect, Response, Sense, Ui, pos2, vec2,
+    Align2, CursorIcon, Event, FontId, IMEPurpose, Id, ImeEvent, Key, Modifiers, Pos2, Rect,
+    Response, Sense, Ui, pos2, vec2,
 };
 use inkmark_buffer::{Bias, Change, Document, Edit, EditKind, Selection};
 use inkmark_parse::{ParseOutput, ParseState};
@@ -19,7 +19,7 @@ use inkmark_text::{
 use crate::commands::{self, EditPlan};
 use crate::folds::Folds;
 use crate::keys::{self, Action};
-use crate::lines::SCROLLBAR_WIDTH;
+use crate::lines::{self, SCROLLBAR_WIDTH};
 use crate::lines::{LineIndex, ScrollPos, Synced};
 use crate::long_line::{LONG_LINE, Rows};
 use crate::motion;
@@ -362,17 +362,7 @@ impl CodeView {
         if response.clicked() || response.drag_started() {
             response.request_focus();
         }
-        ui.memory_mut(|m| {
-            m.set_focus_lock_filter(
-                self.id,
-                EventFilter {
-                    tab: true,
-                    horizontal_arrows: true,
-                    vertical_arrows: true,
-                    escape: false,
-                },
-            )
-        });
+        lines::lock_focus(ui, self.id);
         let focused = response.has_focus();
         let viewport = rect.height();
         self.viewport = viewport;

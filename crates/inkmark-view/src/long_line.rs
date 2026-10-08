@@ -215,7 +215,12 @@ pub(crate) fn holds_long_line(doc: &inkmark_buffer::Document, range: &Range<usiz
 /// its trailing newline. The notice's end is then the end of its text, and
 /// the caret after the newline is on the next line, as after any paragraph.
 pub(crate) fn notice_source(doc: &inkmark_buffer::Document, range: Range<usize>) -> Range<usize> {
-    let end = if range.end > range.start && doc.slice(range.end - 1..range.end) == "\n" {
+    // A byte, not a slice: until the full parse lands, a rebased block can
+    // end inside a character.
+    let end = if range.end > range.start
+        && range.end <= doc.len()
+        && doc.rope().byte(range.end - 1) == b'\n'
+    {
         range.end - 1
     } else {
         range.end
@@ -329,5 +334,13 @@ mod tests {
         assert_eq!((c[3].start, c[3].end, c[3].x, c[3].w), (3, 9, 30.0, 10.0));
         assert_eq!(g.hit_row_affine(0, f32::INFINITY), (3, false));
         assert_eq!(g.hit_row_affine(0, 200.0), (3, false));
+    }
+
+    #[test]
+    fn a_notice_source_ending_inside_a_character_is_kept_whole() {
+        let doc = inkmark_buffer::Document::from_text("ab中\ncd\n");
+        assert_eq!(notice_source(&doc, 0..4), 0..4);
+        assert_eq!(notice_source(&doc, 0..6), 0..5);
+        assert_eq!(notice_source(&doc, 6..9), 6..8);
     }
 }
