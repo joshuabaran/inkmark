@@ -770,9 +770,8 @@ fn zoom(r: &Reporter) {
 }
 
 /// Dragging the window edge (or the split): the panes get a few points
-/// narrower every frame. From 1600 pt wide the live pane stays at its
-/// 75-character measure and only the code pane re-wraps; from 1100 pt the
-/// live pane is narrower than that measure and re-wraps too.
+/// narrower every frame. Both panes wrap at their panel's width, so both
+/// re-wrap every frame: from 1600 pt wide (long live lines) and from 1100 pt.
 fn resize(r: &Reporter, book: &str) {
     for (name, text, width) in [
         (

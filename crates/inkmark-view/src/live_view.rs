@@ -45,10 +45,6 @@ const MIN_COLUMN: f32 = 48.0;
 const REVEAL_FRAMES: u8 = 3;
 /// Height of a blank source line, in rows.
 const BLANK_LINE: f32 = 0.6;
-/// Live-pane measure, in characters of the live font (the middle of 70–80).
-const READING_CHARS: f32 = 75.0;
-/// Narrowest that measure gets. A narrower pane wraps at the pane's width.
-const READING_FLOOR: f32 = 40.0;
 
 /// Laid-out text: a leaf's (or a table cell's) display segments.
 struct Body {
@@ -498,7 +494,7 @@ impl LiveView {
         ui.advance_cursor_after_rect(rect);
         let (bar, text_right, minimap) = self.pane_bounds(rect);
         let available = (text_right - rect.left() - 2.0 * PADDING).max(80.0);
-        let mut frame = Frame {
+        let frame = Frame {
             rect,
             left: rect.left() + PADDING,
             width: available,
@@ -523,25 +519,10 @@ impl LiveView {
             line_height: self.line_height,
             wrap_width: Some(width),
         };
-        // The advance is 0 until the first frame and does not depend on the
-        // wrap, so a frame that already knows it starts at the capped width.
-        // Starting from the pane width every frame would invalidate the
-        // cache on the way back from last frame's cap.
-        let mut width = available;
-        if self.text.avg_advance() > 0.0 {
-            width = self.reading_width(available);
-        }
-        if self.text.begin_frame(config_for(width), ppp) {
+        // The live pane wraps at its content column.
+        if self.text.begin_frame(config_for(available), ppp) {
             self.lines.invalidate();
         }
-        let reading = self.reading_width(available);
-        if (reading - width).abs() > 0.5 {
-            width = reading;
-            if self.text.begin_frame(config_for(width), ppp) {
-                self.lines.invalidate();
-            }
-        }
-        frame.width = width;
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, self.theme.background);
         if self.images.is_none() {
@@ -689,13 +670,6 @@ impl LiveView {
         }
         self.selection.anchor = self.selection.anchor.min(doc.len());
         self.selection.head = self.selection.head.min(doc.len());
-    }
-
-    /// The live wrap: about 75 characters, and the pane's width when that
-    /// is narrower. `available` is the content column in points.
-    fn reading_width(&self, available: f32) -> f32 {
-        let measure = READING_CHARS * self.text.avg_advance();
-        available.min(measure).max(READING_FLOOR).min(available)
     }
 
     /// A source line outside any leaf, as the live pane shows it: the line,
