@@ -6,8 +6,8 @@ use std::ops::Range;
 
 use egui::output::IMEOutput;
 use egui::{
-    Color32, CursorIcon, Event, EventFilter, IMEPurpose, Id, ImeEvent, Key, Modifiers, Pos2, Rect,
-    Response, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
+    Color32, CursorIcon, Event, IMEPurpose, Id, ImeEvent, Key, Modifiers, Pos2, Rect, Response,
+    Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
 use inkmark_buffer::{Bias, Document, Edit, EditKind, Selection};
 use inkmark_parse::{
@@ -511,17 +511,7 @@ impl LiveView {
         if response.clicked() || response.drag_started() {
             response.request_focus();
         }
-        ui.memory_mut(|m| {
-            m.set_focus_lock_filter(
-                self.id,
-                EventFilter {
-                    tab: true,
-                    horizontal_arrows: true,
-                    vertical_arrows: true,
-                    escape: false,
-                },
-            )
-        });
+        lines::lock_focus(ui, self.id);
         self.focused = response.has_focus();
 
         self.ctx = Some(ui.ctx().clone());

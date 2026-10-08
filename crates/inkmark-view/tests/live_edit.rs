@@ -1213,10 +1213,10 @@ fn fuzzed_typing_in_a_very_long_line_inserts_only_the_typed_text() {
             });
             s.frame(vec![]);
         }
-        // In the text column. (After a click on the minimap, at x 702 and
-        // up, an arrow key drops the pane's focus and typing is lost. That
-        // happens on master too, with any document, and is its own bug.)
-        s.click(pos2(20.0 + rand(670) as f32, 10.0 + rand(560) as f32));
+        // Anywhere in the code pane: the text, the minimap (x 702 to 790)
+        // or the scrollbar. A click on either of those keeps the caret and
+        // the pane's keys (CRO-128).
+        s.click(pos2(20.0 + rand(780) as f32, 10.0 + rand(560) as f32));
         if rand(2) == 0 {
             s.press(keys[rand(keys.len() as u64) as usize]);
         }
@@ -1387,4 +1387,60 @@ fn a_caret_the_code_pane_left_inside_a_notice_types_at_its_end() {
     let mut expected = src.clone();
     expected.insert(long.end, 'Z');
     assert_eq!(s.text(), expected);
+}
+
+#[test]
+fn an_arrow_after_a_minimap_or_scrollbar_click_keeps_typing_in_the_pane() {
+    // Regression for CRO-128: a click on a pane's minimap or scrollbar
+    // re-requested focus, which cleared the pane's lock on the arrow keys.
+    // The next arrow then moved egui's focus to the nearest widget that way
+    // (the minimap, for Right), and what was typed after it was lost.
+    let src = "Some words on a line of their own.\n\n".repeat(150);
+    // (pane, widget, x): each pane's minimap, then its scrollbar.
+    let widgets = [
+        ("code", "minimap", 740.0),
+        ("code", "scrollbar", 795.0),
+        ("live", "minimap", 1540.0),
+        ("live", "scrollbar", 1595.0),
+    ];
+    let arrows = [
+        Key::ArrowLeft,
+        Key::ArrowRight,
+        Key::ArrowUp,
+        Key::ArrowDown,
+    ];
+    for (pane, widget, x) in widgets {
+        for arrow in arrows {
+            let mut s = Split::new(&src);
+            let code = pane == "code";
+            // The caret mid-line on the third paragraph, so every arrow moves it.
+            let start = Selection::caret(2 * 36 + 10);
+            if code {
+                s.code.request_focus(&s.ctx);
+                s.code.set_selection(start);
+            } else {
+                s.live.request_focus(&s.ctx);
+                s.live.set_selection(start);
+            }
+            s.frame(vec![]);
+            s.frame(vec![]);
+            s.click(pos2(x, 5.0));
+            s.press(arrow);
+            let what = format!("{arrow:?} after a click on the {pane} pane's {widget}");
+            let (focused, caret) = if code {
+                (s.code.has_focus(&s.ctx), s.code.selection())
+            } else {
+                (s.live.has_focus(&s.ctx), s.live.selection())
+            };
+            assert!(focused, "{what}: the pane lost focus");
+            assert!(
+                caret.is_empty() && caret != start,
+                "{what}: caret {caret:?}"
+            );
+            let mut expected = s.text();
+            s.type_text("Z");
+            expected.insert(caret.head, 'Z');
+            assert_eq!(s.text(), expected, "{what}: typing went astray");
+        }
+    }
 }

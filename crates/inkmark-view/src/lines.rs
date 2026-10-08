@@ -215,12 +215,33 @@ impl LineIndex {
     }
 }
 
+/// Keys a focused pane keeps for itself: Tab and the arrows edit its text
+/// rather than move egui's focus to the next widget. Escape isn't kept.
+const PANE_KEYS: egui::EventFilter = egui::EventFilter {
+    tab: true,
+    horizontal_arrows: true,
+    vertical_arrows: true,
+    escape: false,
+};
+
+/// Keeps Tab and the arrows in the pane `id` while it has focus (see
+/// `PANE_KEYS`). egui reads the lock when a frame begins, so it has to be
+/// in place by the end of each frame, after anything that requests focus:
+/// a request starts the focus over, unlocked.
+pub(crate) fn lock_focus(ui: &Ui, id: Id) {
+    ui.memory_mut(|m| m.set_focus_lock_filter(id, PANE_KEYS));
+}
+
 /// Clicking a pane's scrollbar or minimap keeps (or gives) keyboard focus to
 /// the pane's text, so typing carries on where the caret is.
 pub(crate) fn keep_focus(ui: &Ui, id: Id, response: &egui::Response) {
     // egui drops focus on a click (the release) outside the focused widget,
-    // so reclaim it on press, click and drag end alike.
+    // so reclaim it on press, click and drag end alike. The request clears
+    // the pane's key lock, so lock it again: otherwise the next arrow key
+    // moves focus to the nearest widget that way (the minimap, say) and
+    // typing after it is lost.
     if response.is_pointer_button_down_on() || response.clicked() || response.drag_stopped() {
         ui.memory_mut(|m| m.request_focus(id));
+        lock_focus(ui, id);
     }
 }
