@@ -65,6 +65,33 @@ pub(crate) struct LeafLayout {
     pub segments: Vec<Segment>,
 }
 
+/// A block holding a line over `long_line::LONG_LINE` bytes: one line of
+/// text saying so, standing for the whole block's source (but a trailing
+/// newline, which ends the row as usual). Shaping a line that
+/// long freezes the pane for over a second per keystroke, so the live pane
+/// leaves it to the code pane. A caret in the block shows at the notice's
+/// start or end, arrow keys step over it, and typing at either end edits
+/// there as usual.
+fn long_notice(doc: &Document, range: Range<usize>, theme: &Theme) -> LeafLayout {
+    let text = crate::long_line::notice(range.len());
+    let range = crate::long_line::notice_source(doc, range);
+    let len = text.len();
+    LeafLayout {
+        style: LeafStyle::Paragraph,
+        segments: vec![Segment {
+            text,
+            colors: vec![(0..len, theme.markup)],
+            pieces: vec![Piece {
+                display: 0..len,
+                source: range.clone(),
+                exact: false,
+            }],
+            source_start: range.start,
+            ..Segment::default()
+        }],
+    }
+}
+
 /// Font size of heading levels 1–6, in percent of body text.
 const HEADING_SCALE: [u16; 6] = [190, 155, 130, 115, 100, 90];
 
@@ -285,6 +312,9 @@ pub(crate) fn build(
     math_caret: Option<usize>,
 ) -> LeafLayout {
     let range = leaf.block.range.clone();
+    if crate::long_line::shows_notice(doc, &leaf.block) {
+        return long_notice(doc, range, theme);
+    }
     let style = match leaf.block.kind {
         BlockKind::Heading(level) => LeafStyle::Heading(level),
         BlockKind::CodeBlock { .. } => LeafStyle::Code,
@@ -793,5 +823,38 @@ mod tests {
         );
         assert_eq!(texts(&l), vec!["Energy $E=mc^2$ today."]);
         assert!(l.segments.iter().all(|s| s.maths.is_empty()));
+    }
+
+    #[test]
+    fn a_table_cell_holding_a_very_long_line_is_a_notice() {
+        let cell = "x".repeat(70 * 1024);
+        let src = format!("| a | b |\n|---|---|\n| {cell} | c |\n");
+        let doc = Document::from_text(&src);
+        let out = inkmark_parse::GfmParser.parse(&src);
+        let table = out.blocks.leaves_from(0).next().unwrap().block;
+        let cells: Vec<_> = out
+            .blocks
+            .table_rows(&table)
+            .into_iter()
+            .flat_map(|(_, cells)| cells)
+            .collect();
+        let layout_of = |block: &inkmark_parse::Block| {
+            let leaf = Leaf {
+                block: block.clone(),
+                containers: Vec::new(),
+            };
+            build(&doc, &out.map, &leaf, None, &Theme::dark(), &[], None)
+        };
+        let long = cells.iter().find(|c| c.range.len() > 1024).unwrap();
+        let notice = crate::long_line::notice(long.range.len());
+        assert_eq!(texts(&layout_of(long)), [notice.as_str()]);
+        // A short cell is laid out as usual, on the long row too.
+        for name in ["a", "c"] {
+            let short = cells
+                .iter()
+                .find(|c| doc.slice(c.range.clone()).trim() == name)
+                .unwrap();
+            assert_eq!(texts(&layout_of(short)), [name]);
+        }
     }
 }

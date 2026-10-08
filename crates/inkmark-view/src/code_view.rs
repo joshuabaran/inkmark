@@ -12,13 +12,16 @@ use egui::{
 };
 use inkmark_buffer::{Bias, Change, Document, Edit, EditKind, Selection};
 use inkmark_parse::{ParseOutput, ParseState};
-use inkmark_text::{GlyphMeshes, ScrollAnchor, SharedFonts, TextConfig, TextRenderer};
+use inkmark_text::{
+    GlyphMeshes, LineGeometry, RichLine, ScrollAnchor, SharedFonts, TextConfig, TextRenderer,
+};
 
 use crate::commands::{self, EditPlan};
 use crate::folds::Folds;
 use crate::keys::{self, Action};
 use crate::lines::SCROLLBAR_WIDTH;
 use crate::lines::{LineIndex, ScrollPos, Synced};
+use crate::long_line::{LONG_LINE, Rows};
 use crate::motion;
 use crate::structure;
 use crate::tables;
@@ -97,6 +100,50 @@ pub struct CodeView {
     /// marks do not vanish between keystrokes.
     regions: Vec<CachedRegion>,
     region_revision: Option<u64>,
+    /// Wrap width in points, from this frame's layout settings.
+    wrap: f32,
+    /// Rows of lines over `LONG_LINE` (see `long_line`), kept across edits
+    /// that don't touch them.
+    long: Vec<LongRows>,
+}
+
+/// A long line's rows, the line's bytes as of `epoch`, and the column count
+/// they were wrapped at.
+struct LongRows {
+    epoch: u64,
+    range: Range<usize>,
+    cols: usize,
+    rows: std::rc::Rc<Rows>,
+}
+
+impl LongRows {
+    /// Brings `range` up to `doc`'s epoch: shifted past edits elsewhere.
+    /// False when an edit touched the line (or the log no longer reaches
+    /// back), so the rows are stale.
+    fn catch_up(&mut self, doc: &Document) -> bool {
+        if self.epoch == doc.epoch() {
+            return true;
+        }
+        let Some(changes) = doc.log().changes_since(self.epoch) else {
+            return false;
+        };
+        for c in changes {
+            if c.start <= self.range.end && c.old_end >= self.range.start {
+                return false;
+            }
+            self.range = c.map(self.range.start, Bias::Left)..c.map(self.range.end, Bias::Left);
+        }
+        self.epoch = doc.epoch();
+        true
+    }
+}
+
+/// Wrap width for a long line's grid row, which is never wrapped again.
+const UNWRAPPED: f32 = 1.0e6;
+
+/// Rows `reach` either side of `row`, as a geometry window.
+fn around(row: usize, reach: usize) -> Range<usize> {
+    row.saturating_sub(reach)..row + reach + 1
 }
 
 /// A heading the code pane can fold, remembered across frames.
@@ -160,6 +207,8 @@ impl CodeView {
             marker_hits: Vec::new(),
             regions: Vec::new(),
             region_revision: None,
+            wrap: 0.0,
+            long: Vec::new(),
         }
     }
 
@@ -267,6 +316,7 @@ impl CodeView {
         self.marker_hits.clear();
         self.regions.clear();
         self.region_revision = None;
+        self.long.clear();
     }
 
     /// Gives up keyboard focus (e.g. while a dialog is open).
@@ -333,6 +383,7 @@ impl CodeView {
             line_height: self.line_height,
             wrap_width: Some((frame.text_right - frame.text_left - PADDING).max(40.0)),
         };
+        self.wrap = config.wrap_width.unwrap_or(0.0);
         if self.text.begin_frame(config, ui.ctx().pixels_per_point()) {
             self.lines.invalidate();
         }
@@ -730,12 +781,84 @@ impl CodeView {
         doc.slice(doc.line_range(line))
     }
 
+    /// The rows of `line` when it's over `LONG_LINE`: wrapped on the cell
+    /// grid without shaping (see `long_line`), again only when an edit
+    /// touches the line or the width changes.
+    fn long_rows(&mut self, doc: &Document, line: usize) -> Option<std::rc::Rc<Rows>> {
+        let range = doc.line_range(line);
+        if range.len() <= LONG_LINE {
+            return None;
+        }
+        let cell = self.text.avg_advance();
+        let cols = if cell > 0.0 {
+            (self.wrap / cell).floor().max(1.0) as usize
+        } else {
+            1
+        };
+        self.long.retain_mut(|e| e.catch_up(doc));
+        if let Some(e) = self
+            .long
+            .iter()
+            .find(|e| e.range == range && e.cols == cols)
+        {
+            return Some(e.rows.clone());
+        }
+        if self.long.len() > 16 {
+            self.long.clear();
+        }
+        let rows = std::rc::Rc::new(Rows::wrap(
+            doc.rope().byte_slice(range.clone()).chunks(),
+            cols,
+        ));
+        self.long.push(LongRows {
+            epoch: doc.epoch(),
+            range,
+            cols,
+            rows: rows.clone(),
+        });
+        Some(rows)
+    }
+
+    /// Height of `line` in points: its rows on the cell grid when it's
+    /// long, its laid-out height otherwise.
+    fn line_height_of(&mut self, doc: &Document, line: usize) -> f32 {
+        match self.long_rows(doc, line) {
+            Some(rows) => rows.count() as f32 * self.text.row_height(),
+            None => self.text.line_height(&Self::line_text(doc, line)),
+        }
+    }
+
+    /// Caret geometry of `line`. For a long line only the rows `window`
+    /// picks (given the rows) get clusters, so ask only about those.
+    fn geometry_of(
+        &mut self,
+        doc: &Document,
+        line: usize,
+        window: impl FnOnce(&Rows) -> Range<usize>,
+    ) -> LineGeometry {
+        match self.long_rows(doc, line) {
+            Some(rows) => {
+                let base = doc.line_to_byte(line);
+                rows.geometry(
+                    window(&rows),
+                    self.text.avg_advance(),
+                    self.text.row_height(),
+                    |r| doc.slice(base + r.start..base + r.end).into_owned(),
+                )
+            }
+            None => self.text.geometry(&Self::line_text(doc, line)),
+        }
+    }
+
     /// Moves the caret `rows` visual rows up (negative) or down, keeping its x.
     fn move_vertical(&mut self, doc: &mut Document, rows: i32, extend: bool) {
         let mut head = self.selection.head;
         let mut line = doc.byte_to_line(head);
-        let mut geometry = self.text.geometry(&Self::line_text(doc, line));
-        let mut row = geometry.row_of_affine(head - doc.line_to_byte(line), self.upstream());
+        // Rows a long line needs clusters for: as far as this move reaches.
+        let reach = rows.unsigned_abs() as usize + 1;
+        let rel = head - doc.line_to_byte(line);
+        let mut geometry = self.geometry_of(doc, line, |r| around(r.row_of(rel), reach));
+        let mut row = geometry.row_of_affine(rel, self.upstream());
         let mut upstream = false;
         let x = self
             .preferred_x
@@ -754,7 +877,8 @@ impl CodeView {
                         break;
                     }
                     line = prev;
-                    geometry = self.text.geometry(&Self::line_text(doc, line));
+                    geometry =
+                        self.geometry_of(doc, line, |r| r.count().saturating_sub(reach)..r.count());
                     row = geometry.rows.len() - 1;
                 } else {
                     head = 0;
@@ -773,7 +897,7 @@ impl CodeView {
                     break;
                 }
                 line = next;
-                geometry = self.text.geometry(&Self::line_text(doc, line));
+                geometry = self.geometry_of(doc, line, |_| 0..reach);
                 row = 0;
             } else {
                 head = doc.len();
@@ -794,7 +918,7 @@ impl CodeView {
         let head = self.selection.head;
         let line = doc.byte_to_line(head);
         let start = doc.line_to_byte(line);
-        let geometry = self.text.geometry(&Self::line_text(doc, line));
+        let geometry = self.geometry_of(doc, line, |r| around(r.row_of(head - start), 1));
         let row = geometry.row_of_affine(head - start, self.upstream());
         let (d, upstream) = if end {
             geometry.hit_row_affine(row, f32::INFINITY)
@@ -1064,10 +1188,10 @@ impl CodeView {
         let y =
             self.lines.heights.anchor_y(self.lines.anchor) + f64::from(pos.y - frame.rect.top());
         let at = self.lines.heights.line_at(y);
-        let text = Self::line_text(doc, at.line);
-        let height = self.text.line_height(&text);
+        let height = self.line_height_of(doc, at.line);
         self.lines.heights.set_measured(at.line, height);
-        let geometry = self.text.geometry(&text);
+        let row = (at.offset / self.text.row_height().max(1.0)) as usize;
+        let geometry = self.geometry_of(doc, at.line, |_| around(row, 1));
         let (d, upstream) = geometry.hit_affine(vec2(pos.x - frame.text_left, at.offset));
         self.hit_upstream = upstream;
         doc.line_to_byte(at.line) + d
@@ -1191,14 +1315,13 @@ impl CodeView {
             self.reveal_caret = 0;
             return;
         }
-        let text = Self::line_text(doc, line);
-        let height = self.text.line_height(&text);
+        let height = self.line_height_of(doc, line);
         self.lines.heights.set_measured(line, height);
-        let caret = self.text.geometry(&text).caret_rect_affine(
-            head - doc.line_to_byte(line),
-            CARET_WIDTH,
-            self.upstream(),
-        );
+        let rel = head - doc.line_to_byte(line);
+        let upstream = self.upstream();
+        let caret = self
+            .geometry_of(doc, line, |r| around(r.row_of(rel), 1))
+            .caret_rect_affine(rel, CARET_WIDTH, upstream);
         let top = self.lines.heights.offset_of(line) + f64::from(caret.top());
         let bottom = top + f64::from(caret.height());
         let view_top = self.lines.heights.anchor_y(self.lines.anchor);
@@ -1246,9 +1369,25 @@ impl CodeView {
                 continue;
             }
             let range = doc.line_range(line);
-            let text = doc.slice(range.clone());
-            let height = self.text.line_height(&text);
+            // A long line is never copied or shaped whole: only its rows
+            // on screen are (see `long_line`).
+            let long = self.long_rows(doc, line);
+            let text = match long {
+                Some(_) => Cow::Borrowed(""),
+                None => doc.slice(range.clone()),
+            };
+            let row_h = self.text.row_height();
+            let height = match &long {
+                Some(rows) => rows.count() as f32 * row_h,
+                None => self.text.line_height(&text),
+            };
             self.lines.heights.set_measured(line, height);
+            // The long line's rows inside the pane.
+            let visible = long.as_ref().map(|rows| {
+                let first = ((rect.top() - y) / row_h).floor().max(0.0) as usize;
+                let last = ((rect.bottom() - y) / row_h).ceil().max(0.0) as usize + 1;
+                first.min(rows.count())..last.min(rows.count())
+            });
             if let Some((body, child)) = self.marker_for(line) {
                 let mark = if self.folds.covers(&body, child) {
                     "▸"
@@ -1275,7 +1414,13 @@ impl CodeView {
 
             let selected = selection.start <= range.end && selection.end > range.start;
             if (selected && !selection.is_empty()) || line == caret_line {
-                let geometry = self.text.geometry(&text);
+                let geometry = match &visible {
+                    Some(rows) => {
+                        let rows = rows.clone();
+                        self.geometry_of(doc, line, |_| rows)
+                    }
+                    None => self.text.geometry(&text),
+                };
                 if selected && !selection.is_empty() {
                     let local = selection.start.saturating_sub(range.start)
                         ..selection.end.min(range.end) - range.start;
@@ -1286,7 +1431,12 @@ impl CodeView {
                         NEWLINE_WIDTH,
                         &mut rects,
                     );
-                    highlights.extend(rects.into_iter().map(|r| r.translate(origin.to_vec2())));
+                    highlights.extend(
+                        rects
+                            .into_iter()
+                            .map(|r| r.translate(origin.to_vec2()))
+                            .filter(|r| r.intersects(rect)),
+                    );
                 }
                 if line == caret_line {
                     let r = geometry.caret_rect_affine(
@@ -1297,22 +1447,55 @@ impl CodeView {
                     caret = Some(r.translate(origin.to_vec2()));
                 }
             }
-            colors.clear();
-            if let Some(parse) = parse
-                && parse.map.len() == doc.len()
-            {
-                for span in parse.map.spans_in(range.clone()) {
-                    let local = span.range.start.max(range.start) - range.start
-                        ..span.range.end.min(range.end) - range.start;
-                    if let Some(color) = self.theme.code_color(&span)
-                        && !local.is_empty()
-                    {
-                        colors.push((local, color));
+            // Each piece drawn: the whole line, or each long-line row on
+            // screen as a line of its own, at its row.
+            let pieces: Vec<(Range<usize>, f32)> = match (&long, &visible) {
+                (Some(rows), Some(shown)) => shown
+                    .clone()
+                    .map(|i| {
+                        let r = rows.range(i);
+                        (range.start + r.start..range.start + r.end, i as f32 * row_h)
+                    })
+                    .collect(),
+                _ => vec![(range.clone(), 0.0)],
+            };
+            for (piece, dy) in pieces {
+                colors.clear();
+                if let Some(parse) = parse
+                    && parse.map.len() == doc.len()
+                {
+                    for span in parse.map.spans_in(piece.clone()) {
+                        let local = span.range.start.max(piece.start) - piece.start
+                            ..span.range.end.min(piece.end) - piece.start;
+                        if let Some(color) = self.theme.code_color(&span)
+                            && !local.is_empty()
+                        {
+                            colors.push((local, color));
+                        }
                     }
                 }
+                if long.is_some() {
+                    // A grid row is already wrapped: drawn unwrapped, its
+                    // glyphs stay on the cells the caret uses, hanging
+                    // spaces included.
+                    let row_text = doc.slice(piece);
+                    let line = RichLine {
+                        wrap_width: Some(UNWRAPPED),
+                        ..RichLine::plain(&row_text)
+                    };
+                    let top_left = origin + vec2(0.0, dy);
+                    self.text
+                        .draw_rich(&mut meshes, line, top_left, self.theme.text, &colors, &[]);
+                } else {
+                    self.text.draw_line_colored(
+                        &mut meshes,
+                        &text,
+                        origin,
+                        self.theme.text,
+                        &colors,
+                    );
+                }
             }
-            self.text
-                .draw_line_colored(&mut meshes, &text, origin, self.theme.text, &colors);
             y += height;
             line += 1;
         }
@@ -1421,6 +1604,42 @@ impl CodeView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_rows_survive_edits_elsewhere_but_not_in_their_line() {
+        let line = "word ".repeat(20_000);
+        let mut doc = Document::from_text(&format!("top\n{line}\nbottom\n"));
+        let mut entry = LongRows {
+            epoch: doc.epoch(),
+            range: doc.line_range(1),
+            cols: 80,
+            rows: std::rc::Rc::new(Rows::wrap([""], 80)),
+        };
+        let edit = |doc: &mut Document, e: Edit| {
+            let caret = Selection::caret(0);
+            doc.apply(vec![e], caret, caret, EditKind::Typing).unwrap();
+        };
+        // A line added above and text typed below: the rows still hold.
+        edit(&mut doc, Edit::insert(0, "x\n"));
+        let len = doc.len();
+        edit(&mut doc, Edit::insert(len, "tail"));
+        assert!(entry.catch_up(&doc));
+        assert_eq!(entry.range, doc.line_range(2));
+        // An edit in the line itself, or at its end, makes them stale.
+        let mut at_end = LongRows {
+            epoch: doc.epoch(),
+            range: entry.range.clone(),
+            cols: 80,
+            rows: entry.rows.clone(),
+        };
+        edit(&mut doc, Edit::insert(entry.range.start + 10, "y"));
+        assert!(!entry.catch_up(&doc));
+        let end = doc.line_range(2).end;
+        at_end.range = doc.line_range(2);
+        at_end.epoch = doc.epoch();
+        edit(&mut doc, Edit::insert(end, "z"));
+        assert!(!at_end.catch_up(&doc));
+    }
 
     /// `# One\nbody one\n# Two\nbody two\n`, with each body folded.
     fn two_folds() -> (CodeView, Document) {

@@ -64,7 +64,7 @@
   - Detect changes made on disk (mtime and size) and prompt to reload or keep, never silently overwrite.
 - **Undo/redo:** one stack of inverse range ops, shared by both panes. Each entry records the selection before and after, so undo puts the caret back where it was. Typing is grouped into one entry until a pause (~300ms), a newline, or a cursor jump.
 - **Paint spans** (syntax colors, live styles) come from the BlockTree and SourceMap. They are never kept as a second copy of the text.
-- **Very long lines:** for lines above a threshold (e.g. 64 KB), shape only the visible part. Syntax coloring may fall back to plain text.
+- **Very long lines:** for lines above a threshold (e.g. 64 KB), shape only the visible part. Syntax coloring may fall back to plain text. **As built (CRO-112, 2026-10-08):** the threshold is 64 KiB. In the code pane, such a line wraps on its monospace cell grid without being shaped: each character takes one cell (two if wide, a tab to the next stop), so the rows, the line's height, and every caret position come from counting cells. Only the rows on screen are shaped, each as a short line, and syntax colors stay. In the live pane, a block holding such a line shows as a one-line notice to edit it in the code pane. The caret steps over the block, and typing at its start or end edits there.
 
 ### 2. Parse pipeline
 
