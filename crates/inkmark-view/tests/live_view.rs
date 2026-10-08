@@ -447,3 +447,169 @@ fn a_wheel_holds_its_place_on_the_next_frame() {
         "line {below} is below the viewport and stays estimated"
     );
 }
+
+/// Headings and wrapped paragraphs: blocks whose estimated heights differ
+/// from their laid-out ones, so any estimate that leaked into a scroll
+/// would show.
+fn parts(n: usize) -> String {
+    (0..n)
+        .map(|i| {
+            format!(
+                "## Part {i}\n\nA paragraph of prose that wraps over a few rows in the live \
+                 view, with *some emphasis* and a [link](http://x) to make it realistic, \
+                 number {i}.\n\n"
+            )
+        })
+        .collect()
+}
+
+fn line_of(src: &str, needle: &str) -> usize {
+    src[..src.find(needle).unwrap()].matches('\n').count()
+}
+
+#[test]
+fn a_cold_jump_to_the_end_lays_out_only_the_screen() {
+    let src = parts(400);
+    let mut h = Harness::new(&src);
+    h.key(Key::End, Modifiers::COMMAND);
+    h.frame(vec![]);
+    assert_eq!(h.head(), h.doc.len());
+    let (top, _) = h.view.view_top();
+    let lines = h.doc.line_count();
+    assert!(
+        top + 60 > lines,
+        "the view is at the end: top {top} of {lines}"
+    );
+    assert!(h.view.line_measured(top), "the screen is measured");
+    let middle = line_of(&src, "## Part 200");
+    assert!(
+        !h.view.line_measured(middle),
+        "a block far above the jump stays estimated"
+    );
+}
+
+#[test]
+fn a_wheel_up_after_a_cold_jump_moves_exactly_its_distance() {
+    let mut h = Harness::new(&parts(400));
+    h.key(Key::End, Modifiers::COMMAND);
+    h.frame(vec![]);
+    let (line0, off0) = h.view.view_top();
+    h.frame(vec![
+        Event::PointerMoved(pos2(80.0, 80.0)),
+        Event::MouseWheel {
+            unit: MouseWheelUnit::Point,
+            delta: vec2(0.0, 300.0),
+            phase: TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    // egui spreads a wheel over a few frames.
+    for _ in 0..120 {
+        h.frame(vec![]);
+    }
+    let (line1, off1) = h.view.view_top();
+    assert!(line1 < line0, "moved up from {line0} to {line1}");
+    // Everything the scroll passed through was laid out before it moved
+    // the view, so the distance is exact rather than an estimate.
+    let mut between = 0.0;
+    for l in line1..line0 {
+        assert!(
+            h.view.line_measured(l),
+            "line {l} was scrolled past unmeasured"
+        );
+        between += h.view.measured_height(l);
+    }
+    let moved = between - off1 + off0;
+    assert!(
+        (moved - 300.0).abs() < 1.5,
+        "moved {moved} for a 300 pt wheel"
+    );
+}
+
+#[test]
+fn page_up_after_a_cold_jump_measures_what_it_crosses() {
+    let mut h = Harness::new(&parts(400));
+    h.key(Key::End, Modifiers::COMMAND);
+    h.frame(vec![]);
+    let from = h.doc.byte_to_line(h.head());
+    h.press(Key::PageUp);
+    h.frame(vec![]);
+    let to = h.doc.byte_to_line(h.head());
+    assert!(to + 5 < from, "Page Up moved the caret from {from} to {to}");
+    for l in to..from {
+        assert!(h.view.line_measured(l), "line {l} was crossed unmeasured");
+    }
+    let (top, _) = h.view.view_top();
+    assert!(top <= to, "the caret on line {to} is in view from {top}");
+}
+
+#[test]
+fn a_wrap_change_keeps_the_view_and_lays_out_only_the_screen() {
+    let src = parts(400);
+    let wide = Rect::from_min_max(Pos2::ZERO, pos2(1400.0, 700.0));
+    let mut h = Harness::open(&src, wide);
+    let middle = line_of(&src, "## Part 300");
+    let parse = h.parse.output().clone();
+    h.view.set_scroll_pos(
+        &h.doc,
+        &parse,
+        ScrollPos {
+            line: middle,
+            frac: 0.0,
+        },
+    );
+    h.frame(vec![]);
+    let before = h.view.scroll_pos(&h.doc, &parse);
+    // Narrower than the live pane's 75-character measure: every line wraps
+    // differently and every height is estimated again.
+    h.screen = Rect::from_min_max(Pos2::ZERO, pos2(500.0, 700.0));
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let after = h.view.scroll_pos(&h.doc, &parse);
+    assert_eq!(before.line, after.line, "{before:?} then {after:?}");
+    assert!(
+        h.view.line_measured(middle),
+        "the screen was laid out again"
+    );
+    let far = line_of(&src, "## Part 100");
+    assert!(
+        !h.view.line_measured(far),
+        "a block far above the view stays estimated after the change"
+    );
+}
+
+#[test]
+fn an_edit_far_above_the_view_leaves_it_in_place() {
+    let src = parts(400);
+    let mut h = Harness::new(&src);
+    let middle = line_of(&src, "## Part 300");
+    let parse = h.parse.output().clone();
+    h.view.set_scroll_pos(
+        &h.doc,
+        &parse,
+        ScrollPos {
+            line: middle,
+            frac: 0.0,
+        },
+    );
+    h.frame(vec![]);
+    let (top, offset) = h.view.view_top();
+    // The first paragraph was on screen at open. An edit there that adds
+    // two lines shifts the view by exactly those lines and nothing else:
+    // the view is anchored to its line, not to a height.
+    let at = src.find("number 0.").unwrap();
+    let sel = h.view.selection();
+    h.doc
+        .apply(
+            vec![Edit::insert(
+                at,
+                "a longer ending that wraps onto another row.\n\nNew ",
+            )],
+            sel,
+            sel,
+            EditKind::Other,
+        )
+        .unwrap();
+    h.frame(vec![]);
+    assert_eq!(h.view.view_top(), (top + 2, offset));
+}

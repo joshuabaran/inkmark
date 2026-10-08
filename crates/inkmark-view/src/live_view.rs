@@ -279,9 +279,11 @@ pub struct LiveView {
     selection_current: bool,
     /// A scroll position set from outside, applied after the next sync.
     pending_scroll: Option<ScrollPos>,
-    /// Lines `[0, measured_prefix)` have a real height. An edit or a layout
-    /// change drops this to the first line that has to be measured again.
-    measured_prefix: usize,
+    /// Lines whose block an edit changed while it was measured. The next
+    /// settle lays each of those blocks out again, wherever it is, so a
+    /// block never keeps a height from before the edit. Blocks the view
+    /// hasn't reached stay estimated; nothing walks from the top.
+    remeasure: Vec<usize>,
     /// Task checkboxes drawn last frame: hit area, source offset of the
     /// `[ ]` marker, checked.
     checkboxes: Vec<(Rect, usize, bool)>,
@@ -324,7 +326,7 @@ impl LiveView {
             hit_upstream: false,
             selection_current: false,
             pending_scroll: None,
-            measured_prefix: 0,
+            remeasure: Vec::new(),
             checkboxes: Vec::new(),
             images: None,
             math: crate::math::MathCache::default(),
@@ -368,6 +370,12 @@ impl LiveView {
         line < self.lines.heights.len() && self.lines.heights.is_measured(line)
     }
 
+    /// The top of the view: a source line and how far into its stored
+    /// height the view starts, in points.
+    pub fn view_top(&self) -> (usize, f32) {
+        (self.lines.anchor.line, self.lines.anchor.offset)
+    }
+
     pub fn set_selection(&mut self, selection: Selection) {
         self.selection = selection;
         self.selection_current = true;
@@ -383,7 +391,7 @@ impl LiveView {
 
     pub fn reset(&mut self) {
         self.lines.reset();
-        self.measured_prefix = 0;
+        self.remeasure.clear();
         self.selection = Selection::default();
         self.preferred_x = None;
     }
@@ -656,15 +664,29 @@ impl LiveView {
         // A selection set from outside is already in current offsets.
         let map_selection = map_selection && !std::mem::take(&mut self.selection_current);
         match self.lines.sync(doc, |chars| text.estimate_height(chars)) {
-            Synced::Rebuilt => self.measured_prefix = 0,
+            Synced::Rebuilt => self.remeasure.clear(),
             Synced::Changed(changes) => {
                 // A rebuild that still had edits to map clears every
-                // measurement and reports Changed. A splice leaves the
-                // lines above the edit measured.
+                // measurement and reports Changed: nothing to re-measure.
+                // A splice leaves the lines around the edit measured, so
+                // the blocks at each end of an edit are laid out again.
                 if self.lines.heights.measured_count() == 0 {
-                    self.measured_prefix = 0;
-                } else if let Some(start) = changes.iter().map(|c| c.lines.start).min() {
-                    self.measured_prefix = self.measured_prefix.min(start);
+                    self.remeasure.clear();
+                } else {
+                    for c in &changes {
+                        let l = c.lines;
+                        for line in &mut self.remeasure {
+                            if *line > l.start + l.removed {
+                                *line = *line - l.removed + l.inserted;
+                            } else if *line > l.start {
+                                *line = l.start;
+                            }
+                        }
+                        self.remeasure.push(l.start);
+                        self.remeasure.push(l.start + l.inserted);
+                    }
+                    self.remeasure.sort_unstable();
+                    self.remeasure.dedup();
                 }
                 if map_selection {
                     for c in &changes {
@@ -684,14 +706,6 @@ impl LiveView {
     fn reading_width(&self, available: f32) -> f32 {
         let measure = READING_CHARS * self.text.avg_advance();
         available.min(measure).max(READING_FLOOR).min(available)
-    }
-
-    /// `lines [0, measured_prefix)` stay measured. `to` is the first line
-    /// after a block that was just measured from `from`.
-    fn advance_prefix(&mut self, from: usize, to: usize) {
-        if from <= self.measured_prefix && to > self.measured_prefix {
-            self.measured_prefix = to;
-        }
     }
 
     /// Height of one source line that is not part of a leaf, matching paint.
@@ -778,8 +792,7 @@ impl LiveView {
             let span = (bottom - top).max(1e-3);
             let y = self.lines.heights.anchor_y(self.lines.anchor);
             let progress = ((y - top) / span).clamp(0.0, 1.0);
-            let next = self.store_block(doc, parse, first, width);
-            self.advance_prefix(first, next);
+            self.store_block(doc, parse, first, width);
             let real = self.lines.heights.height(first);
             self.lines.anchor = ScrollAnchor {
                 line: first,
@@ -795,14 +808,101 @@ impl LiveView {
         let text = doc.slice(doc.line_range(line));
         let height = self.raw_line_height(&text);
         self.lines.heights.set_measured(line, height);
-        self.advance_prefix(line, line + 1);
         self.lines.anchor.offset = frac * height;
     }
 
-    /// Measures every unmeasured block from the prefix through `extra`
-    /// points past the bottom of the viewport. Blocks already measured are
-    /// left as they are. A block that starts inside the limit is measured
-    /// whole, including the part that hangs below it.
+    /// The first line of the block that holds `line`: its leaf's first
+    /// line, or `line` itself outside any leaf.
+    fn block_start(doc: &Document, parse: &ParseOutput, line: usize) -> usize {
+        leaf_lines(doc, parse, line).map_or(line, |(first, _)| first)
+    }
+
+    /// Whether any line of the block that starts at `start` and runs up to
+    /// (not including) `end` still has an estimate, or a height from
+    /// before an edit.
+    fn block_unmeasured(&self, start: usize, end: usize) -> bool {
+        let len = self.lines.heights.len();
+        (start..end.max(start + 1).min(len)).any(|l| !self.lines.heights.is_measured(l))
+    }
+
+    /// Lays out again the blocks an edit changed since the last settle.
+    /// A block whose lines are all estimates is left alone: nothing there
+    /// is stale.
+    fn remeasure_edited(&mut self, doc: &Document, parse: &ParseOutput, width: f32) {
+        let len = doc.line_count().min(self.lines.heights.len());
+        for line in std::mem::take(&mut self.remeasure) {
+            if line >= len {
+                continue;
+            }
+            let (first, last) = leaf_lines(doc, parse, line).unwrap_or((line, line));
+            let any_measured =
+                (first..=last.min(len - 1)).any(|l| self.lines.heights.is_measured(l));
+            if any_measured {
+                self.store_block(doc, parse, line, width);
+            }
+        }
+    }
+
+    /// Measures the blocks from line `from` down until they cover `amount`
+    /// points below `from`'s top. A block that starts inside that span is
+    /// measured whole, including the part that hangs below it. Blocks
+    /// already measured are left as they are.
+    fn measure_below(
+        &mut self,
+        doc: &Document,
+        parse: &ParseOutput,
+        from: usize,
+        amount: f64,
+        width: f32,
+    ) {
+        let count = doc.line_count().min(self.lines.heights.len());
+        let mut line = from.min(count);
+        while line < count {
+            let heights = &self.lines.heights;
+            if line > from && heights.offset_of(line) - heights.offset_of(from) >= amount {
+                break;
+            }
+            if heights.is_measured(line) {
+                line += 1;
+                continue;
+            }
+            let next = self.store_block(doc, parse, line, width);
+            if next <= line {
+                break;
+            }
+            line = next;
+        }
+    }
+
+    /// Measures the blocks above line `from` until they cover `amount`
+    /// points: everything a scroll or a caret moving up by that much passes
+    /// through. Nothing further up is touched, so the cost is one move's
+    /// worth of layout however far down the document the view is.
+    fn measure_above(
+        &mut self,
+        doc: &Document,
+        parse: &ParseOutput,
+        from: usize,
+        amount: f64,
+        width: f32,
+    ) {
+        let from = from.min(self.lines.heights.len());
+        let mut line = from;
+        while line > 0 {
+            let heights = &self.lines.heights;
+            if heights.offset_of(from) - heights.offset_of(line) >= amount {
+                break;
+            }
+            let start = Self::block_start(doc, parse, line - 1).min(line - 1);
+            if self.block_unmeasured(start, line) {
+                self.store_block(doc, parse, start, width);
+            }
+            line = start;
+        }
+    }
+
+    /// Measures from the anchor's block through `extra` points past the
+    /// bottom of the viewport. Blocks entirely below that stay estimated.
     fn measure_down(
         &mut self,
         doc: &Document,
@@ -811,28 +911,15 @@ impl LiveView {
         viewport: f32,
         extra: f64,
     ) {
-        let count = doc.line_count().min(self.lines.heights.len());
-        let mut line = self.measured_prefix.min(count);
-        let mut steps = 0;
-        while line < count && steps <= count {
-            steps += 1;
-            let limit =
-                self.lines.heights.anchor_y(self.lines.anchor) + f64::from(viewport) + extra;
-            if line > self.lines.anchor.line && self.lines.heights.offset_of(line) >= limit {
-                break;
-            }
-            if self.lines.heights.is_measured(line) {
-                self.advance_prefix(line, line + 1);
-                line += 1;
-                continue;
-            }
-            let next = self.store_block(doc, parse, line, width);
-            self.advance_prefix(line, next);
-            if next <= line {
-                break;
-            }
-            line = next;
+        let anchor = self.lines.anchor;
+        if anchor.line >= self.lines.heights.len() {
+            return;
         }
+        let from = Self::block_start(doc, parse, anchor.line);
+        let heights = &self.lines.heights;
+        let amount =
+            heights.anchor_y(anchor) - heights.offset_of(from) + f64::from(viewport) + extra;
+        self.measure_below(doc, parse, from, amount, width);
     }
 
     /// Lays the visible blocks out again so a caret reveal matches paint.
@@ -859,7 +946,6 @@ impl LiveView {
                 break;
             }
             let next = self.store_block(doc, parse, line, width);
-            self.advance_prefix(line, next);
             if next <= line {
                 break;
             }
@@ -867,8 +953,13 @@ impl LiveView {
         }
     }
 
-    /// Measures through the viewport, then snaps the anchor the way paint
-    /// does, so paint's own measurement does not move the view.
+    /// Measures what the view is about to show, then snaps the anchor the
+    /// way paint does, so paint's own measurement does not move the view.
+    /// `extra` is the scroll about to be applied: below the viewport when
+    /// positive, above the anchor when negative, so every block it passes
+    /// through has its real height before it can move the view. Blocks
+    /// above the anchor that a scroll doesn't reach may stay estimated: the
+    /// anchor is a line, so measuring them later can't shove the view.
     fn settle(
         &mut self,
         doc: &Document,
@@ -880,8 +971,13 @@ impl LiveView {
         if self.lines.heights.is_empty() {
             return;
         }
+        self.remeasure_edited(doc, parse, width);
         self.collapse_anchor_block(doc, parse, width);
-        self.measure_down(doc, parse, width, viewport, extra);
+        if extra < 0.0 {
+            let from = Self::block_start(doc, parse, self.lines.anchor.line);
+            self.measure_above(doc, parse, from, -extra, width);
+        }
+        self.measure_down(doc, parse, width, viewport, extra.max(0.0));
         self.remeasure_visible(doc, parse, width, viewport);
         let y = self.lines.heights.anchor_y(self.lines.anchor);
         self.lines.anchor = self.lines.heights.line_at(y);
@@ -894,33 +990,27 @@ impl LiveView {
         }
     }
 
-    /// Measures from the prefix through source `line`, so a caret above or
-    /// below the viewport has a real height before the view moves to it.
-    fn measure_through_line(
+    /// Measures the caret's block and a viewport's worth of blocks above
+    /// it, so a caret above or below the view has real heights for
+    /// everything the view will show once it moves there.
+    fn measure_around_line(
         &mut self,
         doc: &Document,
         parse: &ParseOutput,
         line: usize,
         width: f32,
+        viewport: f32,
     ) {
         let count = doc.line_count().min(self.lines.heights.len());
-        let goal = line.min(count.saturating_sub(1));
-        let mut at = self.measured_prefix.min(count);
-        let mut steps = 0;
-        while at < count && at <= goal && steps <= count {
-            steps += 1;
-            if self.lines.heights.is_measured(at) {
-                self.advance_prefix(at, at + 1);
-                at += 1;
-                continue;
-            }
-            let next = self.store_block(doc, parse, at, width);
-            self.advance_prefix(at, next);
-            if next <= at {
-                break;
-            }
-            at = next;
+        if count == 0 {
+            return;
         }
+        let first = Self::block_start(doc, parse, line.min(count - 1));
+        let end = leaf_lines(doc, parse, first).map_or(first + 1, |(_, last)| last + 1);
+        if self.block_unmeasured(first, end) {
+            self.store_block(doc, parse, first, width);
+        }
+        self.measure_above(doc, parse, first, f64::from(viewport), width);
     }
 
     /// Scrollbar, the text column's right edge, and the minimap rect.
@@ -996,8 +1086,7 @@ impl LiveView {
         let wheel = ui.input(|i| i.smooth_scroll_delta.y);
         if (hovered || bar_response.hovered() || minimap_hovered) && wheel != 0.0 {
             let delta = -wheel;
-            let extra = f64::from(delta.max(0.0));
-            self.settle(doc, parse, width, viewport, extra);
+            self.settle(doc, parse, width, viewport, f64::from(delta));
             self.lines.anchor = self
                 .lines
                 .heights
@@ -1509,6 +1598,20 @@ impl LiveView {
         dy: f32,
         extend: bool,
     ) {
+        // The caret moves by document height, so whatever it crosses needs
+        // its real height first. One move's worth, never the whole prefix.
+        let caret_line = doc.byte_to_line(self.selection.head.min(doc.len()));
+        let first = Self::block_start(doc, parse, caret_line);
+        let reach = f64::from(dy.abs() + self.text.row_height());
+        if dy < 0.0 {
+            self.measure_above(doc, parse, first, reach, frame.width);
+        } else {
+            self.measure_below(doc, parse, first, 0.0, frame.width);
+            let end = leaf_lines(doc, parse, first).map_or(first + 1, |(_, last)| last + 1);
+            let heights = &self.lines.heights;
+            let block = heights.offset_of(end.min(heights.len())) - heights.offset_of(first);
+            self.measure_below(doc, parse, first, block + reach, frame.width);
+        }
         let (top, x, height) = self.caret_doc(doc, parse, frame);
         let x = self.preferred_x.unwrap_or(x);
         let mut y = if dy < 0.0 {
@@ -2218,7 +2321,7 @@ impl LiveView {
     ) -> bool {
         self.reveal_caret -= 1;
         let caret_line = doc.byte_to_line(self.selection.head.min(doc.len()));
-        self.measure_through_line(doc, parse, caret_line, frame.width);
+        self.measure_around_line(doc, parse, caret_line, frame.width, frame.rect.height());
         let (top, _, height) = self.caret_doc(doc, parse, frame);
         let bottom = top + f64::from(height);
         let viewport = f64::from(frame.rect.height());
