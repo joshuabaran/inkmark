@@ -541,6 +541,36 @@ fn page_up_after_a_cold_jump_measures_what_it_crosses() {
 }
 
 #[test]
+fn a_wrap_change_keeps_a_line_inside_a_block() {
+    // One paragraph of 40 source lines, each long enough to wrap, so the
+    // block's height changes with every wide width.
+    let line = "word ".repeat(80);
+    let src = format!("# Top\n\n{}\n", vec![line.trim_end(); 40].join("\n"));
+    let first = line_of(&src, "word");
+    let mut h = Harness::open(&src, Rect::from_min_max(Pos2::ZERO, pos2(1400.0, 700.0)));
+    let parse = h.parse.output().clone();
+    let target = ScrollPos {
+        line: first + 20,
+        frac: 0.5,
+    };
+    h.view.set_scroll_pos(&h.doc, &parse, target);
+    h.frame(vec![]);
+    let start = h.view.scroll_pos(&h.doc, &parse);
+    assert_eq!(start.line, target.line, "{start:?}");
+    for width in [1800.0, 1500.0, 1600.0, 520.0, 1800.0] {
+        h.screen = Rect::from_min_max(Pos2::ZERO, pos2(width, 700.0));
+        h.frame(vec![]);
+        h.frame(vec![]);
+        let pos = h.view.scroll_pos(&h.doc, &parse);
+        assert_eq!(pos.line, target.line, "at {width} pt: {pos:?}");
+        assert!(
+            (pos.frac - target.frac).abs() < 0.05,
+            "at {width} pt: {pos:?}"
+        );
+    }
+}
+
+#[test]
 fn a_wrap_change_keeps_the_view_and_lays_out_only_the_screen() {
     let src = parts(400);
     let wide = Rect::from_min_max(Pos2::ZERO, pos2(1400.0, 700.0));

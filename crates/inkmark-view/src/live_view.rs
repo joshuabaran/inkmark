@@ -519,8 +519,8 @@ impl LiveView {
             line_height: self.line_height,
             wrap_width: Some(width),
         };
-        // The live pane wraps at its content column.
-        if self.text.begin_frame(config_for(available), ppp) {
+        let rewrapped = self.text.begin_frame(config_for(available), ppp);
+        if rewrapped {
             self.lines.invalidate();
         }
         let painter = ui.painter_at(rect);
@@ -537,8 +537,15 @@ impl LiveView {
         if state.output().map.len() != doc.len() {
             return response;
         }
+        // A new wrap, font or zoom drops every height, and the anchor's
+        // offset into its block would then be read against the block's new
+        // estimate. Take the view as a source line and fraction while the
+        // old heights still hold, and lay that block out again at the new
+        // width. Not across an edit, whose heights no longer match the lines.
+        let keep = (rewrapped && self.pending_scroll.is_none() && self.lines.synced_to(doc))
+            .then(|| self.scroll_pos(doc, state.output()));
         self.sync(doc, true);
-        if let Some(pos) = self.pending_scroll.take() {
+        if let Some(pos) = self.pending_scroll.take().or(keep) {
             self.apply_scroll_pos(doc, state.output(), pos, frame.width);
         }
 

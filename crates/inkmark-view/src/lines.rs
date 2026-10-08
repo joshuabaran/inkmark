@@ -53,6 +53,12 @@ impl LineIndex {
         self.heights_stale = true;
     }
 
+    /// Whether the heights were last synced to `doc` as it is now, so they
+    /// still describe its lines (a stale mark aside).
+    pub fn synced_to(&self, doc: &Document) -> bool {
+        self.synced_epoch == Some(doc.epoch())
+    }
+
     /// Forget the document entirely.
     pub fn reset(&mut self) {
         self.synced_epoch = None;
