@@ -13,7 +13,7 @@ use egui::{
 use inkmark_buffer::{Bias, Change, Document, Edit, EditKind, Selection};
 use inkmark_parse::{ParseOutput, ParseState};
 use inkmark_text::{
-    GlyphMeshes, LineGeometry, ScrollAnchor, SharedFonts, TextConfig, TextRenderer,
+    GlyphMeshes, LineGeometry, RichLine, ScrollAnchor, SharedFonts, TextConfig, TextRenderer,
 };
 
 use crate::commands::{self, EditPlan};
@@ -102,18 +102,44 @@ pub struct CodeView {
     region_revision: Option<u64>,
     /// Wrap width in points, from this frame's layout settings.
     wrap: f32,
-    /// Rows of lines over `LONG_LINE`, by line, for the document epoch and
-    /// column count they were wrapped at.
-    long: std::collections::HashMap<usize, LongRows>,
+    /// Rows of lines over `LONG_LINE` (see `long_line`), kept across edits
+    /// that don't touch them.
+    long: Vec<LongRows>,
 }
 
-/// A long line's rows (see `long_line`), and what they were wrapped for.
+/// A long line's rows, the line's bytes as of `epoch`, and the column count
+/// they were wrapped at.
 struct LongRows {
     epoch: u64,
+    range: Range<usize>,
     cols: usize,
-    len: usize,
     rows: std::rc::Rc<Rows>,
 }
+
+impl LongRows {
+    /// Brings `range` up to `doc`'s epoch: shifted past edits elsewhere.
+    /// False when an edit touched the line (or the log no longer reaches
+    /// back), so the rows are stale.
+    fn catch_up(&mut self, doc: &Document) -> bool {
+        if self.epoch == doc.epoch() {
+            return true;
+        }
+        let Some(changes) = doc.log().changes_since(self.epoch) else {
+            return false;
+        };
+        for c in changes {
+            if c.start <= self.range.end && c.old_end >= self.range.start {
+                return false;
+            }
+            self.range = c.map(self.range.start, Bias::Left)..c.map(self.range.end, Bias::Left);
+        }
+        self.epoch = doc.epoch();
+        true
+    }
+}
+
+/// Wrap width for a long line's grid row, which is never wrapped again.
+const UNWRAPPED: f32 = 1.0e6;
 
 /// Rows `reach` either side of `row`, as a geometry window.
 fn around(row: usize, reach: usize) -> Range<usize> {
@@ -182,7 +208,7 @@ impl CodeView {
             regions: Vec::new(),
             region_revision: None,
             wrap: 0.0,
-            long: std::collections::HashMap::new(),
+            long: Vec::new(),
         }
     }
 
@@ -756,7 +782,8 @@ impl CodeView {
     }
 
     /// The rows of `line` when it's over `LONG_LINE`: wrapped on the cell
-    /// grid without shaping (see `long_line`), once per edit and width.
+    /// grid without shaping (see `long_line`), again only when an edit
+    /// touches the line or the width changes.
     fn long_rows(&mut self, doc: &Document, line: usize) -> Option<std::rc::Rc<Rows>> {
         let range = doc.line_range(line);
         if range.len() <= LONG_LINE {
@@ -768,26 +795,27 @@ impl CodeView {
         } else {
             1
         };
-        if let Some(e) = self.long.get(&line)
-            && e.epoch == doc.epoch()
-            && e.cols == cols
-            && e.len == range.len()
+        self.long.retain_mut(|e| e.catch_up(doc));
+        if let Some(e) = self
+            .long
+            .iter()
+            .find(|e| e.range == range && e.cols == cols)
         {
             return Some(e.rows.clone());
         }
         if self.long.len() > 16 {
             self.long.clear();
         }
-        let rows = std::rc::Rc::new(Rows::wrap(&doc.slice(range.clone()), cols));
-        self.long.insert(
-            line,
-            LongRows {
-                epoch: doc.epoch(),
-                cols,
-                len: range.len(),
-                rows: rows.clone(),
-            },
-        );
+        let rows = std::rc::Rc::new(Rows::wrap(
+            doc.rope().byte_slice(range.clone()).chunks(),
+            cols,
+        ));
+        self.long.push(LongRows {
+            epoch: doc.epoch(),
+            range,
+            cols,
+            rows: rows.clone(),
+        });
         Some(rows)
     }
 
@@ -1446,18 +1474,27 @@ impl CodeView {
                         }
                     }
                 }
-                let piece_text = if long.is_some() {
-                    doc.slice(piece)
+                if long.is_some() {
+                    // A grid row is already wrapped: drawn unwrapped, its
+                    // glyphs stay on the cells the caret uses, hanging
+                    // spaces included.
+                    let row_text = doc.slice(piece);
+                    let line = RichLine {
+                        wrap_width: Some(UNWRAPPED),
+                        ..RichLine::plain(&row_text)
+                    };
+                    let top_left = origin + vec2(0.0, dy);
+                    self.text
+                        .draw_rich(&mut meshes, line, top_left, self.theme.text, &colors, &[]);
                 } else {
-                    Cow::Borrowed(text.as_ref())
-                };
-                self.text.draw_line_colored(
-                    &mut meshes,
-                    &piece_text,
-                    origin + vec2(0.0, dy),
-                    self.theme.text,
-                    &colors,
-                );
+                    self.text.draw_line_colored(
+                        &mut meshes,
+                        &text,
+                        origin,
+                        self.theme.text,
+                        &colors,
+                    );
+                }
             }
             y += height;
             line += 1;
@@ -1567,6 +1604,42 @@ impl CodeView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_rows_survive_edits_elsewhere_but_not_in_their_line() {
+        let line = "word ".repeat(20_000);
+        let mut doc = Document::from_text(&format!("top\n{line}\nbottom\n"));
+        let mut entry = LongRows {
+            epoch: doc.epoch(),
+            range: doc.line_range(1),
+            cols: 80,
+            rows: std::rc::Rc::new(Rows::wrap([""], 80)),
+        };
+        let edit = |doc: &mut Document, e: Edit| {
+            let caret = Selection::caret(0);
+            doc.apply(vec![e], caret, caret, EditKind::Typing).unwrap();
+        };
+        // A line added above and text typed below: the rows still hold.
+        edit(&mut doc, Edit::insert(0, "x\n"));
+        let len = doc.len();
+        edit(&mut doc, Edit::insert(len, "tail"));
+        assert!(entry.catch_up(&doc));
+        assert_eq!(entry.range, doc.line_range(2));
+        // An edit in the line itself, or at its end, makes them stale.
+        let mut at_end = LongRows {
+            epoch: doc.epoch(),
+            range: entry.range.clone(),
+            cols: 80,
+            rows: entry.rows.clone(),
+        };
+        edit(&mut doc, Edit::insert(entry.range.start + 10, "y"));
+        assert!(!entry.catch_up(&doc));
+        let end = doc.line_range(2).end;
+        at_end.range = doc.line_range(2);
+        at_end.epoch = doc.epoch();
+        edit(&mut doc, Edit::insert(end, "z"));
+        assert!(!at_end.catch_up(&doc));
+    }
 
     /// `# One\nbody one\n# Two\nbody two\n`, with each body folded.
     fn two_folds() -> (CodeView, Document) {

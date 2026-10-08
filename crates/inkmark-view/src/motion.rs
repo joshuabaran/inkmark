@@ -14,17 +14,50 @@ fn line_end(doc: &Document, offset: usize) -> usize {
     doc.line_range(doc.byte_to_line(offset)).end
 }
 
+/// Bytes either side of the caret one step reads. A grapheme or a word is
+/// far shorter (a longer word is crossed in steps this long), and a step in
+/// a very long line reads this much, not the rest of the line.
+const REACH: usize = 4096;
+
+/// The char boundary at or before `offset`.
+fn floor_boundary(doc: &Document, offset: usize) -> usize {
+    let rope = doc.rope();
+    rope.char_to_byte(rope.byte_to_char(offset))
+}
+
+/// Where a step back from `offset` starts reading: its line's start, or
+/// `REACH` bytes back.
+fn reach_back(doc: &Document, offset: usize) -> usize {
+    let start = line_start(doc, offset);
+    if offset - start <= REACH {
+        start
+    } else {
+        floor_boundary(doc, offset - REACH)
+    }
+}
+
+/// Where a step forward from `offset` stops reading: its line's end, or
+/// `REACH` bytes on.
+fn reach_ahead(doc: &Document, offset: usize) -> usize {
+    let end = line_end(doc, offset);
+    if end - offset <= REACH {
+        end
+    } else {
+        floor_boundary(doc, offset + REACH)
+    }
+}
+
 pub fn prev_grapheme(doc: &Document, offset: usize) -> usize {
     let start = line_start(doc, offset);
     if offset == start {
         return offset.saturating_sub(1);
     }
-    let text = doc.slice(start..offset);
-    start
-        + text
-            .grapheme_indices(true)
-            .next_back()
-            .map_or(0, |(i, _)| i)
+    let from = reach_back(doc, offset);
+    let text = doc.slice(from..offset);
+    from + text
+        .grapheme_indices(true)
+        .next_back()
+        .map_or(0, |(i, _)| i)
 }
 
 pub fn next_grapheme(doc: &Document, offset: usize) -> usize {
@@ -32,7 +65,7 @@ pub fn next_grapheme(doc: &Document, offset: usize) -> usize {
     if offset == end {
         return (offset + 1).min(doc.len());
     }
-    let text = doc.slice(offset..end);
+    let text = doc.slice(offset..reach_ahead(doc, offset));
     offset + text.graphemes(true).next().map_or(0, str::len)
 }
 
@@ -43,13 +76,13 @@ pub fn prev_word(doc: &Document, offset: usize) -> usize {
     if offset == start {
         return prev_grapheme(doc, offset);
     }
-    let text = doc.slice(start..offset);
-    start
-        + text
-            .split_word_bound_indices()
-            .rev()
-            .find(|(_, w)| !w.trim().is_empty())
-            .map_or(0, |(i, _)| i)
+    let from = reach_back(doc, offset);
+    let text = doc.slice(from..offset);
+    from + text
+        .split_word_bound_indices()
+        .rev()
+        .find(|(_, w)| !w.trim().is_empty())
+        .map_or(0, |(i, _)| i)
 }
 
 /// End of the word after `offset`, skipping whitespace. At a line end, steps
@@ -59,7 +92,7 @@ pub fn next_word(doc: &Document, offset: usize) -> usize {
     if offset == end {
         return next_grapheme(doc, offset);
     }
-    let text = doc.slice(offset..end);
+    let text = doc.slice(offset..reach_ahead(doc, offset));
     offset
         + text
             .split_word_bound_indices()

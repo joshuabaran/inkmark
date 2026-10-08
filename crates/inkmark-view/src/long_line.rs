@@ -47,43 +47,52 @@ impl Rows {
     /// Greedy word wrap at `cols` cells: a row breaks after the last
     /// whitespace that fits, or mid-word when a word is wider than the row.
     /// Whitespace never starts a row; it hangs past the edge, as it does in
-    /// the shaped panes.
-    pub(crate) fn wrap(text: &str, cols: usize) -> Self {
+    /// the shaped panes. Reads the line in `chunks` (a rope's), so it is
+    /// never copied whole.
+    pub(crate) fn wrap<'a>(chunks: impl IntoIterator<Item = &'a str>, cols: usize) -> Self {
         let cols = cols.max(1);
         let mut starts = vec![0];
         let mut spaces = Vec::new();
         let mut col = 0;
-        // Byte just after the last whitespace on this row.
-        let mut after_space: Option<usize> = None;
-        for (i, c) in text.char_indices() {
-            if c.is_whitespace() {
-                col += cells(c, col);
-                after_space = Some(i + c.len_utf8());
-                continue;
-            }
-            let w = cells(c, col);
-            let row_start = *starts.last().expect("one row at least");
-            if col + w > cols && i > row_start && w > 0 {
-                let (at, space) = match after_space.filter(|&b| b > row_start) {
-                    Some(b) => (b, true),
-                    None => (i, false),
-                };
-                spaces.push(space);
-                starts.push(at);
-                // The part of the word already counted moves down with it.
-                col = 0;
-                for c in text[at..i].chars() {
+        // Byte just after the last whitespace on this row, and the column
+        // there. Only non-whitespace follows it, whose cells don't depend
+        // on the column, so the part of a word past it moves down as is.
+        let mut after_space: Option<(usize, usize)> = None;
+        let mut base = 0;
+        for chunk in chunks {
+            for (i, c) in chunk.char_indices() {
+                let i = base + i;
+                if c.is_whitespace() {
                     col += cells(c, col);
+                    after_space = Some((i + c.len_utf8(), col));
+                    continue;
                 }
-                after_space = None;
+                let w = cells(c, col);
+                let row_start = *starts.last().expect("one row at least");
+                if col + w > cols && i > row_start && w > 0 {
+                    match after_space.filter(|&(b, _)| b > row_start) {
+                        Some((b, at_col)) => {
+                            spaces.push(true);
+                            starts.push(b);
+                            col -= at_col;
+                        }
+                        None => {
+                            spaces.push(false);
+                            starts.push(i);
+                            col = 0;
+                        }
+                    }
+                    after_space = None;
+                }
+                col += w;
             }
-            col += cells(c, col);
+            base += chunk.len();
         }
         spaces.push(false);
         Self {
             starts,
             spaces,
-            len: text.len(),
+            len: base,
         }
     }
 
@@ -122,7 +131,7 @@ impl Rows {
             .map(|i| {
                 let range = self.range(i);
                 let clusters = if window.contains(&i) {
-                    clusters(&row_text(range.clone()), range.start, cell)
+                    clusters(&row_text(range.clone()), range.start, cell, self.spaces[i])
                 } else {
                     Vec::new()
                 };
@@ -141,10 +150,15 @@ impl Rows {
 }
 
 /// One cluster per character of `row` (which starts at byte `base` of its
-/// line), at its cells; combining marks join the character before.
-fn clusters(row: &str, base: usize, cell: f32) -> Vec<ClusterSpan> {
+/// line), at its cells; combining marks join the character before. When the
+/// row wrapped at whitespace, that trailing run is one cluster of its first
+/// character's width, as the shaper keeps it: End and clicks past the row
+/// stop after the word, not out where the hanging spaces would reach.
+fn clusters(row: &str, base: usize, cell: f32, ends_in_space: bool) -> Vec<ClusterSpan> {
     let mut out: Vec<ClusterSpan> = Vec::with_capacity(row.len());
     let mut col = 0;
+    // First cluster of the whitespace run the row ends with, if any so far.
+    let mut run: Option<usize> = None;
     for (i, c) in row.char_indices() {
         let w = cells(c, col);
         let (start, end) = (base + i, base + i + c.len_utf8());
@@ -154,6 +168,11 @@ fn clusters(row: &str, base: usize, cell: f32) -> Vec<ClusterSpan> {
             last.end = end;
             continue;
         }
+        if !c.is_whitespace() {
+            run = None;
+        } else if run.is_none() {
+            run = Some(out.len());
+        }
         out.push(ClusterSpan {
             start,
             end,
@@ -161,6 +180,11 @@ fn clusters(row: &str, base: usize, cell: f32) -> Vec<ClusterSpan> {
             w: w.max(1) as f32 * cell,
         });
         col += w;
+    }
+    if ends_in_space && let Some(first) = run {
+        let end = out.last().map_or(0, |c| c.end);
+        out.truncate(first + 1);
+        out[first].end = end;
     }
     out
 }
@@ -187,12 +211,37 @@ pub(crate) fn holds_long_line(doc: &inkmark_buffer::Document, range: &Range<usiz
     (first..=last).any(|l| doc.line_range(l).len() > LONG_LINE)
 }
 
+/// The source a notice for the block at `range` stands for: the block, but
+/// its trailing newline. The notice's end is then the end of its text, and
+/// the caret after the newline is on the next line, as after any paragraph.
+pub(crate) fn notice_source(doc: &inkmark_buffer::Document, range: Range<usize>) -> Range<usize> {
+    let end = if range.end > range.start && doc.slice(range.end - 1..range.end) == "\n" {
+        range.end - 1
+    } else {
+        range.end
+    };
+    range.start..end
+}
+
+/// Whether the live pane shows `block` as a notice rather than shaping it.
+/// A table cell lies on one line, so only that line is checked: between a
+/// whole-table edit and the full parse a rebased cell can span the whole
+/// table, and walking its lines for every cell is what that would cost.
+pub(crate) fn shows_notice(doc: &inkmark_buffer::Document, block: &inkmark_parse::Block) -> bool {
+    let range = &block.range;
+    if block.kind.is_table_part() {
+        range.len() > LONG_LINE && doc.line_range(doc.byte_to_line(range.start)).len() > LONG_LINE
+    } else {
+        holds_long_line(doc, range)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn rows_of(text: &str, cols: usize) -> Vec<&str> {
-        let rows = Rows::wrap(text, cols);
+        let rows = Rows::wrap([text], cols);
         (0..rows.count()).map(|i| &text[rows.range(i)]).collect()
     }
 
@@ -221,7 +270,7 @@ mod tests {
     #[test]
     fn rows_cover_every_byte_once() {
         let text = "Some prose, a [link](u), and `code`: ".repeat(50) + "end";
-        let rows = Rows::wrap(&text, 37);
+        let rows = Rows::wrap([text.as_str()], 37);
         let mut at = 0;
         for i in 0..rows.count() {
             let r = rows.range(i);
@@ -236,7 +285,7 @@ mod tests {
     #[test]
     fn geometry_puts_each_character_on_its_cells() {
         let text = "ab\u{301}c 漢x";
-        let rows = Rows::wrap(text, 80);
+        let rows = Rows::wrap([text], 80);
         let g = rows.geometry(0..1, 10.0, 20.0, |r| text[r].to_owned());
         assert_eq!(g.rows.len(), 1);
         let c = &g.rows[0].clusters;
@@ -251,11 +300,34 @@ mod tests {
     #[test]
     fn only_the_window_has_clusters() {
         let text = "word ".repeat(100);
-        let rows = Rows::wrap(&text, 20);
+        let rows = Rows::wrap([text.as_str()], 20);
         let g = rows.geometry(2..3, 10.0, 20.0, |r| text[r].to_owned());
         assert_eq!(g.rows.len(), rows.count());
         assert!(g.rows[0].clusters.is_empty() && !g.rows[2].clusters.is_empty());
         assert_eq!(g.rows[3].top, 60.0);
         assert_eq!(g.height(), rows.count() as f32 * 20.0);
+    }
+
+    #[test]
+    fn wrapping_reads_across_chunks() {
+        let text = "aaa bbb\tccc ddd 漢字 eeeeeeeee f";
+        let whole = Rows::wrap([text], 6);
+        for split in (0..=text.len()).filter(|&i| text.is_char_boundary(i)) {
+            assert_eq!(Rows::wrap([&text[..split], &text[split..]], 6), whole);
+        }
+    }
+
+    #[test]
+    fn hanging_spaces_are_one_cluster_and_end_stops_after_the_word() {
+        let text = "a a      bbb";
+        let rows = Rows::wrap([text], 4);
+        let g = rows.geometry(0..2, 10.0, 20.0, |r| text[r].to_owned());
+        let c = &g.rows[0].clusters;
+        // a, the space between the words, a, then the six hanging spaces.
+        assert_eq!(c.len(), 4);
+        assert_eq!((c[1].start, c[1].end), (1, 2));
+        assert_eq!((c[3].start, c[3].end, c[3].x, c[3].w), (3, 9, 30.0, 10.0));
+        assert_eq!(g.hit_row_affine(0, f32::INFINITY), (3, false));
+        assert_eq!(g.hit_row_affine(0, 200.0), (3, false));
     }
 }

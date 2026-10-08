@@ -1595,28 +1595,79 @@ impl LiveView {
     }
 
     /// One step left or right (by grapheme or word), skipping hidden bytes.
-    fn step(&self, doc: &Document, parse: &ParseOutput, forward: bool, word: bool) -> usize {
-        let mut at = self.selection.head;
+    ///
+    /// A long-line notice (see `live_layout::long_notice`) is crossed whole
+    /// by a move, without reading the source it stands for. A selection
+    /// stops at its edge rather than taking the whole block, and a delete at
+    /// its edge takes one grapheme (or word) of the source, as the code pane
+    /// would.
+    fn step(
+        &self,
+        doc: &Document,
+        parse: &ParseOutput,
+        forward: bool,
+        word: bool,
+        purpose: Step,
+    ) -> usize {
+        let one = |at| match (forward, word) {
+            (true, false) => motion::next_grapheme(doc, at),
+            (true, true) => motion::next_word(doc, at),
+            (false, false) => motion::prev_grapheme(doc, at),
+            (false, true) => motion::prev_word(doc, at),
+        };
+        let head = self.selection.head;
+        // The edge facing the step, and the one across.
+        let edges = |block: Range<usize>| {
+            if forward {
+                (block.start, block.end)
+            } else {
+                (block.end, block.start)
+            }
+        };
+        if let Some(block) = notice_at(doc, parse, head) {
+            let (near, far) = edges(block);
+            if head == near {
+                return match purpose {
+                    Step::Move => far,
+                    Step::Select => head,
+                    Step::Delete => one(head),
+                };
+            }
+        }
+        let mut at = head;
         for _ in 0..256 {
-            let next = match (forward, word) {
-                (true, false) => motion::next_grapheme(doc, at),
-                (true, true) => motion::next_word(doc, at),
-                (false, false) => motion::prev_grapheme(doc, at),
-                (false, true) => motion::prev_word(doc, at),
-            };
+            let next = one(at);
             if next == at {
                 break;
             }
             at = next;
-            // Inside a block shown as a long-line notice: across it at once.
-            if let Some(block) = long_block_at(doc, parse, at) {
-                at = if forward { block.end } else { block.start };
+            // Into a notice from outside it (a word step can): to the edge
+            // across for a move, to the edge crossed otherwise.
+            if let Some(block) = notice_at(doc, parse, at).filter(|b| b.start < at && at < b.end) {
+                let (near, far) = edges(block);
+                at = if purpose == Step::Move { far } else { near };
+                break;
             }
             if self.is_visible(doc, parse, at) {
                 break;
             }
         }
         at
+    }
+
+    /// Moves an end of the selection that lies inside a long-line notice
+    /// to the notice's end, where it is drawn, so an edit happens where the
+    /// caret shows. (The code pane can leave it anywhere in the line.)
+    fn settle_in_notice(&mut self, doc: &Document, parse: &ParseOutput) {
+        let settle = |at: usize| match notice_at(doc, parse, at) {
+            Some(block) if block.start < at && at < block.end => block.end,
+            _ => at,
+        };
+        let (anchor, head) = (settle(self.selection.anchor), settle(self.selection.head));
+        if (anchor, head) != (self.selection.anchor, self.selection.head) {
+            self.selection = Selection { anchor, head };
+            self.preferred_x = None;
+        }
     }
 
     fn move_to(&mut self, target: usize, extend: bool) {
@@ -1681,6 +1732,16 @@ impl LiveView {
             }
             y += 4.0f64.copysign(f64::from(dy));
         }
+        // Into a long-line notice from outside it: on the edge facing the
+        // caret, whichever of its glyphs is under x, as the code pane enters
+        // the line's first or last row.
+        let head = self.selection.head;
+        if let Some(block) = notice_at(doc, parse, target)
+            && !block.contains(&head)
+            && head != block.end
+        {
+            target = if dy < 0.0 { block.end } else { block.start };
+        }
         let upstream = self.hit_upstream && target != 0 && target != doc.len();
         self.move_to(target, extend);
         self.upstream_at = upstream.then_some(target);
@@ -1717,6 +1778,9 @@ impl LiveView {
         let events = ui.input(|i| i.events.clone());
         for event in events {
             let parse = state.output();
+            if !matches!(event, Event::Copy) {
+                self.settle_in_notice(doc, parse);
+            }
             let edited = match event {
                 Event::Copy | Event::Cut => {
                     let range = self.selection.range();
@@ -2155,7 +2219,7 @@ impl LiveView {
                 if !word && let Some(plan) = commands::smart_backspace(doc, sel) {
                     return self.apply_plan(doc, plan);
                 }
-                let start = self.step(doc, parse, false, word);
+                let start = self.step(doc, parse, false, word, Step::Delete);
                 // In a table, deleting stops at the cell's edge: past it are
                 // pipes, which would break the row.
                 if let Some(text) = self.cell_text_range(doc, parse)
@@ -2166,7 +2230,7 @@ impl LiveView {
                 return self.delete(doc, start..sel.head, EditKind::Deleting);
             }
             Key::Delete => {
-                let end = self.step(doc, parse, true, word);
+                let end = self.step(doc, parse, true, word, Step::Delete);
                 if let Some(text) = self.cell_text_range(doc, parse)
                     && end > text.end
                 {
@@ -2190,7 +2254,8 @@ impl LiveView {
             Key::ArrowLeft if !shift && !range.is_empty() => self.move_to(range.start, false),
             Key::ArrowRight if !shift && !range.is_empty() => self.move_to(range.end, false),
             Key::ArrowLeft | Key::ArrowRight => {
-                let target = self.step(doc, parse, key == Key::ArrowRight, word);
+                let purpose = if shift { Step::Select } else { Step::Move };
+                let target = self.step(doc, parse, key == Key::ArrowRight, word, purpose);
                 self.move_to(target, shift);
             }
             Key::ArrowUp => self.move_vertical(doc, parse, frame, -1.0, shift),
@@ -2272,19 +2337,17 @@ impl LiveView {
                 self.move_to(at, false);
                 Some(false)
             }
-            Action::WordLeft => {
-                self.move_to(self.step(doc, parse, false, true), extend);
-                Some(false)
-            }
-            Action::WordRight => {
-                self.move_to(self.step(doc, parse, true, true), extend);
+            Action::WordLeft | Action::WordRight => {
+                let purpose = if extend { Step::Select } else { Step::Move };
+                let forward = action == Action::WordRight;
+                self.move_to(self.step(doc, parse, forward, true, purpose), extend);
                 Some(false)
             }
             Action::DeleteWordLeft | Action::DeleteWordRight if !range.is_empty() => {
                 Some(self.delete(doc, range, EditKind::Deleting))
             }
             Action::DeleteWordLeft => {
-                let start = self.step(doc, parse, false, true);
+                let start = self.step(doc, parse, false, true, Step::Delete);
                 if let Some(text) = self.cell_text_range(doc, parse)
                     && start < text.start
                 {
@@ -2293,7 +2356,7 @@ impl LiveView {
                 Some(self.delete(doc, start..head, EditKind::Deleting))
             }
             Action::DeleteWordRight => {
-                let end = self.step(doc, parse, true, true);
+                let end = self.step(doc, parse, true, true, Step::Delete);
                 if let Some(text) = self.cell_text_range(doc, parse)
                     && end > text.end
                 {
@@ -2920,12 +2983,34 @@ fn leaf_at_line(doc: &Document, parse: &ParseOutput, line: usize) -> Option<Leaf
     (doc.byte_to_line(leaf.block.range.start) <= line).then_some(leaf)
 }
 
-/// The block holding `at` strictly inside, when it's shown as a long-line
-/// notice.
-fn long_block_at(doc: &Document, parse: &ParseOutput, at: usize) -> Option<Range<usize>> {
+/// What a step over a long-line notice is for (see `LiveView::step`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Move,
+    Select,
+    Delete,
+}
+
+/// The source a long-line notice stands for (see
+/// `long_line::notice_source`), when `at` is in it or on an edge: the
+/// block's, or in a table the cell's.
+fn notice_at(doc: &Document, parse: &ParseOutput, at: usize) -> Option<Range<usize>> {
     let leaf = leaf_at_line(doc, parse, doc.byte_to_line(at))?;
-    let r = leaf.block.range;
-    (r.start < at && at < r.end && crate::long_line::holds_long_line(doc, &r)).then_some(r)
+    let block = if matches!(leaf.block.kind, BlockKind::Table { .. }) {
+        parse
+            .blocks
+            .table_rows(&leaf.block)
+            .into_iter()
+            .flat_map(|(_, cells)| cells)
+            .find(|c| c.range.start <= at && at <= c.range.end)?
+    } else {
+        leaf.block
+    };
+    if !crate::long_line::shows_notice(doc, &block) {
+        return None;
+    }
+    let source = crate::long_line::notice_source(doc, block.range);
+    (source.start <= at && at <= source.end).then_some(source)
 }
 
 /// First and last source line of the leaf on `line`.

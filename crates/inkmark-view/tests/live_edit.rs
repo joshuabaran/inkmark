@@ -1312,3 +1312,79 @@ fn the_live_pane_steps_over_a_very_long_line_and_edits_at_its_edges() {
     expected.insert(long.end, 'Z');
     assert_eq!(s.text(), expected);
 }
+
+#[test]
+fn deleting_or_selecting_at_a_long_line_notice_takes_one_step() {
+    let (src, long) = long_line_doc();
+    let mut s = Split::new(&src);
+    let long_line = s.doc.byte_to_line(long.start);
+    let removed = |s: &Split, before: &str| before.len() - s.text().len();
+    // Backspace at the notice's end takes the line's last character, and
+    // Delete at its start the first; neither takes the block.
+    s.caret(long.end);
+    let before = s.text();
+    s.press(Key::Backspace);
+    assert_eq!(removed(&s, &before), 1);
+    s.caret(long.start);
+    let before = s.text();
+    s.press(Key::Delete);
+    assert_eq!(removed(&s, &before), 1);
+    // Word deletes take a word.
+    let before = s.text();
+    s.key(Key::Delete, Modifiers::COMMAND);
+    assert!((1..20).contains(&removed(&s, &before)));
+    let end = s.doc.line_range(long_line).end;
+    s.caret(end);
+    let before = s.text();
+    s.key(Key::Backspace, Modifiers::COMMAND);
+    assert!((1..20).contains(&removed(&s, &before)));
+    // Shift+arrow doesn't select the whole block in one step.
+    let line = s.doc.line_range(long_line);
+    s.caret(line.start);
+    s.key(Key::ArrowRight, Modifiers::SHIFT);
+    assert_eq!(s.live.selection(), Selection::caret(line.start));
+    s.caret(line.end);
+    s.key(Key::ArrowLeft, Modifiers::SHIFT);
+    assert_eq!(s.live.selection(), Selection::caret(line.end));
+    // Plain arrows still cross it.
+    s.press(Key::ArrowLeft);
+    assert_eq!(s.live.selection().head, line.start);
+}
+
+#[test]
+fn up_and_down_enter_a_long_line_notice_at_its_near_edge() {
+    let (src, long) = long_line_doc();
+    let mut s = Split::new(&src);
+    // Down from the end of "Intro." (past the blank line): the notice's
+    // start, wherever "Intro." ends.
+    s.caret(src.find("Intro.").unwrap() + 6);
+    for _ in 0..3 {
+        if s.live.selection().head >= long.start {
+            break;
+        }
+        s.press(Key::ArrowDown);
+    }
+    assert_eq!(s.live.selection().head, long.start);
+    // Up from "Outro.": its end.
+    s.caret(src.find("Outro.").unwrap());
+    for _ in 0..3 {
+        if s.live.selection().head <= long.end {
+            break;
+        }
+        s.press(Key::ArrowUp);
+    }
+    assert_eq!(s.live.selection().head, long.end);
+}
+
+#[test]
+fn a_caret_the_code_pane_left_inside_a_notice_types_at_its_end() {
+    let (src, long) = long_line_doc();
+    let mut s = Split::new(&src);
+    // The notice draws a caret inside the line at its end, so that's where
+    // typing goes.
+    s.caret(long.start + 5000);
+    s.type_text("Z");
+    let mut expected = src.clone();
+    expected.insert(long.end, 'Z');
+    assert_eq!(s.text(), expected);
+}
