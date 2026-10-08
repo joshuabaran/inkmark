@@ -333,21 +333,18 @@ fn first_row_end(screen: Rect) -> usize {
 }
 
 #[test]
-fn the_live_pane_wraps_near_seventy_five_characters() {
+fn the_live_pane_wraps_at_its_panel_width() {
     let wide = first_row_end(Rect::from_min_max(Pos2::ZERO, pos2(1800.0, 900.0)));
     let medium = first_row_end(Rect::from_min_max(Pos2::ZERO, pos2(1000.0, 700.0)));
     let narrow = first_row_end(Rect::from_min_max(Pos2::ZERO, pos2(480.0, 600.0)));
+    // No cap at about 75 characters: a wide panel fills its row.
+    assert!(wide > 150, "wide {wide}");
+    // The row grows with the panel: the text column is about twice as wide
+    // at 1800 pt as at 1000 pt, and about twice as wide at 1000 as at 480.
+    assert!(wide * 10 >= medium * 17, "wide {wide}, medium {medium}");
     assert!(
-        (40..=110).contains(&wide) && (40..=110).contains(&medium),
-        "wide {wide}, medium {medium}"
-    );
-    assert!(
-        wide.abs_diff(medium) <= 15,
-        "wide {wide} and medium {medium} diverged"
-    );
-    assert!(
-        narrow + 20 <= wide.min(medium),
-        "narrow {narrow}, wide {wide}, medium {medium}"
+        medium * 10 >= narrow * 17,
+        "medium {medium}, narrow {narrow}"
     );
 }
 
@@ -544,6 +541,36 @@ fn page_up_after_a_cold_jump_measures_what_it_crosses() {
 }
 
 #[test]
+fn a_wrap_change_keeps_a_line_inside_a_block() {
+    // One paragraph of 40 source lines, each long enough to wrap, so the
+    // block's height changes with every wide width.
+    let line = "word ".repeat(80);
+    let src = format!("# Top\n\n{}\n", vec![line.trim_end(); 40].join("\n"));
+    let first = line_of(&src, "word");
+    let mut h = Harness::open(&src, Rect::from_min_max(Pos2::ZERO, pos2(1400.0, 700.0)));
+    let parse = h.parse.output().clone();
+    let target = ScrollPos {
+        line: first + 20,
+        frac: 0.5,
+    };
+    h.view.set_scroll_pos(&h.doc, &parse, target);
+    h.frame(vec![]);
+    let start = h.view.scroll_pos(&h.doc, &parse);
+    assert_eq!(start.line, target.line, "{start:?}");
+    for width in [1800.0, 1500.0, 1600.0, 520.0, 1800.0] {
+        h.screen = Rect::from_min_max(Pos2::ZERO, pos2(width, 700.0));
+        h.frame(vec![]);
+        h.frame(vec![]);
+        let pos = h.view.scroll_pos(&h.doc, &parse);
+        assert_eq!(pos.line, target.line, "at {width} pt: {pos:?}");
+        assert!(
+            (pos.frac - target.frac).abs() < 0.05,
+            "at {width} pt: {pos:?}"
+        );
+    }
+}
+
+#[test]
 fn a_wrap_change_keeps_the_view_and_lays_out_only_the_screen() {
     let src = parts(400);
     let wide = Rect::from_min_max(Pos2::ZERO, pos2(1400.0, 700.0));
@@ -560,8 +587,7 @@ fn a_wrap_change_keeps_the_view_and_lays_out_only_the_screen() {
     );
     h.frame(vec![]);
     let before = h.view.scroll_pos(&h.doc, &parse);
-    // Narrower than the live pane's 75-character measure: every line wraps
-    // differently and every height is estimated again.
+    // A narrower pane: every line wraps differently and every height is estimated again.
     h.screen = Rect::from_min_max(Pos2::ZERO, pos2(500.0, 700.0));
     h.frame(vec![]);
     h.frame(vec![]);

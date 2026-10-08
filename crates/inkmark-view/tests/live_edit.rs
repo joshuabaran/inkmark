@@ -1346,9 +1346,15 @@ fn deleting_or_selecting_at_a_long_line_notice_takes_one_step() {
     s.caret(line.end);
     s.key(Key::ArrowLeft, Modifiers::SHIFT);
     assert_eq!(s.live.selection(), Selection::caret(line.end));
-    // Plain arrows still cross it.
+    // Plain arrows still cross it, to the paragraph's start. The word
+    // delete left the line starting with a space, which the full parse
+    // leaves out of the paragraph (a block still rebased from before the
+    // delete holds it), so let the parse land first.
+    s.settle();
     s.press(Key::ArrowLeft);
-    assert_eq!(s.live.selection().head, line.start);
+    let text = s.text();
+    let start = line.start + text[line.start..].len() - text[line.start..].trim_start().len();
+    assert_eq!(s.live.selection().head, start);
 }
 
 #[test]

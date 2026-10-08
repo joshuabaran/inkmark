@@ -187,6 +187,15 @@ Each hypothesis gets one verdict:
 > and the screen it lands on, not the whole prefix. `jump_end_cold_5mb`
 > 4 ms, `resize_drag_narrow_5mb` 14 ms, `prose_zoom_steps_1mb` 10 ms,
 > `random_jumps_5mb` max under 5 ms.
+>
+> **Note (CRO-127, 2026-10-08):** the live pane no longer stops at 75
+> characters; it wraps at its panel's width. The rows above were measured
+> with the cap, so `resize_drag_1mb` and `resize_drag_5mb` (1600 pt) only
+> re-wrapped the code pane then. Now they re-wrap the live pane too.
+> A/B against master on the same disk, p50 / p95 per frame:
+> `resize_drag_1mb` 5.8 / 5.9 ms → 9.8 / 10.0 ms, `resize_drag_5mb`
+> 8.7 / 8.8 ms → 16.2 / 16.4 ms (just over budget; CRO-123 is the
+> follow-up). The narrow drags and the table rows did not change.
 
 Before the live pane scrolls, it measures every block from
 `measured_prefix` down to the target, in one UI-thread frame. The prefix

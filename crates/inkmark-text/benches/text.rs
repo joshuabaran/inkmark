@@ -22,7 +22,7 @@ fn configure() -> Criterion {
     }
 }
 
-/// The live pane's settings at its 75-character measure.
+/// The live pane's settings, wrapped at a mid-sized panel's width.
 const LIVE: TextConfig = TextConfig {
     monospace: false,
     font_size: 16.0,
