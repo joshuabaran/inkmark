@@ -581,10 +581,17 @@ fn a_long_name_keeps_the_unsaved_mark_in_the_row() {
 
 /// The delay egui would wait before the next frame, after one idle frame.
 fn idle_repaint_delay(h: &mut Harness) -> Duration {
+    repaint_delay_after(h, vec![])
+}
+
+/// The delay egui would wait before the next frame, after a frame with
+/// `events`.
+fn repaint_delay_after(h: &mut Harness, events: Vec<Event>) -> Duration {
     h.time += 1.0 / 60.0;
     let input = RawInput {
         screen_rect: Some(SCREEN),
         time: Some(h.time),
+        events,
         ..Default::default()
     };
     let browser = &mut h.browser;
@@ -645,4 +652,80 @@ fn an_external_change_wakes_the_window_without_a_timer() {
         std::thread::sleep(Duration::from_millis(5));
     }
     h.wait_until(|b| b.row_count() == 2);
+}
+
+/// Records whether egui was asked for a frame since the last reset.
+fn repaint_flag(h: &Harness) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let woken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = woken.clone();
+    h.ctx.set_request_repaint_callback(move |_| {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    woken
+}
+
+#[test]
+fn a_root_set_between_frames_asks_for_the_frame_that_lists_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("a.md"), "").unwrap();
+    let mut h = Harness::new(dir.path());
+    h.wait_until(|b| b.row_count() == 1);
+    for _ in 0..5 {
+        h.frame(vec![]);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let woken = repaint_flag(&h);
+    // As the app does when the Open Folder dialog returns: no input, no
+    // frame running. Without a wake the listing would wait for the next
+    // timed frame, a second away.
+    h.browser.set_root(sub.clone());
+    assert!(
+        woken.load(std::sync::atomic::Ordering::SeqCst),
+        "set_root asked for no frame"
+    );
+    h.wait_until(|b| b.row_names() == ["a.md"]);
+}
+
+#[test]
+fn expanding_a_folder_lists_it_without_waiting_for_a_timer() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("a.md"), "").unwrap();
+    let mut h = Harness::new(dir.path());
+    h.wait_until(|b| b.row_rect(&sub).is_some());
+    for _ in 0..5 {
+        h.frame(vec![]);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let c = h.browser.row_rect(&sub).unwrap().center();
+    let button = |pressed| Event::PointerButton {
+        pos: c,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    repaint_delay_after(&mut h, vec![Event::PointerMoved(c), button(true)]);
+    // The release expands the folder after this frame's poll ran.
+    let delay = repaint_delay_after(&mut h, vec![button(false)]);
+    assert!(
+        delay < Duration::from_millis(100),
+        "next frame after {delay:?}"
+    );
+    // Each following frame comes promptly until the listing lands.
+    let start = Instant::now();
+    while !h.browser.row_names().contains(&"a.md".to_string()) {
+        let delay = idle_repaint_delay(&mut h);
+        assert!(
+            delay < Duration::from_millis(100),
+            "waited {delay:?} for the listing"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "the listing never landed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
