@@ -103,11 +103,11 @@ fi
 # Host details the report can't read from /proc.
 host=()
 if command -v lspci > /dev/null; then
-    gpu=$(lspci 2>/dev/null | grep -iE 'vga|3d' | sed 's/.*: //' | paste -sd ';' -)
+    gpu=$(lspci 2>/dev/null | grep -iE 'vga|3d' | sed 's/.*: //' | paste -sd ';' - || true)
     host+=(--host "gpu=$gpu")
 fi
 if command -v pacman > /dev/null; then
-    host+=(--host "mesa=$(pacman -Q mesa 2>/dev/null | cut -d' ' -f2)")
+    host+=(--host "mesa=$(pacman -Q mesa 2>/dev/null | cut -d' ' -f2 || true)")
 fi
 if command -v hyprctl > /dev/null && command -v jq > /dev/null; then
     monitors=$(hyprctl monitors -j 2>/dev/null \
@@ -116,7 +116,7 @@ if command -v hyprctl > /dev/null && command -v jq > /dev/null; then
     host+=(--host "monitors=$monitors")
 fi
 if command -v fc-match > /dev/null; then
-    host+=(--host "fonts=$(fc-match -f '%{family[0]}' monospace) / $(fc-match -f '%{family[0]}' sans-serif)")
+    host+=(--host "fonts=$(fc-match -f '%{family[0]}' monospace || true) / $(fc-match -f '%{family[0]}' sans-serif || true)")
 fi
 host+=(--host "rustc=$(rustc --version | cut -d' ' -f2)")
 

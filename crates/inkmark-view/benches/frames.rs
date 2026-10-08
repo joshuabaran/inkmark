@@ -382,7 +382,7 @@ fn scrolling(r: &Reporter, book: &str) {
     if r.wants("jump_end") {
         for (mode, prefix) in [(Mode::Live, "live"), (Mode::Split, "split")] {
             let (mut cold, mut after_edit) = (Run::default(), Run::default());
-            for _ in 0..iterations(5, 2) {
+            for _ in 0..iterations(5, 1) {
                 let mut p = Panes::new(book, mode);
                 let (k, m) = ctrl(Key::End);
                 cold.push(p.key(k, m));
@@ -648,7 +648,7 @@ fn long_lines(r: &Reporter) {
         let open_ms = started.elapsed().as_secs_f64() * 1000.0;
         p.caret(at);
         let mut run = Run::default();
-        for _ in 0..iterations(10, 3) {
+        for _ in 0..iterations(10, 1) {
             run.push(p.text("x"));
         }
         run.report(
@@ -693,7 +693,7 @@ fn cjk(r: &Reporter) {
         let mut p = Panes::new(&text, Mode::Split);
         let lines = p.doc.line_count();
         let mut run = Run::default();
-        for i in 0..iterations(240, 60) {
+        for i in 0..iterations(240, 20) {
             p.zoom = zooms[(i / 20) % zooms.len()];
             p.scroll_to((i * 7) % lines);
             run.push(p.frame(vec![]));
@@ -732,7 +732,7 @@ fn zoom(r: &Reporter) {
         let mut p = Panes::new(&book, Mode::Split);
         p.caret(mid_paragraph(&p.doc, p.doc.line_count() / 2));
         let mut run = Run::default();
-        for i in 0..iterations(30, 10) {
+        for i in 0..iterations(30, 5) {
             p.zoom = [1.0, 1.25, 1.5, 2.0, 1.1][i % 5];
             run.push(p.frame(vec![]));
         }
@@ -766,7 +766,7 @@ fn resize(r: &Reporter, book: &str) {
         p.screen = Rect::from_min_max(Pos2::ZERO, pos2(width, 1000.0));
         p.caret(mid_paragraph(&p.doc, p.doc.line_count() / 2));
         let mut run = Run::default();
-        for i in 0..iterations(20, 6) {
+        for i in 0..iterations(20, 2) {
             p.screen = Rect::from_min_max(Pos2::ZERO, pos2(width - 4.0 * (i + 1) as f32, 1000.0));
             run.push(p.frame(vec![]));
         }

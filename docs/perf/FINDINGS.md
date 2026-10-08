@@ -151,6 +151,11 @@ Each hypothesis gets one verdict:
   `micro/shape/cold_cjk_emoji_300b` takes 310 µs against 147 µs for Latin
   text of the same length. The extra comes from cosmic-text's per-run font
   fallback, and the code pane shapes those lines twice (§3).
+- **Without a font that covers the text, it gets far worse.** The GitHub
+  runner has only DejaVu and Noto Core (no CJK, no color emoji), and there
+  the same scroll took **763 ms per frame** (p50), with 2.3 million
+  allocations: every run searches every installed font and finds nothing.
+  A user without a CJK font who opens a CJK note pays this.
 
 ### 5. Code pane per frame: Confirmed, minor
 
@@ -355,7 +360,7 @@ are p95 unless noted.
 | 3 | Very long lines: shape only the visible part (CRO-112). | `frames/code/long_line_1mb_typing`, `live/long_line_1mb_typing` | 1.6 s per keystroke | Code pane < 16 ms; live pane doesn't freeze | L / M |
 | 4 | Find: run a regex query off the UI thread, first match first and the count after, as folder search does. | `micro/find/query_regex_5mb` | 123 ms per query keystroke | < 16 ms on the UI thread | M / low |
 | 5 | Tables: cache cell layouts and measure each cell once, taking the natural width from the same layout instead of per-word geometry. | `frames/live/table_repad_on_leave_500x8`, `table_insert_column_500x8`, `table_first_paint_500x8` | 210 · 163 · 140 ms | < 16 ms | M / low |
-| 6 | CJK and emoji: cache wide-character scales per font and size instead of a probe layout per line, and look at cosmic-text's fallback cost. | `frames/split/cjk_emoji_scroll`, `micro/shape/cold_cjk_emoji_300b` | 20.1 ms p95; 310 µs | < 12 ms p95 | M / low |
+| 6 | CJK and emoji: cache wide-character scales per font and size instead of a probe layout per line, and cache cosmic-text's fallback misses (a script no installed font covers). | `frames/split/cjk_emoji_scroll`, `micro/shape/cold_cjk_emoji_300b` | 20.1 ms p95 here; 763 ms per frame with no CJK font | < 12 ms p95, with or without the font | M / low |
 | 7 | Images: evict textures (LRU by bytes), drop them when another file opens, and keep them at drawn size instead of decoded size. | `frames/live/image_note_paging` `texture_mb` | 119–129 MB for 24 images, never freed | Bounded (e.g. 256 MB), freed on open | S–M / low |
 | 8 | Save off the UI thread: write a rope snapshot on a worker and keep the disk-stamp rules. | `micro/file/save_10mb`, `app/save_*` | 11–13 ms on NVMe; unbounded on slow disks | < 1 ms on the UI thread | M / M (detecting changes on disk) |
 | 9 | Width changes: make the estimate of every line's height lazy or incremental. | `frames/split/resize_drag_5mb` | 10 ms per frame at 5 MB (~19 ms at 10 MB) | < 4 ms at 10 MB | S–M / low |
