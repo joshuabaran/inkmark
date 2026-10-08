@@ -85,6 +85,34 @@ jobs:
             lcov.info
             coverage/html
 
+  bench:
+    name: Bench smoke (quick)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Runner numbers are noise, not a baseline: build fast instead of
+      # building the shipped profile (thin LTO, one codegen unit).
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_DEBUG: "false"
+      CARGO_PROFILE_BENCH_LTO: "false"
+      CARGO_PROFILE_BENCH_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_BENCH_DEBUG: "false"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fonts
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-dejavu-core fonts-noto-core
+      - run: cargo bench --workspace --no-run --locked
+      # Every bench runs once, briefly; the authoritative numbers come from
+      # `scripts/bench.sh full` on the Omarchy host (docs/perf/).
+      - run: scripts/bench.sh quick
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bench-quick
+          path: target/bench
+
   build:
     name: Release build
     runs-on: ubuntu-latest

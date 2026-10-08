@@ -278,13 +278,24 @@ Opening another file or closing with unsaved changes asks first.
 
 ```sh
 cargo test --workspace                                  # unit, spec, fuzz tests
-cargo test --release --workspace -- --ignored --nocapture   # benchmarks
-scripts/measure.sh [big.md]                             # startup, memory, scroll fps
+scripts/bench.sh [quick|full]                           # benchmarks → target/bench/<sha>.md
+scripts/measure.sh [big.md]                             # app window: startup, typing, scroll, idle
 FUZZ_ITERS=5000 cargo test --release -p inkmark-view --test live_edit fuzzed
 ```
 
+`scripts/bench.sh` generates its fixtures in `target/fixtures` from a fixed
+seed, runs the criterion micro benches (`cargo bench -p inkmark-buffer`,
+`-p inkmark-parse`, `-p inkmark-text`) and the frame benches
+(`cargo bench -p inkmark-view --bench frames -- <filter>`), and writes a
+JSON and Markdown report. `full` adds the older `#[ignore]`d bench tests
+and the real-window numbers from `scripts/measure.sh`.
+`--compare docs/perf/baseline-<sha>.json` flags medians more than 15%
+slower and any p95 over the 16 ms budget. The findings and the baseline
+are in [docs/perf](docs/perf/FINDINGS.md).
+
 CI (`.github/workflows/ci.yml`) runs formatting, clippy (also with the
-`glow` renderer), rustdoc, the tests, a release build, and coverage with
+`glow` renderer), rustdoc, the tests, the quick benches as a smoke test,
+a release build, and coverage with
 [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov). The coverage
 summary is on each run's page, with the HTML report and `lcov.info` as an
 artifact. Locally:
@@ -298,8 +309,9 @@ The workspace is split into `inkmark-buffer` (rope, edits, undo, file I/O),
 `inkmark-parse` (parser seam, block tree, source map), `inkmark-text`
 (cosmic-text layout and glyph atlas), `inkmark-view` (code and live panes,
 and the folder sidebar), `inkmark-files` (folder tree, listing and
-watching), `inkmark-minimap`, and the `inkmark` app. Large test documents
-are not in the repo; `scripts/measure.sh` takes any big `.md` file.
+watching), `inkmark-minimap`, `inkmark-bench` (benchmark fixtures and reports), and
+the `inkmark` app. Large test documents are generated, not committed;
+`scripts/measure.sh` also takes any big `.md` file.
 
 ## License
 

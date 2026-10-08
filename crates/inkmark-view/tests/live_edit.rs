@@ -435,10 +435,7 @@ fn fuzzed_mixed_editing_keeps_invariants() {
 #[test]
 #[ignore]
 fn bench_live_typing_long_paragraph() {
-    let book = std::env::var("HOME")
-        .ok()
-        .and_then(|h| std::fs::read_to_string(format!("{h}/Projects/inkmark/tolstoy.md")).ok())
-        .unwrap_or_else(|| format!("{}\n", "word ".repeat(600)));
+    let book = inkmark_bench::fixtures::load("prose-5mb.md");
     let longest = book
         .split("\n\n")
         .max_by_key(|p| p.len())
