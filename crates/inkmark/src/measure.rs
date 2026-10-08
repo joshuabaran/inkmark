@@ -9,7 +9,8 @@
 //!    pane, then live pane), one every 100 ms, so debounced parses land
 //!    between keystrokes as they do for a person;
 //! 4. saving, when the file is a scratch copy (`INKMARK_MEASURE_SAVE=1`);
-//! 5. five seconds idle: CPU time and how many frames the app asked for.
+//! 5. two seconds to settle, then five seconds idle: CPU time and how many
+//!    frames the app asked for.
 //!
 //! `INKMARK_MEASURE_LABEL` (e.g. `5mb`) is appended to each result's
 //! name, and `INKMARK_BENCH_OUT` names a file to append JSON lines to, in
@@ -32,6 +33,9 @@ const KEY_INTERVAL: Duration = Duration::from_millis(100);
 const SAVES: usize = 5;
 /// How long the idle phase watches.
 const IDLE_FOR: Duration = Duration::from_secs(5);
+/// Quiet time before the idle phase starts counting, so the last save's
+/// folder event and the last full parse aren't counted as idle wakes.
+const IDLE_SETTLE: Duration = Duration::from_secs(2);
 
 /// Which pane a step is about.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -230,16 +234,18 @@ impl Measure {
                 Step::Save
             }
             Phase::Idle(idle) => {
+                if idle.cpu_start.is_none() {
+                    // Settling: the frames from the phases before still
+                    // land here. Count from the first frame after it.
+                    if now - idle.started >= IDLE_SETTLE {
+                        idle.cpu_start = cpu_seconds();
+                        idle.started = now;
+                    }
+                    return Step::Idle;
+                }
                 idle.frames += 1;
                 for cause in ctx.repaint_causes() {
                     *idle.causes.entry(cause.to_string()).or_default() += 1;
-                }
-                if idle.cpu_start.is_none() {
-                    // The first idle frame: start counting from here.
-                    idle.cpu_start = cpu_seconds();
-                    idle.started = now;
-                    idle.frames = 0;
-                    return Step::Idle;
                 }
                 if now - idle.started < IDLE_FOR {
                     return Step::Idle;

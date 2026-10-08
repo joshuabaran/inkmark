@@ -402,11 +402,10 @@ impl FileBrowser {
         for index in indexes {
             self.tree.invalidate(index);
         }
-        // A backup wake: the watch thread also requests a repaint, but a
-        // missed one would otherwise wait on the disk-check interval.
-        if !dirs.is_empty() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
-        }
+        // No timer here. The watch thread requests a repaint with every
+        // change, and the app repaints once a second for its disk check, so
+        // a missed wake still shows within a second. A timer of its own
+        // would wake an idle window several times a second (CRO-117).
     }
 
     fn reveal_if_listed(&mut self) {
