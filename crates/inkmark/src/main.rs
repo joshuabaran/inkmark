@@ -2251,6 +2251,12 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frame(ui);
     }
+
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(m) = &mut self.measure {
+            m.input(raw_input);
+        }
+    }
 }
 
 impl App {
@@ -2334,6 +2340,29 @@ impl App {
                 self.code.set_scroll_pos(pos);
                 self.live
                     .set_scroll_pos(&self.doc, self.parse.output(), pos);
+            }
+            measure::Step::Caret(pane) => {
+                let pane = match pane {
+                    measure::Pane::Code => Pane::Code,
+                    measure::Pane::Live => Pane::Live,
+                };
+                // The middle of a line in the middle of the document.
+                let line = self.doc.line_count() / 2;
+                let range = self.doc.line_range(line);
+                let mut at = (range.start + range.end) / 2;
+                while !self.doc.is_char_boundary(at) {
+                    at += 1;
+                }
+                self.focus = pane;
+                self.jump_to(at);
+                self.focus_pane(ctx, pane);
+            }
+            measure::Step::Save => {
+                let started = std::time::Instant::now();
+                self.save();
+                if let Some(m) = &mut self.measure {
+                    m.saved(started.elapsed());
+                }
             }
             measure::Step::Quit => {
                 self.close_allowed = true;

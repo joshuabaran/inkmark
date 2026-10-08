@@ -1265,3 +1265,88 @@ mod tests {
         assert_eq!(hit_row(&layout, 2), None);
     }
 }
+
+/// Folder search on the generated 10,000-note folder. Run with
+/// `cargo test --release -p inkmark -- --ignored --nocapture bench_folder_search`,
+/// or through `scripts/bench.sh`.
+#[cfg(test)]
+mod bench {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    use inkmark_bench::{Reporter, fixtures};
+
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn bench_folder_search_10k() {
+        let root = fixtures::dir().join("folder-10k");
+        if !root.exists() {
+            let notes = if inkmark_bench::quick() {
+                2_000
+            } else {
+                10_000
+            };
+            fixtures::write_folder(&root, notes, fixtures::SEED).unwrap();
+        }
+        let reporter = Reporter::new("search");
+        for (name, query, regex) in [
+            ("folder_rare_word", fixtures::NEEDLE, false),
+            ("folder_common_word", "the", false),
+            ("folder_regex", r"\b\w+ly\b", true),
+        ] {
+            let (mut names, mut first, mut done) = (Vec::new(), Vec::new(), Vec::new());
+            let mut hits = 0;
+            for _ in 0..inkmark_bench::iterations(5, 2) {
+                let job = Job {
+                    generation: 1,
+                    root: root.clone(),
+                    query: query.into(),
+                    case_sensitive: false,
+                    regex,
+                    show_all: false,
+                };
+                let cancel = AtomicU64::new(1);
+                let (tx, rx) = mpsc::channel();
+                let started = Instant::now();
+                let ms = |t: Instant| t.duration_since(started).as_secs_f64() * 1000.0;
+                let stamps = std::cell::RefCell::new(Vec::new());
+                run_job(&job, &cancel, &tx, &|| {
+                    stamps.borrow_mut().push(Instant::now())
+                });
+                drop(tx);
+                let stamps = stamps.into_inner();
+                let mut first_content = None;
+                hits = 0;
+                for (report, at) in rx.iter().zip(&stamps) {
+                    match report {
+                        Report::Names { .. } => names.push(ms(*at)),
+                        Report::Content {
+                            hits: h, done: d, ..
+                        } => {
+                            hits += h.len();
+                            if !h.is_empty() && first_content.is_none() {
+                                first_content = Some(ms(*at));
+                            }
+                            if d {
+                                done.push(ms(*at));
+                            }
+                        }
+                        Report::Failed { message, .. } => panic!("{message}"),
+                    }
+                }
+                first.extend(first_content);
+            }
+            reporter.record(&format!("{name}_names"), &names, None, &[]);
+            reporter.record(&format!("{name}_first_content"), &first, None, &[]);
+            reporter.record(
+                &format!("{name}_done"),
+                &done,
+                None,
+                &[("hits", hits as f64)],
+            );
+        }
+    }
+}

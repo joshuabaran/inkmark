@@ -26,4 +26,5 @@ tracing = "0.1.44"
 glow = ["eframe/glow"]
 
 [dev-dependencies]
+inkmark-bench.workspace = true
 tempfile = "3.27.0"

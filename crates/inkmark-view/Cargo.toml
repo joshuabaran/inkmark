@@ -20,4 +20,9 @@ unicode-segmentation.workspace = true
 latex-rust.workspace = true
 
 [dev-dependencies]
+inkmark-bench.workspace = true
 tempfile = "3.27.0"
+
+[[bench]]
+name = "frames"
+harness = false

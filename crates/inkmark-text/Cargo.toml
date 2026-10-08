@@ -11,8 +11,14 @@ egui.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+inkmark-bench.workspace = true
 eframe.workspace = true
 
 [features]
 # Lets the spike example run on the glow renderer (`--features glow -- --glow`).
 glow = ["eframe/glow"]
+
+[[bench]]
+name = "text"
+harness = false

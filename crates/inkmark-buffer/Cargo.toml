@@ -10,5 +10,11 @@ regex-cursor.workspace = true
 ropey.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+inkmark-bench.workspace = true
 proptest = "1.11.0"
 tempfile = "3.27.0"
+
+[[bench]]
+name = "buffer"
+harness = false

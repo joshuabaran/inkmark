@@ -184,17 +184,11 @@ fn scroll_position_round_trips() {
 
 /// Live view frame cost on a ~5 MB book. Run with:
 /// `cargo test --release -p inkmark-view --test live_view -- --ignored --nocapture`
-/// Uses ~/Projects/inkmark/tolstoy.md if present, else synthetic prose.
+/// Uses the generated 5 MB book (`inkmark-bench` fixtures), the same on every machine.
 #[test]
 #[ignore]
 fn bench_live_scroll_5mb() {
-    let book = std::env::var("HOME")
-        .ok()
-        .and_then(|h| std::fs::read_to_string(format!("{h}/Projects/inkmark/tolstoy.md")).ok())
-        .unwrap_or_else(|| {
-            "## Chapter\n\nSome *prose* that wraps across a couple of rows in the live view, with a [link](u).\n\n"
-                .repeat(50_000)
-        });
+    let book = inkmark_bench::fixtures::load("prose-5mb.md");
     let mut h = Harness::new(&book);
     let lines = h.doc.line_count();
     let parse = h.parse.output().clone();
