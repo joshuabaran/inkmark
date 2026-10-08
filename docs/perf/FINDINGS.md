@@ -183,6 +183,11 @@ Each hypothesis gets one verdict:
 
 ### 7. P6 reading scroll and huge-document jumps: Confirmed (the worst finding)
 
+> **Fixed in CRO-116 (2026-10-08):** a move measures what it passes through
+> and the screen it lands on, not the whole prefix. `jump_end_cold_5mb`
+> 4 ms, `resize_drag_narrow_5mb` 14 ms, `prose_zoom_steps_1mb` 10 ms,
+> `random_jumps_5mb` max under 5 ms.
+
 Before the live pane scrolls, it measures every block from
 `measured_prefix` down to the target, in one UI-thread frame. The prefix
 resets to 0 on `Synced::Rebuilt`: opening a file, a font or zoom change, or
@@ -294,6 +299,16 @@ any change to the live wrap width.
   | Regex | 32 ms | 32 ms | 320 ms |
 
 ### 13. Table editing: Confirmed
+
+> **Update (CRO-116, 2026-10-08):** the baseline's table-typing rows measured
+> a rendering bug. `BlockTree::leaves_from` missed a long table's own block
+> deep inside the table, so with the view top deep in a 500×8 table the
+> live pane drew the rows as raw source lines and never laid the table out.
+> Since the fix, typing there costs what drawing the real table costs:
+> `frames/live/table_typing_500x8` about 62 ms and
+> `frames/code/table_typing_500x8` about 24 ms. Master with the same parse
+> fix measures the same. Caching the table layout is the tables follow-up
+> (#5 below).
 
 | Bench (500 rows × 8 columns) | p50 | max |
 |---|---:|---:|

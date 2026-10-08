@@ -1069,3 +1069,90 @@ fn editing_a_table_in_the_code_pane_doesnt_re_pad_it() {
     }
     assert_eq!(s.text(), TABLE.replace("| c |", "| cell |"));
 }
+
+#[test]
+fn a_jump_deep_into_a_long_table_draws_the_table() {
+    // Eight cells a row make thousands of row and cell blocks, so the
+    // table's own block is several chunks before its last rows. The table
+    // isn't on screen at open, so nothing has laid it out yet.
+    let mut src = "Prose paragraph.\n\n".repeat(200);
+    src.push_str("| a | b | c | d | e | f | g | h |\n");
+    src.push_str("|---|---|---|---|---|---|---|---|\n");
+    for i in 0..500 {
+        src.push_str(&format!("| {i} | x | y | z | w | v | u | t |\n"));
+    }
+    let line_of = |needle: &str| src[..src.find(needle).unwrap()].matches('\n').count();
+    let (first, row) = (line_of("| a |"), line_of("| 450 |"));
+    let mut s = Split::new(&src);
+    assert!(!s.live.line_measured(first), "the table starts unmeasured");
+    let parse = s.parse.output().clone();
+    s.live.set_scroll_pos(
+        &s.doc,
+        &parse,
+        inkmark_view::ScrollPos {
+            line: row,
+            frac: 0.0,
+        },
+    );
+    s.frame(vec![]);
+    // Drawn as one table: its height sits on its first line and its rows
+    // hold nothing. A row drawn as a raw source line holds a height of its
+    // own.
+    assert!(s.live.line_measured(first), "the table was laid out");
+    assert_eq!(
+        s.live.measured_height(row),
+        0.0,
+        "row {row} was drawn as a raw line"
+    );
+    assert_eq!(s.live.view_top().0, first, "the view is inside the table");
+}
+
+#[test]
+fn arrow_up_in_an_estimated_table_stays_on_the_real_row() {
+    // A table's rows are taller drawn (cell padding) than their per-line
+    // estimates, so an estimated table is shorter in the height cache than
+    // on screen.
+    let mut src = String::from("| a | b | c |\n|---|---|---|\n");
+    for i in 0..120 {
+        src.push_str(&format!("| row {i} | x | y |\n"));
+    }
+    src.push('\n');
+    src.push_str(&"Filler.\n\n".repeat(300));
+    let at = src.find("row 100 ").unwrap() + 4;
+    let row_line = |s: &Split| s.doc.byte_to_line(s.live.selection().head);
+
+    // On screen: the table is laid out, and Arrow Up goes to row 99.
+    let mut fresh = Split::new(&src);
+    fresh.ctx.set_zoom_factor(1.25);
+    fresh.frame(vec![]);
+    fresh.caret(at);
+    fresh.press(Key::ArrowUp);
+    let expected = row_line(&fresh);
+    assert_eq!(expected, src[..at].matches('\n').count() - 1, "one row up");
+
+    // The caret handed over without a scroll, the view far below, then a
+    // zoom: the table is estimated again when Arrow Up runs.
+    let mut s = Split::new(&src);
+    s.live
+        .mirror_selection(inkmark_buffer::Selection::caret(at));
+    let parse = s.parse.output().clone();
+    let far = s.doc.line_count() - 5;
+    s.live.set_scroll_pos(
+        &s.doc,
+        &parse,
+        inkmark_view::ScrollPos {
+            line: far,
+            frac: 0.0,
+        },
+    );
+    s.frame(vec![]);
+    s.ctx.set_zoom_factor(1.25);
+    s.frame(vec![]);
+    s.frame(vec![]);
+    assert!(
+        !s.live.line_measured(0),
+        "the zoom left the table estimated"
+    );
+    s.press(Key::ArrowUp);
+    assert_eq!(row_line(&s), expected);
+}
