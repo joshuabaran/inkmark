@@ -1156,3 +1156,159 @@ fn arrow_up_in_an_estimated_table_stays_on_the_real_row() {
     s.press(Key::ArrowUp);
     assert_eq!(row_line(&s), expected);
 }
+
+/// A document with one line far over the long-line threshold (64 KiB)
+/// between two short paragraphs.
+fn long_line_doc() -> (String, std::ops::Range<usize>) {
+    let words = [
+        "alpha", "beta", "*gamma*", "delta", "`eps`", "zeta", "eta", "théta", "中文",
+    ];
+    let mut line = String::new();
+    let mut i = 0;
+    while line.len() < 100 * 1024 {
+        line.push_str(words[i % words.len()]);
+        line.push(' ');
+        i += 1;
+    }
+    let src = format!("Intro.\n\n{line}\n\nOutro.\n");
+    let start = src.find(&line).unwrap();
+    (src.clone(), start..start + line.len())
+}
+
+#[test]
+fn fuzzed_typing_in_a_very_long_line_inserts_only_the_typed_text() {
+    let (src, long) = long_line_doc();
+    let mut s = Split::new(&src);
+    s.code.request_focus(&s.ctx);
+    s.frame(vec![]);
+    let mut seed = 0x10_6e_u64 ^ 0x9e37_79b9;
+    let mut rand = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let iters = std::env::var("FUZZ_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+    let keys = [
+        Key::ArrowUp,
+        Key::ArrowDown,
+        Key::ArrowLeft,
+        Key::ArrowRight,
+        Key::Home,
+        Key::End,
+        Key::PageUp,
+        Key::PageDown,
+    ];
+    let long_line = s.doc.byte_to_line(long.start);
+    for i in 0..iters {
+        // Somewhere in the long line's rows, then a click and maybe a key.
+        if rand(3) == 0 {
+            let frac = rand(1000) as f32 / 1000.0;
+            s.code.set_scroll_pos(inkmark_view::ScrollPos {
+                line: long_line,
+                frac,
+            });
+            s.frame(vec![]);
+        }
+        // In the text column. (After a click on the minimap, at x 702 and
+        // up, an arrow key drops the pane's focus and typing is lost. That
+        // happens on master too, with any document, and is its own bug.)
+        s.click(pos2(20.0 + rand(670) as f32, 10.0 + rand(560) as f32));
+        if rand(2) == 0 {
+            s.press(keys[rand(keys.len() as u64) as usize]);
+        }
+        let before = s.text();
+        let caret = s.code.selection();
+        if !caret.is_empty() {
+            continue;
+        }
+        let ch = ['x', 'é', ' ', '中'][rand(4) as usize];
+        s.type_text(&ch.to_string());
+        let at = caret.head;
+        let mut expected = before;
+        expected.insert(at, ch);
+        let after = s.text();
+        if after != expected {
+            let d = after
+                .bytes()
+                .zip(expected.bytes())
+                .position(|(a, b)| a != b)
+                .unwrap_or(after.len().min(expected.len()));
+            let near = |t: &str| {
+                let lo = t.floor_char_boundary(d.saturating_sub(20));
+                let hi = t.ceil_char_boundary((d + 20).min(t.len()));
+                t[lo..hi].to_owned()
+            };
+            let msg = format!(
+                "iteration {i}: typing {ch:?} at {at}: first difference at {d} \
+                 (lengths {} vs {}): got {:?}, expected {:?}; code focused {}, live focused {}",
+                after.len(),
+                expected.len(),
+                near(&after),
+                near(&expected),
+                s.code.has_focus(&s.ctx),
+                s.live.has_focus(&s.ctx)
+            );
+            panic!("{msg}");
+        }
+        assert_eq!(s.code.selection(), Selection::caret(at + ch.len_utf8()));
+        s.parse.output().map.validate(s.doc.len()).unwrap();
+    }
+}
+
+#[test]
+fn arrow_down_in_a_very_long_line_moves_one_row() {
+    let (src, long) = long_line_doc();
+    let mut s = Split::new(&src);
+    s.code.request_focus(&s.ctx);
+    s.frame(vec![]);
+    let at = long.start + 5000;
+    s.code.set_selection(Selection::caret(at));
+    s.frame(vec![]);
+    s.frame(vec![]);
+    s.press(Key::ArrowDown);
+    let down = s.code.selection().head;
+    // A row of the left pane holds tens of characters, not thousands.
+    assert!(
+        down > at + 20 && down < at + 200,
+        "Down went from {at} to {down}"
+    );
+    s.press(Key::ArrowUp);
+    assert_eq!(
+        s.code.selection().head,
+        at,
+        "Up came back to {}",
+        s.code.selection().head
+    );
+    // End stays on the caret's row.
+    s.press(Key::End);
+    let end = s.code.selection().head;
+    assert!(end > at && end < down + 200, "End went from {at} to {end}");
+}
+
+#[test]
+fn the_live_pane_steps_over_a_very_long_line_and_edits_at_its_edges() {
+    let (src, long) = long_line_doc();
+    let mut s = Split::new(&src);
+    // From the end of "Intro.", Right walks into the long block: it must
+    // land on one of its edges, never inside.
+    s.caret(src.find("Intro.").unwrap() + 6);
+    for _ in 0..4 {
+        s.press(Key::ArrowRight);
+        let head = s.live.selection().head;
+        assert!(
+            head <= long.start || head >= long.end,
+            "the caret stopped inside the long line at {head}"
+        );
+    }
+    // Typed at the block's end, a character goes exactly there.
+    s.caret(long.end);
+    let before = s.text();
+    s.type_text("Z");
+    let mut expected = before;
+    expected.insert(long.end, 'Z');
+    assert_eq!(s.text(), expected);
+}

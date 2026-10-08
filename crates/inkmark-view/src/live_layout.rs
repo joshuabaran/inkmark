@@ -65,6 +65,31 @@ pub(crate) struct LeafLayout {
     pub segments: Vec<Segment>,
 }
 
+/// A block holding a line over `long_line::LONG_LINE` bytes: one line of
+/// text saying so, standing for the whole block's source. Shaping a line that
+/// long freezes the pane for over a second per keystroke, so the live pane
+/// leaves it to the code pane. A caret in the block shows at the notice's
+/// start or end, arrow keys step over it, and typing at either end edits
+/// there as usual.
+fn long_notice(range: Range<usize>, theme: &Theme) -> LeafLayout {
+    let text = crate::long_line::notice(range.len());
+    let len = text.len();
+    LeafLayout {
+        style: LeafStyle::Paragraph,
+        segments: vec![Segment {
+            text,
+            colors: vec![(0..len, theme.markup)],
+            pieces: vec![Piece {
+                display: 0..len,
+                source: range.clone(),
+                exact: false,
+            }],
+            source_start: range.start,
+            ..Segment::default()
+        }],
+    }
+}
+
 /// Font size of heading levels 1–6, in percent of body text.
 const HEADING_SCALE: [u16; 6] = [190, 155, 130, 115, 100, 90];
 
@@ -285,6 +310,9 @@ pub(crate) fn build(
     math_caret: Option<usize>,
 ) -> LeafLayout {
     let range = leaf.block.range.clone();
+    if crate::long_line::holds_long_line(doc, &range) {
+        return long_notice(range, theme);
+    }
     let style = match leaf.block.kind {
         BlockKind::Heading(level) => LeafStyle::Heading(level),
         BlockKind::CodeBlock { .. } => LeafStyle::Code,

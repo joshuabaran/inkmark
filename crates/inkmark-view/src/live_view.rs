@@ -708,6 +708,18 @@ impl LiveView {
         available.min(measure).max(READING_FLOOR).min(available)
     }
 
+    /// A source line outside any leaf, as the live pane shows it: the line,
+    /// or the long-line notice for one too long to shape (before the first
+    /// parse every line is outside a leaf, a 1 MB one included).
+    fn raw_line_text(doc: &Document, line: usize) -> std::borrow::Cow<'_, str> {
+        let range = doc.line_range(line);
+        if range.len() > crate::long_line::LONG_LINE {
+            crate::long_line::notice(range.len()).into()
+        } else {
+            doc.slice(range)
+        }
+    }
+
     /// Height of one source line that is not part of a leaf, matching paint.
     fn raw_line_height(&mut self, text: &str) -> f32 {
         let blank = text
@@ -754,7 +766,7 @@ impl LiveView {
             return line;
         }
         let Some(leaf) = leaf_at_line(doc, parse, line) else {
-            let text = doc.slice(doc.line_range(line));
+            let text = Self::raw_line_text(doc, line);
             let height = self.raw_line_height(&text);
             self.lines.heights.set_measured(line, height);
             return line + 1;
@@ -805,7 +817,7 @@ impl LiveView {
         }
         let old = self.lines.heights.height(line).max(0.001);
         let frac = (self.lines.anchor.offset / old).clamp(0.0, 1.0);
-        let text = doc.slice(doc.line_range(line));
+        let text = Self::raw_line_text(doc, line);
         let height = self.raw_line_height(&text);
         self.lines.heights.set_measured(line, height);
         self.lines.anchor.offset = frac * height;
@@ -1246,7 +1258,13 @@ impl LiveView {
         let first_line = doc.byte_to_line(range.start);
         let last_line = doc.byte_to_line(range.end.saturating_sub(1).max(range.start));
 
-        let spans = map.spans_in(range.clone());
+        // A block with a very long line is drawn as a notice (see
+        // `live_layout::long_notice`); its spans would only be scanned here.
+        let spans = if crate::long_line::holds_long_line(doc, &range) {
+            Vec::new()
+        } else {
+            map.spans_in(range.clone())
+        };
         let has_image = spans.iter().any(|s| s.style.contains(Style::IMAGE));
         let image_only = has_image
             && spans.iter().all(|s| {
@@ -1590,6 +1608,10 @@ impl LiveView {
                 break;
             }
             at = next;
+            // Inside a block shown as a long-line notice: across it at once.
+            if let Some(block) = long_block_at(doc, parse, at) {
+                at = if forward { block.end } else { block.start };
+            }
             if self.is_visible(doc, parse, at) {
                 break;
             }
@@ -2403,7 +2425,7 @@ impl LiveView {
             let next_first = leaves.peek().map(|l| doc.byte_to_line(l.block.range.start));
             if next_first.is_none_or(|f| f > line) {
                 // A line outside any leaf: blank, or raw (e.g. a link definition).
-                let text = doc.slice(doc.line_range(line));
+                let text = Self::raw_line_text(doc, line);
                 let height = self.raw_line_height(&text);
                 let blank = text
                     .trim_start_matches(|c: char| c.is_whitespace() || c == '>')
@@ -2896,6 +2918,14 @@ fn reveal_at(doc: &Document, caret: usize) -> Reveal {
 fn leaf_at_line(doc: &Document, parse: &ParseOutput, line: usize) -> Option<Leaf> {
     let leaf = parse.blocks.leaves_from(doc.line_to_byte(line)).next()?;
     (doc.byte_to_line(leaf.block.range.start) <= line).then_some(leaf)
+}
+
+/// The block holding `at` strictly inside, when it's shown as a long-line
+/// notice.
+fn long_block_at(doc: &Document, parse: &ParseOutput, at: usize) -> Option<Range<usize>> {
+    let leaf = leaf_at_line(doc, parse, doc.byte_to_line(at))?;
+    let r = leaf.block.range;
+    (r.start < at && at < r.end && crate::long_line::holds_long_line(doc, &r)).then_some(r)
 }
 
 /// First and last source line of the leaf on `line`.

@@ -332,6 +332,14 @@ twice (§6), on top of the edit and the reparse.
 
 ### A3: very long lines (CRO-112)
 
+> **Fixed in CRO-112 (2026-10-08):** lines over 64 KiB wrap on the code
+> pane's cell grid without shaping, and only rows on screen are shaped. The
+> live pane shows such a block as a notice. Per keystroke in the 1 MB line:
+> code pane 1,552 → 3 ms, live pane 1,550 → 0.03 ms. Open and settle:
+> 1.8 s → 30 ms (code pane) and 2.3 s → 12 ms (live pane). New benches:
+> `code/long_line_1mb_scroll` (a fresh screen of rows every frame) is
+> 12.8 ms p95, and `code/long_line_1mb_caret` is 0.85 ms p95.
+
 | Bench (`long-line-1mb.md`, one 1 MB line) | p50 | max |
 |---|---:|---:|
 | `frames/code/long_line_1mb_typing` | **1,552 ms** per keystroke | 1,571 ms |

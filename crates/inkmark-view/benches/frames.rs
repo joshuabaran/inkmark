@@ -657,6 +657,35 @@ fn long_lines(r: &Reporter) {
             BUDGET,
             &[("open_and_settle_ms", open_ms)],
         );
+        if mode != Mode::Code {
+            continue;
+        }
+        // Scrolling down through the line's rows, a step of the line each
+        // frame.
+        let mut run = Run::default();
+        let steps = iterations(100, 20);
+        for i in 0..steps {
+            let frac = i as f32 / steps as f32;
+            p.code.set_scroll_pos(ScrollPos { line: 0, frac });
+            run.push(p.frame(vec![]));
+        }
+        run.report(r, "code/long_line_1mb_scroll", BUDGET, &[]);
+        // Caret movement inside the line: rows, pages, row ends.
+        p.caret(at);
+        let keys = [
+            Key::ArrowDown,
+            Key::PageDown,
+            Key::End,
+            Key::ArrowRight,
+            Key::ArrowUp,
+            Key::PageUp,
+            Key::Home,
+        ];
+        let mut run = Run::default();
+        for i in 0..iterations(70, 14) {
+            run.push(p.key(keys[i % keys.len()], Modifiers::NONE));
+        }
+        run.report(r, "code/long_line_1mb_caret", BUDGET, &[]);
     }
 }
 
