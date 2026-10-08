@@ -310,7 +310,10 @@ pub(crate) fn build(
     math_caret: Option<usize>,
 ) -> LeafLayout {
     let range = leaf.block.range.clone();
-    if crate::long_line::holds_long_line(doc, &range) {
+    // A table's cells are laid out with their table, never as a notice, and
+    // between a whole-table edit and the full parse a rebased cell can span
+    // the whole table: checking each of them would walk its lines per cell.
+    if !leaf.block.kind.is_table_part() && crate::long_line::holds_long_line(doc, &range) {
         return long_notice(range, theme);
     }
     let style = match leaf.block.kind {
