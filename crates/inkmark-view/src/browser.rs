@@ -98,6 +98,10 @@ pub struct FileBrowser {
     /// not. A hidden name is never stored here.
     reveal_path: Option<PathBuf>,
     watch: Option<Watch>,
+    /// The context the sidebar was last drawn in, so a change made between
+    /// frames (the app opening a folder or creating a file) can ask for
+    /// the frame that lists it. There is no timer to fall back on.
+    ctx: Option<egui::Context>,
     /// Colors, refreshed from the context every frame.
     theme: std::sync::Arc<Theme>,
     /// Shortcuts, shared with the editor panes and the app shell.
@@ -131,6 +135,7 @@ impl FileBrowser {
             search_rect: None,
             reveal_path: None,
             watch: None,
+            ctx: None,
             theme: std::sync::Arc::new(Theme::dark()),
             keys: keys::KeyMap::builtin(),
         }
@@ -157,6 +162,15 @@ impl FileBrowser {
         self.revealed = false;
         self.reveal_path = None;
         self.bump_epoch();
+        self.wake();
+    }
+
+    /// Asks for a frame now. The tree changed outside `show`, and nothing
+    /// else may draw again for a second.
+    fn wake(&self) {
+        if let Some(ctx) = &self.ctx {
+            ctx.request_repaint();
+        }
     }
 
     pub fn go_up(&mut self) {
@@ -167,7 +181,10 @@ impl FileBrowser {
 
     /// The open document's unsaved mark, drawn beside its name like the footer.
     pub fn set_dirty(&mut self, dirty: bool) {
-        self.dirty = dirty;
+        if self.dirty != dirty {
+            self.dirty = dirty;
+            self.wake();
+        }
     }
 
     /// Highlights `path` and expands its parents once they are listed.
@@ -181,6 +198,7 @@ impl FileBrowser {
             self.tree.reveal(&path);
             self.selected = Some(path);
         }
+        self.wake();
     }
 
     pub fn request_focus(&mut self) {
@@ -256,6 +274,7 @@ impl FileBrowser {
     /// Selects `path` (e.g. after a rename), once its row is listed.
     pub fn select(&mut self, path: &Path) {
         self.selected = Some(path.to_path_buf());
+        self.wake();
     }
 
     /// Something in `dir` was created, renamed, moved or removed by the
@@ -264,6 +283,7 @@ impl FileBrowser {
         for index in self.tree.dirs_at(dir) {
             self.tree.invalidate(index);
         }
+        self.wake();
     }
 
     /// The folder was just created here: re-read its parent. When the sidebar
@@ -295,6 +315,7 @@ impl FileBrowser {
             }
         }
         self.set_current(Some(path.to_path_buf()));
+        self.wake();
     }
 
     /// Rows painted last frame. A large folder stays small here.
@@ -343,6 +364,17 @@ impl FileBrowser {
         if let Some(dragged) = background.dnd_release_payload::<Dragged>() {
             output.dropped = Some((dragged.0.clone(), self.tree.root().to_path_buf()));
         }
+        // The header, keys and rows run after `poll`, so a folder they
+        // expanded or a refresh they asked for has no listing in flight
+        // yet. One more frame sends it; the in-flight poll then takes over.
+        let unsent = self
+            .tree
+            .pending()
+            .iter()
+            .any(|job| !self.inflight.contains(&(job.index, job.generation)));
+        if unsent {
+            ui.ctx().request_repaint();
+        }
         output
     }
 
@@ -352,6 +384,9 @@ impl FileBrowser {
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
+        if self.ctx.is_none() {
+            self.ctx = Some(ctx.clone());
+        }
         self.poll_watch(ctx);
         while let Ok(done) = self.rx.try_recv() {
             self.inflight.remove(&(done.index, done.generation));
@@ -402,11 +437,10 @@ impl FileBrowser {
         for index in indexes {
             self.tree.invalidate(index);
         }
-        // A backup wake: the watch thread also requests a repaint, but a
-        // missed one would otherwise wait on the disk-check interval.
-        if !dirs.is_empty() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
-        }
+        // No timer here. The watch thread requests a repaint with every
+        // change, and the app repaints once a second for its disk check, so
+        // a missed wake still shows within a second. A timer of its own
+        // would wake an idle window several times a second (CRO-117).
     }
 
     fn reveal_if_listed(&mut self) {

@@ -16,9 +16,11 @@ cd "$(dirname "$0")/.."
 cargo build --release -q -p inkmark -p inkmark-bench
 fixtures=${INKMARK_FIXTURES:-target/fixtures}
 target/release/inkmark-bench fixtures --dir "$fixtures" > /dev/null
-# Under target/, so saves hit the real disk (/tmp is often tmpfs).
+# Under target/, so saves hit the real disk (/tmp is often tmpfs). The
+# path must be absolute: the XDG spec says to ignore a relative
+# XDG_STATE_HOME, and inkmark then falls back to ~/.local/state.
 mkdir -p target
-tmp=$(mktemp -d -p target measure.XXXXXX)
+tmp=$(mktemp -d -p "$PWD/target" measure.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
 # A clean profile: the default layout (split, both minimaps, sidebar),
 # no config.toml, the built-in theme, and nothing written to your recent
@@ -26,6 +28,10 @@ trap 'rm -rf "$tmp"' EXIT
 # (a user fonts.conf lives under XDG_CONFIG_HOME too).
 export XDG_CONFIG_HOME="$tmp/config" XDG_STATE_HOME="$tmp/state"
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
+case $tmp in
+/*) ;;
+*) echo "measure.sh: scratch dir $tmp is not absolute" >&2; exit 1 ;;
+esac
 
 run() { # label file
     local label=$1 file=${2:-}

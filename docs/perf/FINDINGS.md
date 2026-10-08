@@ -263,6 +263,14 @@ any change to the live wrap width.
 
 ### 11. Idle cost: Confirmed, and worse than expected
 
+> **Fixed in CRO-117 (2026-10-08):** the sidebar no longer sets a 250 ms
+> timer. The watch thread's own wake, plus the app's 1 s disk check as a
+> backstop, keep changes visible within a second. The measure mode now
+> waits 2 s before counting idle, so the last save's folder event and the
+> last full parse aren't counted. Measured that way at 5 MB, idle went from
+> 4.3 frames/s and 0.58% CPU to 1.0 frames/s and 0.17% CPU. The disk check
+> is the only cause left.
+
 - **The idle app wakes 4.5–4.9 times a second, not once.** That's the
   `frames_per_s` in `app/idle_*`. The measure mode logs egui's repaint
   causes, and most name `inkmark-view/src/browser.rs:408`: `poll_watch`
