@@ -225,8 +225,9 @@ parent folder, ↗ to open a folder, ↻ to re-read the folders that are
 expanded, + for a new note, ⊞ for a new folder, and ∗ to search. Each one
 has a tooltip. All files stays words: checking it lists names that start
 with a dot, and files that are not Markdown. A file that is not Markdown
-is shown and not opened. While the open file has unsaved edits, its row
-shows ●, the same mark as the status bar. Arrow keys move through the
+is shown and not opened. While a file open in a tab has unsaved edits, its row
+shows ●, the same mark as the status bar. A file changed on disk shows ↻,
+and a missing file shows ✕. Arrow keys move through the
 tree, Left and Right collapse and expand a folder, and Enter opens a
 Markdown file. Ctrl+Shift+F searches this folder, and so does ∗. A file
 name is listed first, and a match inside a file follows; opening either
@@ -287,7 +288,14 @@ atomically, and never overwrites changes made by other programs without
 asking: if the open file changes on disk, a banner offers **Reload** or
 **Keep mine**; if it's deleted, your text stays and saving recreates it.
 Opening another file keeps the unsaved tab and shows the new file beside
-it. Closing the window asks about each unsaved tab, one at a time.
+it. Closing one dirty tab asks Save, Discard, or Cancel for that tab.
+Closing the window with several unsaved tabs asks once, names each file,
+and offers Save all, Discard all, or Cancel. Closing the last tab leaves
+the window open on the recent-files list. A clean file another program
+changes in a background tab is reloaded. A dirty one is marked ↻, and the
+banner appears when that tab is selected. A missing file keeps its text
+and is marked ✕. Saving a tab as a path another tab already has open is
+refused.
 
 ## Develop
 

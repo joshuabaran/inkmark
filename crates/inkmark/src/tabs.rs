@@ -11,6 +11,10 @@ pub(crate) struct Item {
     pub id: u64,
     pub title: String,
     pub dirty: bool,
+    /// Another program changed the file. Drawn as ↻.
+    pub changed: bool,
+    /// The file is gone. Drawn as ✕.
+    pub missing: bool,
     pub active: bool,
     /// Italic title. T3 sets this; until then every tab is pinned.
     pub preview: bool,
@@ -65,9 +69,19 @@ fn chip(ui: &mut egui::Ui, index: usize, tab: &Item) -> Option<Event> {
             ..Default::default()
         },
     );
+    let mut marks = String::new();
     if tab.dirty {
+        marks.push_str(" ●");
+    }
+    if tab.changed {
+        marks.push_str(" ↻");
+    }
+    if tab.missing {
+        marks.push_str(" ✕");
+    }
+    if !marks.is_empty() {
         job.append(
-            " ●",
+            &marks,
             0.0,
             egui::TextFormat {
                 font_id: font,

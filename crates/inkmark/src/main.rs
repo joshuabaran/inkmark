@@ -178,20 +178,31 @@ fn install_ui_font(ctx: &egui::Context) {
 
 /// The open file's state on disk, when it needs the user's attention.
 /// Errors are shown separately, so one never hides the other.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Banner {
     /// Another program changed the file since we loaded or saved it.
     DiskChanged,
     DiskMissing,
 }
 
-/// Closing the window with unsaved changes. Save writes the tab on screen
-/// and, if another tab is unsaved, asks about that one next. Discard
-/// closes. Cancel stays. Opening a file no longer asks: the edited tab
-/// stays, and the file opens beside it. Closing one dirty tab is still
-/// refused until that prompt exists (T4).
+/// A save or discard the user has not answered yet.
+///
+/// `Close` is the window, and one tab is unsaved. `CloseAll` is the
+/// window, and more than one tab is unsaved. `CloseTab` is that tab only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Confirm {
     Close,
+    CloseAll,
+    CloseTab(usize),
+}
+
+/// What a successful save should do afterwards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterSave {
+    /// Close the window once every tab is saved.
+    Window,
+    /// Close this tab once its save lands.
+    Tab(u64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,6 +286,9 @@ struct Tab {
     /// The pane with keyboard focus (or that last had it).
     focus: Pane,
     banner: Option<Banner>,
+    /// An external change or deletion not yet answered. Shown on the tab
+    /// and the sidebar immediately. The banner waits until the tab is showing.
+    disk: Option<Banner>,
     /// Query and matches for this document. The bar's open flag is on `App`.
     find: FindState,
     /// A preview tab is replaced by the next single click. T3 sets this.
@@ -337,7 +351,7 @@ struct App {
     opened_urls: Vec<String>,
     dialog: Option<Receiver<DialogResult>>,
     confirm: Option<Confirm>,
-    close_after_save: bool,
+    after_save: Option<AfterSave>,
     close_allowed: bool,
     /// Whether the window had keyboard focus last frame.
     focused: Option<bool>,
@@ -455,6 +469,7 @@ impl App {
                 }),
                 focus: Pane::Code,
                 banner: None,
+                disk: None,
                 find: FindState::default(),
                 preview: false,
             }],
@@ -474,7 +489,7 @@ impl App {
             opened_urls: Vec::new(),
             dialog: None,
             confirm: None,
-            close_after_save: false,
+            after_save: None,
             close_allowed: false,
             focused: None,
             last_beat: Instant::now(),
@@ -612,7 +627,18 @@ impl App {
         }
         self.active = index;
         self.note_mru(index);
+        self.reveal_disk();
         self.focus_active();
+    }
+
+    /// The on-screen tab shows a disk banner it picked up in the background.
+    fn reveal_disk(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        if let Some(mark) = self.tab().disk {
+            self.tab_mut().banner = Some(mark);
+        }
     }
 
     /// Moves `index` to the front of the MRU list and ends a Ctrl+Tab walk.
@@ -638,6 +664,7 @@ impl App {
         };
         self.mru_at = Some(next);
         self.active = self.mru[next];
+        self.reveal_disk();
         self.focus_active();
     }
 
@@ -673,12 +700,19 @@ impl App {
         if index >= self.tabs.len() {
             return;
         }
-        if self.tabs.len() == 1 {
-            self.show_hint("This is the only open tab.");
+        if self.tabs[index].doc.is_dirty() {
+            if index != self.active {
+                self.activate(index);
+            }
+            self.confirm = Some(Confirm::CloseTab(index));
             return;
         }
-        if self.tabs[index].doc.is_dirty() {
-            self.show_hint("Save this tab before closing it.");
+        self.remove_tab(index);
+    }
+
+    /// Drops the tab. The last one leaves the window on the recent-files list.
+    fn remove_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
             return;
         }
         self.tabs.remove(index);
@@ -689,11 +723,33 @@ impl App {
             }
         }
         self.mru_at = None;
+        if self.tabs.is_empty() {
+            self.active = 0;
+            self.mru.clear();
+            self.confirm = None;
+            self.after_save = None;
+            self.find_open = false;
+            self.goto.close();
+            self.recent_list = Some(0);
+            return;
+        }
         self.active = self.mru[0];
+        self.reveal_disk();
         self.focus_active();
     }
 
+    /// A window with no document stays on the recent-files list. Another
+    /// dialog that just closed must not leave a blank editor.
+    fn show_recent_if_empty(&mut self) {
+        if self.tabs.is_empty() && !self.modal_open() {
+            self.recent_list = Some(self.recent_list.unwrap_or(0));
+        }
+    }
+
     fn focus_active(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
         let pane = self.tab().focus;
         let ctx = self.ctx.clone();
         self.focus_pane(&ctx, pane);
@@ -704,13 +760,29 @@ impl App {
     fn push_tab(&mut self, doc: Document) {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let source = &self.tabs[self.active];
-        let code_size = source.code.font_size;
-        let code_height = source.code.line_height;
-        let code_minimap = source.code.show_minimap;
-        let text_size = source.live.font_size;
-        let text_height = source.live.line_height;
-        let live_minimap = source.live.show_minimap;
+        let was_empty = self.tabs.is_empty();
+        let (code_size, code_height, code_minimap, text_size, text_height, live_minimap) =
+            if let Some(source) = self.tabs.get(self.active) {
+                (
+                    source.code.font_size,
+                    source.code.line_height,
+                    source.code.show_minimap,
+                    source.live.font_size,
+                    source.live.line_height,
+                    source.live.show_minimap,
+                )
+            } else {
+                let code_size = self.settings.code_size.unwrap_or(CODE_SIZE);
+                let text_size = self.settings.text_size.unwrap_or(TEXT_SIZE);
+                (
+                    code_size,
+                    (code_size * CODE_LINE).round(),
+                    self.layout.code_minimap,
+                    text_size,
+                    (text_size * TEXT_LINE).round(),
+                    self.layout.live_minimap,
+                )
+            };
         let fonts = self.fonts.clone();
         let keys = self.keys.clone();
         let ctx = self.ctx.clone();
@@ -738,12 +810,16 @@ impl App {
             live,
             focus,
             banner: None,
+            disk: None,
             find: FindState::default(),
             preview: false,
         });
         self.active = self.tabs.len() - 1;
         self.note_mru(self.active);
         self.error = None;
+        if was_empty {
+            self.recent_list = None;
+        }
         self.focus_active();
     }
 
@@ -754,6 +830,7 @@ impl App {
         tab.live.reset();
         tab.parse.reset(&tab.doc);
         tab.banner = None;
+        tab.disk = None;
         tab.find.reset_matches();
         self.error = None;
     }
@@ -768,6 +845,7 @@ impl App {
             Ok(doc) => self.replace_document(doc),
             Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 self.tab_mut().banner = Some(Banner::DiskMissing);
+                self.tab_mut().disk = Some(Banner::DiskMissing);
             }
             Err(e) => {
                 self.error = Some(format!("Couldn't reload {}: {e}", path.display()));
@@ -776,21 +854,34 @@ impl App {
     }
 
     fn save(&mut self) {
+        if self.tabs.is_empty() {
+            self.after_save = None;
+            return;
+        }
         if self.tab().doc.path().is_none() {
             return self.spawn_dialog(DialogKind::SaveAs);
         }
         // Never overwrite someone else's changes without asking.
         if matches!(self.tab().doc.disk_status(), Ok(DiskStatus::Modified)) {
             self.tab_mut().banner = Some(Banner::DiskChanged);
+            self.tab_mut().disk = Some(Banner::DiskChanged);
+            self.after_save = None;
             return;
         }
         match self.tab_mut().doc.save() {
             Ok(()) => self.saved(),
-            Err(e) => self.error = Some(format!("Couldn't save: {e}")),
+            Err(e) => {
+                self.error = Some(format!("Couldn't save: {e}"));
+                self.after_save = None;
+            }
         }
     }
 
     fn save_as(&mut self, path: PathBuf) {
+        if self.tabs.is_empty() {
+            self.after_save = None;
+            return;
+        }
         // Saving as the open file is a save: don't overwrite changes made
         // by another program without asking.
         let canonical = |p: &std::path::Path| std::fs::canonicalize(p).ok();
@@ -799,6 +890,18 @@ impl App {
         });
         if same_file && matches!(self.tab().doc.disk_status(), Ok(DiskStatus::Modified)) {
             self.tab_mut().banner = Some(Banner::DiskChanged);
+            self.tab_mut().disk = Some(Banner::DiskChanged);
+            self.after_save = None;
+            return;
+        }
+        if self.path_open_elsewhere(&path) {
+            self.error = Some(format!(
+                "{} is already open in another tab.",
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            ));
+            self.after_save = None;
             return;
         }
         match self.tab_mut().doc.save_as(&path) {
@@ -806,24 +909,47 @@ impl App {
                 self.recent.add(&path);
                 self.saved();
             }
-            Err(e) => self.error = Some(format!("Couldn't save {}: {e}", path.display())),
+            Err(e) => {
+                self.error = Some(format!("Couldn't save {}: {e}", path.display()));
+                self.after_save = None;
+            }
         }
     }
 
+    /// Another tab already has `path` open. The active tab does not count.
+    fn path_open_elsewhere(&self, path: &Path) -> bool {
+        self.tabs.iter().enumerate().any(|(index, tab)| {
+            index != self.active && tab.doc.path().is_some_and(|open| same_file(open, path))
+        })
+    }
+
     fn saved(&mut self) {
-        self.tab_mut().banner = None;
-        self.error = None;
-        if !self.close_after_save {
-            return;
+        if !self.tabs.is_empty() {
+            self.tab_mut().banner = None;
+            self.tab_mut().disk = None;
         }
-        // The tab just saved may not have been the only unsaved one.
-        // Ask about the next, still in strip order. Discard is what closes
-        // while others remain unsaved.
-        if let Some(index) = self.first_dirty_tab() {
-            self.activate(index);
-            self.confirm = Some(Confirm::Close);
-        } else {
-            self.close_allowed = true;
+        self.error = None;
+        match self.after_save {
+            None => {}
+            Some(AfterSave::Tab(id)) => {
+                self.after_save = None;
+                if let Some(index) = self.tabs.iter().position(|tab| tab.id == id)
+                    && !self.tabs[index].doc.is_dirty()
+                {
+                    self.remove_tab(index);
+                }
+            }
+            Some(AfterSave::Window) => {
+                if let Some(index) = self.first_dirty_tab() {
+                    if index != self.active {
+                        self.activate(index);
+                    }
+                    self.save();
+                } else {
+                    self.after_save = None;
+                    self.close_allowed = true;
+                }
+            }
         }
     }
 
@@ -839,12 +965,12 @@ impl App {
             return;
         }
         let (tx, rx) = mpsc::channel();
-        let dir = self
-            .tab()
-            .doc
-            .path()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf());
+        let dir = self.tabs.get(self.active).and_then(|tab| {
+            tab.doc
+                .path()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+        });
         let dir = dir.or_else(|| Some(self.browser.root().to_path_buf()));
         std::thread::spawn(move || {
             let mut dialog = rfd::FileDialog::new();
@@ -892,7 +1018,7 @@ impl App {
                 self.browser.request_focus();
             }
             Ok(DialogResult::Open(None) | DialogResult::SaveAs(None)) => {
-                self.close_after_save = false;
+                self.after_save = None;
             }
             Ok(DialogResult::MoveTo(path, Some(dir))) => self.move_entry(path, dir),
             Ok(DialogResult::Folder(None) | DialogResult::MoveTo(_, None)) => {}
@@ -993,14 +1119,75 @@ impl App {
             if !self.font_files.is_empty() && config::stamps(&self.font_files) != self.font_stamps {
                 self.apply_settings();
             }
-            let status = self.tab().doc.disk_status();
-            self.tab_mut().banner = match status {
-                Ok(DiskStatus::Modified) => Some(Banner::DiskChanged),
-                Ok(DiskStatus::Missing) => Some(Banner::DiskMissing),
-                _ => None,
-            };
+            self.poll_tabs_on_disk();
         }
+        // The same one-second wake as before. A background tab does not
+        // ask for another frame unless its parse worker finishes a reload.
         ctx.request_repaint_after(DISK_CHECK_INTERVAL);
+    }
+
+    /// Every open file, not only the one on screen. A clean background file
+    /// is re-read. A dirty one keeps its text and is marked. The banner
+    /// appears when that tab is showing.
+    fn poll_tabs_on_disk(&mut self) {
+        let active = self.active;
+        for index in 0..self.tabs.len() {
+            let status = self.tabs[index].doc.disk_status();
+            let dirty = self.tabs[index].doc.is_dirty();
+            match status {
+                Ok(DiskStatus::Modified) if !dirty && index != active => {
+                    self.reload_background(index);
+                }
+                Ok(DiskStatus::Modified) => {
+                    self.tabs[index].disk = Some(Banner::DiskChanged);
+                    if index == active {
+                        self.tabs[index].banner = Some(Banner::DiskChanged);
+                    }
+                }
+                Ok(DiskStatus::Missing) => {
+                    self.tabs[index].disk = Some(Banner::DiskMissing);
+                    if index == active {
+                        self.tabs[index].banner = Some(Banner::DiskMissing);
+                    }
+                }
+                Ok(DiskStatus::Unchanged) => {
+                    self.tabs[index].disk = None;
+                    if matches!(
+                        self.tabs[index].banner,
+                        Some(Banner::DiskChanged | Banner::DiskMissing)
+                    ) {
+                        self.tabs[index].banner = None;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Re-reads a tab that is not showing. Its text matched the last save,
+    /// so the new bytes replace it. A failure leaves the buffer and a mark.
+    fn reload_background(&mut self, index: usize) {
+        let Some(path) = self.tabs[index].doc.path().map(|path| path.to_path_buf()) else {
+            return;
+        };
+        match Document::open(&path) {
+            Ok(doc) => {
+                let tab = &mut self.tabs[index];
+                tab.doc = doc;
+                tab.code.reset();
+                tab.live.reset();
+                tab.parse.reset(&tab.doc);
+                tab.banner = None;
+                tab.disk = None;
+                tab.find.reset_matches();
+            }
+            Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.tabs[index].disk = Some(Banner::DiskMissing);
+            }
+            Err(_) => {
+                self.tabs[index].disk = Some(Banner::DiskChanged);
+            }
+        }
     }
 
     fn selection(&self) -> inkmark_buffer::Selection {
@@ -1010,6 +1197,9 @@ impl App {
     /// Moves keyboard focus (with the caret and scroll position) to `pane`,
     /// switching away from a single-pane mode that hides it.
     fn focus_pane(&mut self, ctx: &egui::Context, pane: Pane) {
+        if self.tabs.is_empty() {
+            return;
+        }
         let mode_before = self.mode;
         let mut mode = self.mode;
         {
@@ -1052,6 +1242,9 @@ impl App {
 
     /// Split → code → live → split.
     fn cycle_mode(&mut self, ctx: &egui::Context) {
+        if self.tabs.is_empty() {
+            return;
+        }
         match self.mode {
             Mode::Split => {
                 // Pretend live was showing so focus_pane carries its position.
@@ -1076,11 +1269,11 @@ impl App {
     /// Writes the mode, both minimaps, and the widths. A resize that only
     /// draws a pane narrower does not call this.
     fn remember_layout(&mut self) {
-        let code_minimap = self.tab().code.show_minimap;
-        let live_minimap = self.tab().live.show_minimap;
+        if let Some(tab) = self.tabs.get(self.active) {
+            self.layout.code_minimap = tab.code.show_minimap;
+            self.layout.live_minimap = tab.live.show_minimap;
+        }
         self.layout.mode = self.mode;
-        self.layout.code_minimap = code_minimap;
-        self.layout.live_minimap = live_minimap;
         self.layout.save();
     }
 
@@ -1118,6 +1311,42 @@ impl App {
     }
 
     fn run_app_action(&mut self, ctx: &egui::Context, action: Action) {
+        // Open, Recent, New, and the sidebar still work with no document.
+        // Editing, find, and tab walking do not.
+        if self.tabs.is_empty()
+            && matches!(
+                action,
+                Action::ToggleMinimap
+                    | Action::CycleMode
+                    | Action::FocusCode
+                    | Action::FocusLive
+                    | Action::Back
+                    | Action::Forward
+                    | Action::SaveAs
+                    | Action::Save
+                    | Action::CloseTab
+                    | Action::TabNext
+                    | Action::TabPrevious
+                    | Action::TabLeft
+                    | Action::TabRight
+                    | Action::Tab1
+                    | Action::Tab2
+                    | Action::Tab3
+                    | Action::Tab4
+                    | Action::Tab5
+                    | Action::Tab6
+                    | Action::Tab7
+                    | Action::Tab8
+                    | Action::Tab9
+                    | Action::Find
+                    | Action::Replace
+                    | Action::FindNext
+                    | Action::FindPrevious
+                    | Action::GoToLine
+            )
+        {
+            return;
+        }
         match action {
             Action::ToggleSidebar => self.toggle_sidebar(ctx),
             Action::ToggleOutline => {
@@ -1126,14 +1355,20 @@ impl App {
             }
             Action::RecentFiles => {
                 self.show_keys = false;
-                self.recent_list = match self.recent_list {
-                    Some(_) => None,
-                    None => {
-                        self.new_file = None;
-                        self.new_folder = None;
-                        Some(0)
-                    }
-                };
+                if self.tabs.is_empty() {
+                    self.new_file = None;
+                    self.new_folder = None;
+                    self.recent_list = Some(self.recent_list.unwrap_or(0));
+                } else {
+                    self.recent_list = match self.recent_list {
+                        Some(_) => None,
+                        None => {
+                            self.new_file = None;
+                            self.new_folder = None;
+                            Some(0)
+                        }
+                    };
+                }
             }
             Action::ToggleMinimap => {
                 // The code pane and the live pane each keep their own
@@ -1189,7 +1424,7 @@ impl App {
 
     /// Ctrl+F / Ctrl+H. A dialog already owns the keyboard, so find waits.
     fn open_find(&mut self, ctx: &egui::Context, replace: bool) {
-        if self.modal_open() {
+        if self.tabs.is_empty() || self.modal_open() {
             return;
         }
         self.goto.close();
@@ -1210,7 +1445,7 @@ impl App {
 
     /// Ctrl+G. A dialog already owns the keyboard, so the prompt waits.
     fn open_goto(&mut self, ctx: &egui::Context) {
-        if self.modal_open() {
+        if self.tabs.is_empty() || self.modal_open() {
             return;
         }
         self.find_open = false;
@@ -1232,11 +1467,16 @@ impl App {
             self.sidebar.save();
         }
         self.search.open();
-        self.tab_mut().code.release_focus(ctx);
-        self.tab_mut().live.release_focus(ctx);
+        if !self.tabs.is_empty() {
+            self.tab_mut().code.release_focus(ctx);
+            self.tab_mut().live.release_focus(ctx);
+        }
     }
 
     fn find_move(&mut self, next: bool) {
+        if self.tabs.is_empty() {
+            return;
+        }
         let selection = self.selection();
         let moved = {
             let tab = self.tab_mut();
@@ -1256,8 +1496,8 @@ impl App {
         self.sidebar.save();
         if self.sidebar.visible {
             self.browser.request_focus();
-        } else {
-            let focus = self.tab().focus;
+        } else if let Some(tab) = self.tabs.get(self.active) {
+            let focus = tab.focus;
             self.focus_pane(ctx, focus);
         }
     }
@@ -1266,6 +1506,7 @@ impl App {
     fn toggle_keys(&mut self, ctx: &egui::Context) {
         if self.show_keys {
             self.show_keys = false;
+            self.show_recent_if_empty();
             return;
         }
         if self.modal_open() {
@@ -1273,8 +1514,10 @@ impl App {
         }
         self.recent_list = None;
         self.show_keys = true;
-        self.tab_mut().code.release_focus(ctx);
-        self.tab_mut().live.release_focus(ctx);
+        if !self.tabs.is_empty() {
+            self.tab_mut().code.release_focus(ctx);
+            self.tab_mut().live.release_focus(ctx);
+        }
     }
 
     fn modal_open(&self) -> bool {
@@ -1291,7 +1534,7 @@ impl App {
     /// Ctrl+Z and Ctrl+Y while the bar holds the keyboard. A field would
     /// undo its own text, and a button click leaves the panes unfocused.
     fn find_history_keys(&mut self, ctx: &egui::Context) {
-        if !self.find_open || self.modal_open() {
+        if self.tabs.is_empty() || !self.find_open || self.modal_open() {
             return;
         }
         let (field, pane) = {
@@ -1360,33 +1603,48 @@ impl App {
         self.tabs.iter().position(|tab| tab.doc.is_dirty())
     }
 
-    /// A dirty tab holds the window open. The first unsaved tab in strip
-    /// order is shown, and Save asks about the next one. Discard closes
-    /// and drops any that remain. T4 replaces this with one dialog that
-    /// names every file.
+    fn dirty_count(&self) -> usize {
+        self.tabs.iter().filter(|tab| tab.doc.is_dirty()).count()
+    }
+
+    fn dirty_labels(&self) -> Vec<String> {
+        self.tabs
+            .iter()
+            .filter(|tab| tab.doc.is_dirty())
+            .map(|tab| {
+                tab.doc
+                    .path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "untitled".to_owned())
+            })
+            .collect()
+    }
+
+    /// One unsaved tab uses the single prompt. Several unsaved tabs use
+    /// one list. Discard closes the window either way.
     fn guard_close(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|i| i.viewport().close_requested());
-        let dirty = self.first_dirty_tab();
+        let dirty = self.dirty_count();
         if requested && !self.logged_close {
-            let cancel = dirty.is_some() && !self.close_allowed;
-            session::line(&format!(
-                "close_requested dirty={} cancel={cancel}",
-                dirty.is_some()
-            ));
+            let cancel = dirty > 0 && !self.close_allowed;
+            session::line(&format!("close_requested dirty={dirty} cancel={cancel}"));
             self.logged_close = true;
         }
         if !requested {
             self.logged_close = false;
         }
-        if requested
-            && !self.close_allowed
-            && let Some(index) = dirty
-        {
-            if index != self.active {
-                self.activate(index);
-            }
+        if requested && !self.close_allowed && dirty > 0 {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            self.confirm = Some(Confirm::Close);
+            if dirty == 1
+                && let Some(index) = self.first_dirty_tab()
+            {
+                if index != self.active {
+                    self.activate(index);
+                }
+                self.confirm = Some(Confirm::Close);
+            } else {
+                self.confirm = Some(Confirm::CloseAll);
+            }
         }
         if self.close_allowed {
             if !self.logged_send {
@@ -1399,8 +1657,16 @@ impl App {
 
     /// Heartbeat, focus changes, and the e2e harness's timed quit.
     fn note_session(&mut self, ctx: &egui::Context) {
-        let path = self.tab().doc.path().map(|path| path.display().to_string());
-        let path = path.as_deref().unwrap_or("untitled");
+        let (path, dirty) = match self.tabs.get(self.active) {
+            Some(tab) => (
+                tab.doc
+                    .path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "untitled".to_owned()),
+                tab.doc.is_dirty(),
+            ),
+            None => ("none".to_owned(), false),
+        };
         if self.focused.is_none() {
             session::line(&format!("first_frame path={path}"));
         }
@@ -1412,8 +1678,7 @@ impl App {
         if self.last_beat.elapsed() >= session::heartbeat_every() {
             self.last_beat = Instant::now();
             session::line(&format!(
-                "alive focused={focused} dirty={} path={path}",
-                self.tab().doc.is_dirty()
+                "alive focused={focused} dirty={dirty} path={path}"
             ));
         }
         if let Some(after) = self.quit_after {
@@ -1433,12 +1698,16 @@ impl App {
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
-        let dirty = if self.tab().doc.is_dirty() {
-            "● "
+        let title = if self.tabs.is_empty() {
+            "inkmark".to_owned()
         } else {
-            ""
+            let dirty = if self.tab().doc.is_dirty() {
+                "● "
+            } else {
+                ""
+            };
+            format!("{dirty}{} — inkmark", self.file_name())
         };
-        let title = format!("{dirty}{} — inkmark", self.file_name());
         if title != self.title {
             ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
             self.title = title;
@@ -1454,6 +1723,12 @@ impl App {
                     action = Some("dismiss");
                 }
             });
+        }
+        if self.tabs.is_empty() {
+            if action == Some("dismiss") {
+                self.error = None;
+            }
+            return;
         }
         let Some(banner) = &self.tab().banner else {
             if action == Some("dismiss") {
@@ -1483,6 +1758,7 @@ impl App {
             Some("reload") => self.reload(),
             Some("keep") => {
                 self.tab_mut().banner = None;
+                self.tab_mut().disk = None;
                 if let Err(e) = self.tab_mut().doc.acknowledge_disk_state() {
                     self.error = Some(format!("Couldn't check the file: {e}"));
                 }
@@ -1492,6 +1768,10 @@ impl App {
     }
 
     fn status_ui(&mut self, ui: &mut egui::Ui) {
+        if self.tabs.is_empty() {
+            self.status_empty(ui);
+            return;
+        }
         let head = self.selection().head;
         let (line, column, encoding, path, dirty) = {
             let doc = &self.tab().doc;
@@ -1546,6 +1826,39 @@ impl App {
         }
     }
 
+    /// Status bar with no document: the sidebar and outline toggles stay.
+    fn status_empty(&mut self, ui: &mut egui::Ui) {
+        let files_tip = binding_tip(&self.keys, Action::ToggleSidebar);
+        let outline_tip = binding_tip(&self.keys, Action::ToggleOutline);
+        let mut toggle_files = false;
+        let mut toggle_outline = false;
+        ui.horizontal(|ui| {
+            let files = ui
+                .add(egui::Button::new("«").small())
+                .on_hover_text(&files_tip);
+            if files.clicked() {
+                toggle_files = true;
+            }
+            ui.label("No file open");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let outline = ui
+                    .add(egui::Button::new("»").small())
+                    .on_hover_text(&outline_tip);
+                if outline.clicked() {
+                    toggle_outline = true;
+                }
+            });
+        });
+        let ctx = ui.ctx().clone();
+        if toggle_files {
+            self.toggle_sidebar(&ctx);
+        }
+        if toggle_outline {
+            self.layout.outline_visible = !self.layout.outline_visible;
+            self.remember_layout();
+        }
+    }
+
     /// While a dialog is open the panes don't get keys (typing mustn't edit
     /// the document behind it); focus returns when it closes.
     fn hold_focus_for_dialogs(&mut self, ctx: &egui::Context) {
@@ -1556,6 +1869,13 @@ impl App {
             || self.show_keys
             || self.rename.is_some()
             || self.trash_confirm.is_some();
+        if self.tabs.is_empty() {
+            if open {
+                ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("file_browser")));
+            }
+            self.modal_was_open = open;
+            return;
+        }
         if open {
             self.tab_mut().code.release_focus(ctx);
             self.tab_mut().live.release_focus(ctx);
@@ -1570,11 +1890,13 @@ impl App {
     }
 
     /// The recent-files list: arrows and Enter, or a click, open one.
+    /// With no document open the list stays up, including when it is empty.
     fn recent_ui(&mut self, ctx: &egui::Context) {
         let Some(mut selected) = self.recent_list else {
             return;
         };
         let entries = self.recent.entries().to_vec();
+        let empty_window = self.tabs.is_empty();
         let (up, down, enter, escape) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::NONE, Key::ArrowUp),
@@ -1583,21 +1905,26 @@ impl App {
                 i.consume_key(Modifiers::NONE, Key::Escape),
             )
         });
-        if entries.is_empty() || escape {
+        if !empty_window && (entries.is_empty() || escape) {
             self.recent_list = None;
             return;
         }
-        if up {
-            selected = selected.saturating_sub(1);
+        if !entries.is_empty() {
+            if up {
+                selected = selected.saturating_sub(1);
+            }
+            if down {
+                selected = (selected + 1).min(entries.len() - 1);
+            }
         }
-        if down {
-            selected = (selected + 1).min(entries.len() - 1);
-        }
-        let mut chosen = enter.then(|| entries[selected].clone());
+        let mut chosen = (enter && !entries.is_empty()).then(|| entries[selected].clone());
         egui::Modal::new(egui::Id::new("recent")).show(ctx, |ui| {
             ui.set_min_width(480.0);
             ui.heading("Recent files");
             ui.add_space(6.0);
+            if entries.is_empty() {
+                ui.label("No recent files");
+            }
             for (i, path) in entries.iter().enumerate() {
                 let name = path.file_name().map_or_else(
                     || path.display().to_string(),
@@ -1616,11 +1943,12 @@ impl App {
                 }
             }
             ui.add_space(6.0);
-            ui.label(
-                RichText::new("Up/Down select · Enter open · Esc close")
-                    .small()
-                    .weak(),
-            );
+            let hint = if empty_window {
+                "Up/Down select · Enter open"
+            } else {
+                "Up/Down select · Enter open · Esc close"
+            };
+            ui.label(RichText::new(hint).small().weak());
         });
         self.recent_list = Some(selected);
         if let Some(path) = chosen {
@@ -1633,14 +1961,30 @@ impl App {
         let Some(confirm) = self.confirm.clone() else {
             return;
         };
+        let all = matches!(confirm, Confirm::CloseAll);
+        let labels = if all { self.dirty_labels() } else { Vec::new() };
+        let name = if all || self.tabs.is_empty() {
+            String::new()
+        } else {
+            self.file_name()
+        };
         let mut choice = None;
         egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
-            ui.label(format!("{} has unsaved changes.", self.file_name()));
+            if all {
+                ui.label("These files have unsaved changes:");
+                for label in &labels {
+                    ui.label(label);
+                }
+            } else {
+                ui.label(format!("{name} has unsaved changes."));
+            }
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
+                let save = if all { "Save all" } else { "Save" };
+                let discard = if all { "Discard all" } else { "Discard" };
+                if ui.button(save).clicked() {
                     choice = Some("save");
                 }
-                if ui.button("Discard").clicked() {
+                if ui.button(discard).clicked() {
                     choice = Some("discard");
                 }
                 if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -1652,11 +1996,31 @@ impl App {
         self.confirm = None;
         match (choice, confirm) {
             ("save", Confirm::Close) => {
-                self.close_after_save = true;
+                self.after_save = Some(AfterSave::Window);
                 self.save();
             }
-            ("discard", Confirm::Close) => self.close_allowed = true,
-            ("cancel", Confirm::Close) => self.close_after_save = false,
+            ("save", Confirm::CloseTab(index)) => {
+                if let Some(tab) = self.tabs.get(index) {
+                    let id = tab.id;
+                    self.after_save = Some(AfterSave::Tab(id));
+                    self.save();
+                }
+            }
+            ("save", Confirm::CloseAll) => {
+                self.after_save = Some(AfterSave::Window);
+                if let Some(index) = self.first_dirty_tab() {
+                    if index != self.active {
+                        self.activate(index);
+                    }
+                    self.save();
+                } else {
+                    self.after_save = None;
+                    self.close_allowed = true;
+                }
+            }
+            ("discard", Confirm::Close | Confirm::CloseAll) => self.close_allowed = true,
+            ("discard", Confirm::CloseTab(index)) => self.remove_tab(index),
+            ("cancel", _) => self.after_save = None,
             _ => {}
         }
     }
@@ -1749,6 +2113,7 @@ impl App {
         );
         if cancel {
             self.new_folder = None;
+            self.show_recent_if_empty();
             return;
         }
         self.new_folder = Some(prompt);
@@ -1764,6 +2129,7 @@ impl App {
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             self.show_keys = false;
+            self.show_recent_if_empty();
             return;
         }
         let rows: Vec<(String, String)> = Action::ALL
@@ -1848,6 +2214,7 @@ impl App {
         );
         if cancel {
             self.new_file = None;
+            self.show_recent_if_empty();
             return;
         }
         self.new_file = Some(prompt);
@@ -1905,6 +2272,7 @@ impl App {
         );
         if cancel {
             self.rename = None;
+            self.show_recent_if_empty();
             return;
         }
         self.rename = Some(prompt.clone());
@@ -2035,6 +2403,7 @@ impl App {
         });
         if cancel {
             self.trash_confirm = None;
+            self.show_recent_if_empty();
         } else if confirm {
             self.trash_confirm = None;
             match self.trash.trash(&path) {
@@ -2046,6 +2415,7 @@ impl App {
                         for tab in &mut self.tabs {
                             if tab.doc.path().is_some_and(|open| open.starts_with(&path)) {
                                 tab.banner = Some(Banner::DiskMissing);
+                                tab.disk = Some(Banner::DiskMissing);
                             }
                         }
                     }
@@ -2065,7 +2435,10 @@ impl App {
     /// Sidebar on the left, heading outline on the right. Each one can be
     /// hidden on its own. Hiding the sidebar leaves the outline up.
     fn editor(&mut self, ui: &mut egui::Ui) {
-        let open_path = self.tab().doc.path().map(|path| path.to_path_buf());
+        let open_path = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.doc.path().map(|path| path.to_path_buf()));
         let mut dirty_paths = HashSet::new();
         for tab in &self.tabs {
             if tab.doc.is_dirty()
@@ -2074,8 +2447,25 @@ impl App {
                 dirty_paths.insert(path.to_path_buf());
             }
         }
+        let mut changed_paths = HashSet::new();
+        let mut missing_paths = HashSet::new();
+        for tab in &self.tabs {
+            if let Some(path) = tab.doc.path() {
+                match tab.disk {
+                    Some(Banner::DiskChanged) => {
+                        changed_paths.insert(path.to_path_buf());
+                    }
+                    Some(Banner::DiskMissing) => {
+                        missing_paths.insert(path.to_path_buf());
+                    }
+                    None => {}
+                }
+            }
+        }
         self.browser.set_current(open_path);
         self.browser.set_dirty(&dirty_paths);
+        self.browser.set_changed(&changed_paths);
+        self.browser.set_missing(&missing_paths);
         if !self.sidebar.visible {
             self.browser.poll_listings(ui.ctx());
         }
@@ -2141,8 +2531,10 @@ impl App {
             }
             if closed {
                 self.search.close();
-                let focus = self.tab().focus;
-                self.focus_pane(ui.ctx(), focus);
+                if let Some(tab) = self.tabs.get(self.active) {
+                    let focus = tab.focus;
+                    self.focus_pane(ui.ctx(), focus);
+                }
             }
             let handle =
                 Rect::from_min_max(pos2(cursor, rect.top()), pos2(cursor + gap, rect.bottom()));
@@ -2178,7 +2570,13 @@ impl App {
         let panes = Rect::from_min_max(pos2(cursor, rect.top()), pos2(panes_right, rect.bottom()));
         // The panes mirror the caret while they draw. A click is applied
         // after that, so both panes end the frame on the heading.
-        if panes.width() > 1.0 {
+        if panes.width() > 1.0 && self.tabs.is_empty() {
+            ui.scope_builder(UiBuilder::new().max_rect(panes), |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.label(RichText::new("No file open").weak());
+                });
+            });
+        } else if panes.width() > 1.0 {
             let mut tab_events = Vec::new();
             ui.scope_builder(UiBuilder::new().max_rect(panes), |ui| {
                 if self.tabs.len() > 1 {
@@ -2238,20 +2636,28 @@ impl App {
                 divider.y_range(),
                 Stroke::new(1.0, colors.divider),
             );
-            {
+            if self.tabs.is_empty() {
+                self.outline.clear();
+            } else {
                 // Field borrow: `tab()` would take all of `self`, and the
                 // outline is borrowed beside the document.
                 let tab = &self.tabs[self.active];
                 self.outline
                     .refresh(tab.parse.revision(), &tab.doc, tab.parse.output());
             }
-            let caret = self.selection().head;
+            let caret = self
+                .tabs
+                .get(self.active)
+                .map(|tab| tab.selection().head)
+                .unwrap_or(0);
             let clicked = ui
                 .scope_builder(UiBuilder::new().max_rect(outline_rect), |ui| {
                     outline::show(ui, self.outline.rows(), caret)
                 })
                 .inner;
-            if let Some(offset) = clicked {
+            if let Some(offset) = clicked
+                && !self.tabs.is_empty()
+            {
                 let here = self.here();
                 self.jump_to(offset);
                 self.remember(here);
@@ -2269,6 +2675,8 @@ impl App {
                 id: tab.id,
                 title: tab.title(),
                 dirty: tab.doc.is_dirty(),
+                changed: matches!(tab.disk, Some(Banner::DiskChanged)),
+                missing: matches!(tab.disk, Some(Banner::DiskMissing)),
                 active: index == self.active,
                 preview: tab.preview,
             })
@@ -2287,6 +2695,16 @@ impl App {
     /// A folder-search row. The same file selects the match; another file
     /// opens, and the match is selected once that file is parsed.
     fn open_search_hit(&mut self, hit: SearchOpen) {
+        if self.tabs.is_empty() {
+            match hit {
+                SearchOpen::File(path) => self.request_open(path),
+                SearchOpen::Match { path, range, text } => {
+                    self.pending_jump = Some((path.clone(), Jump::Select { range, text }));
+                    self.request_open(path);
+                }
+            }
+            return;
+        }
         match hit {
             SearchOpen::File(path) => {
                 if self.tab().doc.path() != Some(path.as_path()) {
@@ -2731,11 +3149,16 @@ impl App {
         self.keys_ui(&ctx);
         self.hold_focus_for_dialogs(&ctx);
 
-        if self.tab().banner.is_some() || self.error.is_some() {
+        let show_banner = self.error.is_some()
+            || self
+                .tabs
+                .get(self.active)
+                .is_some_and(|tab| tab.banner.is_some());
+        if show_banner {
             egui::Panel::top("banner").show(ui, |ui| self.banner_ui(ui));
         }
         egui::Panel::bottom("status").show(ui, |ui| self.status_ui(ui));
-        if self.find_open {
+        if self.find_open && !self.tabs.is_empty() {
             self.find_history_keys(&ctx);
             let selection = self.selection();
             let modal = self.modal_open();
@@ -2754,7 +3177,7 @@ impl App {
                 self.show_match(sel);
             }
         }
-        if self.goto.is_open() {
+        if self.goto.is_open() && !self.tabs.is_empty() {
             let line_count = self.tab().doc.line_count();
             let modal = self.modal_open();
             let step = {
@@ -2791,6 +3214,9 @@ impl App {
 
 impl App {
     fn measure_step(&mut self, ctx: &egui::Context) {
+        if self.tabs.is_empty() {
+            return;
+        }
         let settled = self.tab().parse.is_settled();
         let lines = self.tab().doc.line_count();
         let Some(m) = self.measure.as_mut() else {
@@ -4481,21 +4907,28 @@ mod tests {
             self.click_text_button(text, egui::PointerButton::Primary);
         }
 
-        /// Clicks a tab chip. A dirty chip is one galley, the title plus the
-        /// unsaved mark, so the title alone is not on screen.
+        /// Clicks a tab chip. Marks share the title's galley, so the title
+        /// alone is not on screen once a chip is dirty, changed, or missing.
         fn click_tab(&mut self, title: &str) {
-            let marked = format!("{title} ●");
+            let candidates = [
+                title.to_owned(),
+                format!("{title} ●"),
+                format!("{title} ↻"),
+                format!("{title} ✕"),
+                format!("{title} ● ↻"),
+                format!("{title} ● ✕"),
+            ];
             for _ in 0..3 {
-                if self.text_rect(title).is_some() || self.text_rect(&marked).is_some() {
+                if candidates.iter().any(|text| self.text_rect(text).is_some()) {
                     break;
                 }
                 self.frame(vec![]);
             }
-            if self.text_rect(title).is_some() {
-                self.click_text(title);
-            } else {
-                self.click_text(&marked);
-            }
+            let shown = candidates
+                .iter()
+                .find(|text| self.text_rect(text).is_some())
+                .unwrap_or_else(|| panic!("{title:?} isn't on screen"));
+            self.click_text(shown);
         }
 
         fn click_text_button(&mut self, text: &str, button: egui::PointerButton) {
@@ -4918,7 +5351,7 @@ mod tests {
         assert!(r.sent(&ViewportCommand::CancelClose));
         r.click_text("Cancel");
         assert!(r.app.confirm.is_none());
-        assert!(!r.app.close_after_save);
+        assert!(r.app.after_save.is_none());
         assert!(!r.sent(&ViewportCommand::Close));
         assert_eq!(tab_text(&r.app, 0), "a\nunsaved");
         r.app.save();
@@ -4932,59 +5365,73 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.md");
         let b = dir.path().join("b.md");
+        let c = dir.path().join("c.md");
         fs::write(&a, "a\n").unwrap();
         fs::write(&b, "b\n").unwrap();
+        fs::write(&c, "c\n").unwrap();
 
         let mut r = Run::new(dir.path(), Some(a.clone()));
         type_into(&mut r.app, "A");
         r.app.request_open(b.clone());
         type_into(&mut r.app, "B");
+        r.app.request_open(c.clone());
+        type_into(&mut r.app, "C");
         r.close_window();
-        assert_eq!(r.app.tab().doc.path(), Some(a.as_path()));
-        r.click_text("Save");
-        assert_eq!(fs::read_to_string(&a).unwrap(), "a\nA");
-        assert_eq!(fs::read_to_string(&b).unwrap(), "b\n");
-        assert_eq!(r.app.confirm, Some(Confirm::Close));
-        assert_eq!(r.app.tab().doc.path(), Some(b.as_path()));
-        assert!(!r.sent(&ViewportCommand::Close));
-        r.click_text("Save");
+        assert_eq!(r.app.confirm, Some(Confirm::CloseAll));
+        assert_eq!(
+            r.app.dirty_labels(),
+            vec![
+                a.display().to_string(),
+                b.display().to_string(),
+                c.display().to_string()
+            ]
+        );
+        r.click_text("Save all");
         assert!(r.sent(&ViewportCommand::Close));
+        assert_eq!(fs::read_to_string(&a).unwrap(), "a\nA");
         assert_eq!(fs::read_to_string(&b).unwrap(), "b\nB");
+        assert_eq!(fs::read_to_string(&c).unwrap(), "c\nC");
 
-        // Save the first, then Cancel: the window stays, and saving the
-        // rest later does not close it.
+        // Cancel stays, and a later save of one tab does not close the window.
         fs::write(&a, "a\n").unwrap();
         fs::write(&b, "b\n").unwrap();
+        fs::write(&c, "c\n").unwrap();
         let mut r = Run::new(dir.path(), Some(a.clone()));
         type_into(&mut r.app, "A");
         r.app.request_open(b.clone());
         type_into(&mut r.app, "B");
+        r.app.request_open(c.clone());
+        type_into(&mut r.app, "C");
         r.close_window();
-        r.click_text("Save");
-        assert_eq!(fs::read_to_string(&a).unwrap(), "a\nA");
-        assert_eq!(fs::read_to_string(&b).unwrap(), "b\n");
+        r.frame(vec![]);
         r.click_text("Cancel");
         assert!(r.app.confirm.is_none());
-        assert!(!r.app.close_after_save);
+        assert!(r.app.after_save.is_none());
         assert!(!r.sent(&ViewportCommand::Close));
-        assert_eq!(r.app.tab().doc.path(), Some(b.as_path()));
+        assert_eq!(tab_text(&r.app, 0), "a\nA");
         assert_eq!(tab_text(&r.app, 1), "b\nB");
+        assert_eq!(tab_text(&r.app, 2), "c\nC");
         r.app.save();
         r.frame(vec![]);
         assert!(!r.sent(&ViewportCommand::Close));
-        assert_eq!(fs::read_to_string(&b).unwrap(), "b\nB");
+        assert_eq!(fs::read_to_string(&c).unwrap(), "c\nC");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "a\n");
 
         fs::write(&a, "a\n").unwrap();
         fs::write(&b, "b\n").unwrap();
+        fs::write(&c, "c\n").unwrap();
         let mut r = Run::new(dir.path(), Some(a.clone()));
         type_into(&mut r.app, "A");
         r.app.request_open(b.clone());
         type_into(&mut r.app, "B");
+        r.app.request_open(c.clone());
+        type_into(&mut r.app, "C");
         r.close_window();
-        r.click_text("Discard");
+        r.click_text("Discard all");
         assert!(r.sent(&ViewportCommand::Close));
         assert_eq!(fs::read_to_string(&a).unwrap(), "a\n");
         assert_eq!(fs::read_to_string(&b).unwrap(), "b\n");
+        assert_eq!(fs::read_to_string(&c).unwrap(), "c\n");
     }
 
     #[test]
@@ -6266,7 +6713,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_a_dirty_tab_or_the_last_tab_is_refused() {
+    fn closing_a_dirty_tab_asks_and_the_last_tab_leaves_the_recent_list() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.md");
         let b = dir.path().join("b.md");
@@ -6280,16 +6727,230 @@ mod tests {
         type_into(&mut run.app, "dirty");
         run.key(egui::Key::W, egui::Modifiers::COMMAND);
         assert_eq!(run.app.tabs.len(), 2);
-        assert!(hint(&run.app).contains("Save"));
+        assert_eq!(run.app.confirm, Some(Confirm::CloseTab(1)));
         assert!(text(&run.app).ends_with("dirty"));
+        run.click_text("Cancel");
+        assert!(run.app.confirm.is_none());
+        assert_eq!(run.app.tabs.len(), 2);
+        assert!(run.app.after_save.is_none());
 
         run.click_text_button("a.md", egui::PointerButton::Middle);
         assert_eq!(run.app.tabs.len(), 1);
         assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
         run.key(egui::Key::W, egui::Modifiers::COMMAND);
         assert_eq!(run.app.tabs.len(), 1);
-        assert!(hint(&run.app).contains("only open tab"));
-        assert!(text(&run.app).ends_with("dirty"));
+        assert_eq!(run.app.confirm, Some(Confirm::CloseTab(0)));
+        run.click_text("Discard");
+        assert!(run.app.tabs.is_empty());
+        assert_eq!(run.app.recent_list, Some(0));
+        assert!(!run.sent(&ViewportCommand::Close));
+        run.frame(vec![]);
+        assert!(run.text_rect("Recent files").is_some());
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert_eq!(run.app.recent_list, Some(0));
+        assert!(!run.sent(&ViewportCommand::Close));
+        run.click_text("a.md");
+        assert_eq!(run.app.tabs.len(), 1);
+        assert_eq!(run.app.tab().doc.path(), Some(a.as_path()));
+    }
+
+    #[test]
+    fn closing_a_clean_window_does_not_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(a));
+        r.app.request_open(b);
+        r.frame(vec![]);
+        r.close_window();
+        assert!(r.app.confirm.is_none());
+        assert!(!r.sent(&ViewportCommand::CancelClose));
+        assert!(!r.sent(&ViewportCommand::Close));
+    }
+
+    #[test]
+    fn closing_a_dirty_tab_saves_that_tab_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(a.clone()));
+        type_into(&mut r.app, "A");
+        r.app.request_open(b.clone());
+        type_into(&mut r.app, "B");
+        r.frame(vec![]);
+        r.key(egui::Key::W, egui::Modifiers::COMMAND);
+        assert_eq!(r.app.confirm, Some(Confirm::CloseTab(1)));
+        r.click_text("Save");
+        assert_eq!(r.app.tabs.len(), 1);
+        assert_eq!(r.app.tab().doc.path(), Some(a.as_path()));
+        assert_eq!(fs::read_to_string(&b).unwrap(), "b\nB");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "a\n");
+        assert_eq!(tab_text(&r.app, 0), "a\nA");
+        assert!(!r.sent(&ViewportCommand::Close));
+    }
+
+    #[test]
+    fn save_all_stops_when_a_file_changed_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(a.clone()));
+        type_into(&mut r.app, "A");
+        r.app.request_open(b.clone());
+        type_into(&mut r.app, "B");
+        fs::write(&b, "theirs\n").unwrap();
+        r.close_window();
+        assert_eq!(r.app.confirm, Some(Confirm::CloseAll));
+        r.click_text("Save all");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "a\nA");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "theirs\n");
+        assert!(matches!(r.app.tab().banner, Some(Banner::DiskChanged)));
+        assert_eq!(r.app.tab().doc.path(), Some(b.as_path()));
+        assert_eq!(text(&r.app), "b\nB");
+        assert!(r.app.after_save.is_none());
+        assert!(!r.sent(&ViewportCommand::Close));
+        r.app.save();
+        r.frame(vec![]);
+        assert!(!r.sent(&ViewportCommand::Close));
+        assert_eq!(fs::read_to_string(&b).unwrap(), "theirs\n");
+    }
+
+    #[test]
+    fn save_as_refuses_a_path_another_tab_has_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let mut app = app(dir.path(), Some(a.clone()));
+        app.request_open(b.clone());
+        type_into(&mut app, "B");
+        app.save_as(a.clone());
+        assert!(
+            app.error.as_deref().unwrap().contains("already open"),
+            "{:?}",
+            app.error
+        );
+        assert_eq!(fs::read_to_string(&a).unwrap(), "a\n");
+        assert_eq!(text(&app), "b\nB");
+        assert!(app.after_save.is_none());
+        // The tab's own path is still a normal save.
+        app.save_as(b.clone());
+        assert_eq!(fs::read_to_string(&b).unwrap(), "b\nB");
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn renaming_a_folder_follows_both_open_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        fs::create_dir(&notes).unwrap();
+        let a = notes.join("a.md");
+        let b = notes.join("b.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        type_into(&mut app, "A");
+        app.request_open(b.clone());
+        type_into(&mut app, "B");
+        app.begin_rename(notes.clone());
+        app.rename.as_mut().unwrap().name = "renamed".into();
+        let mut time = 0.0;
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        let renamed_a = dir.path().join("renamed/a.md");
+        let renamed_b = dir.path().join("renamed/b.md");
+        assert!(renamed_a.exists());
+        assert!(renamed_b.exists());
+        assert!(!a.exists());
+        assert_eq!(app.tabs[0].doc.path(), Some(renamed_a.as_path()));
+        assert_eq!(app.tabs[1].doc.path(), Some(renamed_b.as_path()));
+        assert_eq!(tab_text(&app, 0), "a\nA");
+        assert_eq!(tab_text(&app, 1), "b\nB");
+        app.activate(0);
+        app.save();
+        app.activate(1);
+        app.save();
+        assert_eq!(fs::read_to_string(&renamed_a).unwrap(), "a\nA");
+        assert_eq!(fs::read_to_string(&renamed_b).unwrap(), "b\nB");
+    }
+
+    #[test]
+    fn a_clean_background_tab_reloads_and_a_dirty_one_is_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(a.clone()));
+        r.app.request_open(b.clone());
+        r.settle();
+        r.app.sidebar.visible = false;
+        r.frame(vec![]);
+        fs::write(&a, "from disk\n").unwrap();
+        r.check_disk_now();
+        assert_eq!(tab_text(&r.app, 0), "from disk\n");
+        assert!(r.app.tabs[0].banner.is_none());
+        assert!(r.app.tabs[0].disk.is_none());
+        assert_eq!(text(&r.app), "b\n");
+        assert!(r.app.tab().banner.is_none());
+
+        type_into(&mut r.app, "mine");
+        r.click_tab("a.md");
+        assert_eq!(r.app.tab().doc.path(), Some(a.as_path()));
+        fs::write(&b, "theirs\n").unwrap();
+        r.check_disk_now();
+        assert_eq!(tab_text(&r.app, 1), "b\nmine");
+        assert!(matches!(r.app.tabs[1].disk, Some(Banner::DiskChanged)));
+        assert!(r.app.tabs[1].banner.is_none());
+        assert!(r.app.tab().banner.is_none());
+        assert!(r.text_rect("b.md ● ↻").is_some());
+        r.click_tab("b.md");
+        assert!(matches!(r.app.tab().banner, Some(Banner::DiskChanged)));
+        assert_eq!(text(&r.app), "b\nmine");
+        r.app.sidebar.visible = true;
+        r.frame(vec![]);
+        let row = r.app.browser.row_rect(&b).expect("b.md");
+        let marks = r.text_rects("↻");
+        assert!(
+            marks.iter().any(|mark| row.contains(mark.center())),
+            "the sidebar marks the dirty file that changed on disk"
+        );
+    }
+
+    #[test]
+    fn a_deleted_background_file_keeps_its_text_until_the_tab_is_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(a.clone()));
+        r.app.request_open(b.clone());
+        r.settle();
+        r.app.sidebar.visible = false;
+        r.frame(vec![]);
+        fs::remove_file(&a).unwrap();
+        r.check_disk_now();
+        assert_eq!(tab_text(&r.app, 0), "a\n");
+        assert!(matches!(r.app.tabs[0].disk, Some(Banner::DiskMissing)));
+        assert!(r.app.tabs[0].banner.is_none());
+        assert!(r.app.tab().banner.is_none());
+        assert!(r.text_rect("a.md ✕").is_some());
+        r.click_tab("a.md");
+        assert!(matches!(r.app.tab().banner, Some(Banner::DiskMissing)));
+        assert_eq!(text(&r.app), "a\n");
     }
 
     #[test]

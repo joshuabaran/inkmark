@@ -26,6 +26,12 @@ impl Outline {
     pub(crate) fn rows(&self) -> &[Heading] {
         &self.rows
     }
+
+    /// Drops the rows when no document is open.
+    pub(crate) fn clear(&mut self) {
+        self.rows.clear();
+        self.revision = None;
+    }
 }
 
 /// Width the outline takes when the window has room for it.

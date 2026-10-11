@@ -81,6 +81,10 @@ pub struct FileBrowser {
     /// Open documents with unsaved edits. Every one of those rows is marked,
     /// not only the file on screen.
     dirty: HashSet<PathBuf>,
+    /// Open files another program changed. Those rows show ↻.
+    changed: HashSet<PathBuf>,
+    /// Open files that are gone from disk. Those rows show ✕.
+    missing: HashSet<PathBuf>,
     focus_next: bool,
     /// The open file was scrolled into view for the current path.
     revealed: bool,
@@ -122,6 +126,8 @@ impl FileBrowser {
             selected: None,
             current: None,
             dirty: HashSet::new(),
+            changed: HashSet::new(),
+            missing: HashSet::new(),
             focus_next: false,
             revealed: false,
             id: Id::new("file_browser"),
@@ -185,6 +191,24 @@ impl FileBrowser {
     pub fn set_dirty(&mut self, dirty: &HashSet<PathBuf>) {
         if &self.dirty != dirty {
             self.dirty.clone_from(dirty);
+            self.wake();
+        }
+    }
+
+    /// Files changed on disk since they were opened or saved. Wakes only
+    /// when the set changes, so a poll that finds nothing new does not
+    /// repaint.
+    pub fn set_changed(&mut self, changed: &HashSet<PathBuf>) {
+        if &self.changed != changed {
+            self.changed.clone_from(changed);
+            self.wake();
+        }
+    }
+
+    /// Files missing on disk. Same wake rule as [`Self::set_changed`].
+    pub fn set_missing(&mut self, missing: &HashSet<PathBuf>) {
+        if &self.missing != missing {
+            self.missing.clone_from(missing);
             self.wake();
         }
     }
@@ -871,32 +895,17 @@ impl FileBrowser {
             self.theme.markup,
         );
         let name_x = indent + 16.0;
+        let mut marks = Vec::new();
         if self.dirty.contains(&row.path) {
-            // Leave room for ● at the end of the row. A long name otherwise
-            // pushes the mark past the clip, and the row looks saved.
-            let mark_width = ui
-                .painter()
-                .layout_no_wrap("●".to_owned(), font.clone(), color)
-                .size()
-                .x;
-            let gap = 6.0;
-            let name_width = (rect.right() - name_x - gap - mark_width).max(0.0);
-            let name = fit_row_label(ui, label, font.clone(), color, name_width);
-            let name_pos = pos2(name_x, rect.center().y - name.size().y * 0.5);
-            let painted = name.size().x;
-            ui.painter().galley(name_pos, name, color);
-            let mut mark_x = name_x + painted + gap;
-            if mark_x + mark_width > rect.right() {
-                mark_x = (rect.right() - mark_width).max(rect.left());
-            }
-            ui.painter().text(
-                pos2(mark_x, rect.center().y),
-                Align2::LEFT_CENTER,
-                "●",
-                font,
-                color,
-            );
-        } else {
+            marks.push("●");
+        }
+        if self.changed.contains(&row.path) {
+            marks.push("↻");
+        }
+        if self.missing.contains(&row.path) {
+            marks.push("✕");
+        }
+        if marks.is_empty() {
             ui.painter().text(
                 pos2(name_x, rect.center().y),
                 Align2::LEFT_CENTER,
@@ -904,6 +913,44 @@ impl FileBrowser {
                 font,
                 color,
             );
+        } else {
+            // Leave room for the marks at the end of the row. A long name
+            // otherwise pushes them past the clip.
+            let gap = 6.0;
+            let mark_width: f32 = marks
+                .iter()
+                .map(|mark| {
+                    ui.painter()
+                        .layout_no_wrap((*mark).to_owned(), font.clone(), color)
+                        .size()
+                        .x
+                        + gap
+                })
+                .sum();
+            let name_width = (rect.right() - name_x - mark_width).max(0.0);
+            let name = fit_row_label(ui, label, font.clone(), color, name_width);
+            let name_pos = pos2(name_x, rect.center().y - name.size().y * 0.5);
+            let painted = name.size().x;
+            ui.painter().galley(name_pos, name, color);
+            let mut mark_x = name_x + painted + gap;
+            for mark in marks {
+                let width = ui
+                    .painter()
+                    .layout_no_wrap(mark.to_owned(), font.clone(), color)
+                    .size()
+                    .x;
+                if mark_x + width > rect.right() {
+                    mark_x = (rect.right() - width).max(rect.left());
+                }
+                ui.painter().text(
+                    pos2(mark_x, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    mark,
+                    font.clone(),
+                    color,
+                );
+                mark_x += width + gap;
+            }
         }
         Some(response)
     }
