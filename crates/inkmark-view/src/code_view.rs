@@ -338,7 +338,7 @@ impl CodeView {
         self.text.release_line_cache();
     }
 
-    /// Source bytes in the shaped-line cache.
+    /// Estimated bytes in the shaped-line cache.
     pub fn cached_line_bytes(&self) -> usize {
         self.text.cached_line_bytes()
     }

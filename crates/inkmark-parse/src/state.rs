@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -451,9 +451,10 @@ pub struct ParseState {
     full_epoch: Option<u64>,
     requested: Option<u64>,
     last_change: Instant,
-    /// Bumped by `reset`; jobs and results carry it so a parse of the
-    /// previous document still in flight can't land on the new one.
-    generation: u64,
+    /// Bumped by `reset` and by parking. Jobs carry the value from when
+    /// they were sent. The worker reads this and drops a job that no
+    /// longer matches, instead of parsing it or sending the output back.
+    generation: Arc<AtomicU64>,
     /// Bumped whenever `output` changes. Callers cache on this.
     revision: u64,
     jobs: Sender<Job>,
@@ -483,6 +484,8 @@ impl ParseState {
         let worker_parser = Arc::clone(&parser);
         let awake = Arc::new(AtomicBool::new(true));
         let worker_awake = Arc::clone(&awake);
+        let generation = Arc::new(AtomicU64::new(0));
+        let worker_generation = Arc::clone(&generation);
         std::thread::Builder::new()
             .name("inkmark-parse".into())
             .spawn(move || {
@@ -491,7 +494,16 @@ impl ParseState {
                     while let Ok(newer) = job_rx.try_recv() {
                         job = newer;
                     }
+                    // Parked or reset while this job waited in the queue.
+                    if job.generation != worker_generation.load(Ordering::Acquire) {
+                        continue;
+                    }
                     let output = worker_parser.parse(&job.text);
+                    // Parked or reset while this parse was running. Drop the
+                    // output here so it is not retained until the tab returns.
+                    if job.generation != worker_generation.load(Ordering::Acquire) {
+                        continue;
+                    }
                     if result_tx.send((job.generation, job.epoch, output)).is_err() {
                         break;
                     }
@@ -510,7 +522,7 @@ impl ParseState {
             full_epoch: None,
             requested: None,
             last_change: Instant::now(),
-            generation: 0,
+            generation,
             revision: 0,
             jobs,
             results,
@@ -532,8 +544,9 @@ impl ParseState {
         // No debounce for the first parse.
         self.last_change = Instant::now() - DEBOUNCE;
         // Results for the previous document, queued or still being
-        // computed, carry the old generation and are ignored.
-        self.generation += 1;
+        // computed, carry the old generation and are ignored. The worker
+        // sees this too and does not start the next queued job.
+        self.generation.fetch_add(1, Ordering::Release);
         self.revision = self.revision.wrapping_add(1);
     }
 
@@ -565,23 +578,28 @@ impl ParseState {
         }
     }
 
-    /// After two seconds asleep, drop the in-flight job. The worker
-    /// finishes what it started and the result is ignored. The next
+    /// After two seconds asleep, cancel the in-flight job. The worker sees
+    /// the new generation and does not parse a queued follow-up or send the
+    /// output back. Results that already arrived are dropped here, including
+    /// on later frames while the tab stays parked. The next
     /// [`update`](Self::update) while awake starts a fresh parse.
     pub fn park_if_idle(&mut self) {
-        if self.awake.load(Ordering::Acquire) || self.parked {
+        if self.awake.load(Ordering::Acquire) {
             return;
         }
-        let Some(at) = self.slept_at else {
-            return;
-        };
-        if at.elapsed() < self.park_after {
-            return;
+        if !self.parked {
+            let Some(at) = self.slept_at else {
+                return;
+            };
+            if at.elapsed() < self.park_after {
+                return;
+            }
+            self.generation.fetch_add(1, Ordering::Release);
+            self.requested = None;
+            self.parked = true;
+            self.slept_at = None;
         }
-        self.generation = self.generation.wrapping_add(1);
-        self.requested = None;
-        self.parked = true;
-        self.slept_at = None;
+        while self.results.try_recv().is_ok() {}
     }
 
     /// Call every frame. Returns how long until it wants to run again (a
@@ -589,7 +607,7 @@ impl ParseState {
     pub fn update(&mut self, doc: &Document) -> Option<Duration> {
         let now = Instant::now();
         while let Ok((generation, epoch, output)) = self.results.try_recv() {
-            if generation == self.generation {
+            if generation == self.generation.load(Ordering::Acquire) {
                 self.accept(doc, epoch, output);
             }
         }
@@ -613,7 +631,7 @@ impl ParseState {
             return Some(DEBOUNCE - quiet);
         }
         let _ = self.jobs.send(Job {
-            generation: self.generation,
+            generation: self.generation.load(Ordering::Acquire),
             epoch: self.epoch,
             text: String::from(doc.rope()),
         });
@@ -748,5 +766,79 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(wakes.load(Ordering::Relaxed) > settled_wakes);
+    }
+
+    /// A job queued behind one that is already running must not start after
+    /// the tab is parked. The output must not sit in the channel either.
+    #[test]
+    fn parking_cancels_a_queued_parse_and_drops_its_output() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct Hold {
+            calls: Arc<AtomicUsize>,
+            started: Arc<AtomicBool>,
+            release: Arc<AtomicBool>,
+        }
+
+        impl MarkdownParser for Hold {
+            fn parse(&self, src: &str) -> ParseOutput {
+                // An edit also reparses on the thread that called `update`.
+                // Only the worker thread counts here.
+                if std::thread::current().name() != Some("inkmark-parse") {
+                    return ParseOutput::unparsed(src.len());
+                }
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    self.started.store(true, Ordering::SeqCst);
+                    while !self.release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                ParseOutput::unparsed(src.len())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let mut doc = Document::from_text("# A\n");
+        let mut state = ParseState::new(
+            Arc::new(Hold {
+                calls: Arc::clone(&calls),
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }),
+            &doc,
+            || {},
+        );
+        state.update(&doc);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the worker never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        doc.apply(
+            vec![Edit::insert(doc.len(), "\n")],
+            Selection::caret(doc.len()),
+            Selection::caret(doc.len()),
+            EditKind::Other,
+        )
+        .unwrap();
+        state.update(&doc);
+        std::thread::sleep(DEBOUNCE + Duration::from_millis(20));
+        state.update(&doc);
+        assert_eq!(state.requested, Some(doc.epoch()));
+
+        state.set_awake(false);
+        state.park_after = Duration::ZERO;
+        state.park_if_idle();
+        release.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a parked job was parsed");
+        state.park_if_idle();
+        assert!(
+            state.results.try_recv().is_err(),
+            "a parked output was kept"
+        );
     }
 }

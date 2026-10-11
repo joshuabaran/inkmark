@@ -859,6 +859,8 @@ impl App {
             return;
         }
         let shown = self.tabs.get(self.active).map(|tab| tab.id);
+        let id = self.tabs[index].id;
+        self.forget_tab_images(id);
         self.tabs.remove(index);
         self.mru.retain(|slot| *slot != index);
         for slot in &mut self.mru {
@@ -982,6 +984,8 @@ impl App {
     }
 
     fn replace_document(&mut self, doc: Document) {
+        let id = self.tab().id;
+        self.forget_tab_images(id);
         let tab = self.tab_mut();
         tab.doc = doc;
         tab.code.reset();
@@ -1354,6 +1358,7 @@ impl App {
         let Some(path) = self.tabs[index].doc.path().map(|path| path.to_path_buf()) else {
             return;
         };
+        self.forget_tab_images(self.tabs[index].id);
         let (code_sel, live_sel, code_scroll, live_scroll, folds) = {
             let tab = &self.tabs[index];
             (
@@ -3436,14 +3441,27 @@ impl App {
         let Some(cache) = self.images.clone() else {
             return;
         };
+        if let Some(id) = self.tabs.get(self.active).map(|tab| tab.id) {
+            cache.set_active(id);
+        }
         for tab in &mut self.tabs {
-            tab.live.share_images(cache.clone());
+            let id = tab.id;
+            tab.live.share_images(cache.clone(), id);
         }
     }
 
-    /// Shaped-line source text kept across every tab. Past this, tabs that
-    /// are not showing drop their line caches first. The tab on screen
-    /// keeps its own, so switching back to it is still a paint.
+    /// The tab closed or its file was replaced. Its images are dropped
+    /// unless another open tab is showing them.
+    fn forget_tab_images(&self, id: u64) {
+        if let Some(cache) = &self.images {
+            cache.release_user(id);
+        }
+    }
+
+    /// Estimated shaped-line bytes kept across every tab (both copies of
+    /// the source, plus the glyphs). Past this, tabs that are not showing
+    /// drop their line caches first. The tab on screen keeps its own, so
+    /// switching back to it is still a paint.
     const LINE_CACHE_BUDGET: usize = 8 * 1024 * 1024;
 
     fn trim_background_line_caches(&mut self) {
