@@ -99,14 +99,18 @@ impl Harness {
     }
 
     fn click(&mut self, pos: Pos2) -> BrowserOutput {
-        let button = |pressed| Event::PointerButton {
+        self.click_button(pos, PointerButton::Primary)
+    }
+
+    fn click_button(&mut self, pos: Pos2, button: PointerButton) -> BrowserOutput {
+        let event = |pressed| Event::PointerButton {
             pos,
-            button: PointerButton::Primary,
+            button,
             pressed,
             modifiers: Modifiers::NONE,
         };
-        self.frame(vec![Event::PointerMoved(pos), button(true)]);
-        self.frame(vec![button(false)])
+        self.frame(vec![Event::PointerMoved(pos), event(true)]);
+        self.frame(vec![event(false)])
     }
 
     fn wait_until(&mut self, mut pred: impl FnMut(&mut FileBrowser) -> bool) {
@@ -215,6 +219,62 @@ fn a_double_click_pins_and_a_single_click_does_not() {
         Some(OpenFile {
             path: file,
             pin: true
+        })
+    );
+}
+
+#[test]
+fn a_click_beside_another_row_does_not_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.md");
+    let b = dir.path().join("b.md");
+    fs::write(&a, "a\n").unwrap();
+    fs::write(&b, "b\n").unwrap();
+    let mut h = Harness::new(dir.path());
+    h.wait_until(|browser| browser.row_rect(&a).is_some() && browser.row_rect(&b).is_some());
+    let a_rect = h.browser.row_rect(&a).unwrap();
+    let b_rect = h.browser.row_rect(&b).unwrap();
+    let (above, below, below_path) = if a_rect.top() < b_rect.top() {
+        (a_rect, b_rect, b)
+    } else {
+        (b_rect, a_rect, a)
+    };
+    // Two pixels each side of the boundary is four pixels apart, inside
+    // egui's six-pixel double-click distance, and on two different rows.
+    let boundary = below.top();
+    let on_above = pos2(above.center().x, boundary - 2.0);
+    let on_below = pos2(below.center().x, boundary + 2.0);
+    assert!(above.contains(on_above));
+    assert!(below.contains(on_below));
+    assert!(on_above.distance(on_below) < 6.0);
+    let first = h.click(on_above);
+    assert_eq!(first.open_file.as_ref().map(|open| open.pin), Some(false));
+    let second = h.click(on_below);
+    assert_eq!(
+        second.open_file,
+        Some(OpenFile {
+            path: below_path,
+            pin: false,
+        })
+    );
+}
+
+#[test]
+fn a_middle_click_does_not_make_the_next_primary_click_a_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("b.md");
+    fs::write(&file, "b\n").unwrap();
+    let mut h = Harness::new(dir.path());
+    h.wait_until(|browser| browser.row_rect(&file).is_some());
+    let at = h.browser.row_rect(&file).unwrap().center();
+    let middle = h.click_button(at, PointerButton::Middle);
+    assert!(middle.open_file.is_none());
+    let primary = h.click(at);
+    assert_eq!(
+        primary.open_file,
+        Some(OpenFile {
+            path: file,
+            pin: false,
         })
     );
 }

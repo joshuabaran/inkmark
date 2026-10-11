@@ -119,6 +119,12 @@ pub struct FileBrowser {
     theme: std::sync::Arc<Theme>,
     /// Shortcuts, shared with the editor panes and the app shell.
     keys: keys::KeyMap,
+    /// The last primary click on a row: its path, and the `Ui` input time.
+    /// The next primary click on that same path, inside the double-click
+    /// window, pins. A middle click does not update this. egui's own count
+    /// is global to the pointer, so another row or another button inside
+    /// the window would otherwise count as a double or a triple.
+    last_primary_click: Option<(PathBuf, f64)>,
 }
 
 impl FileBrowser {
@@ -153,6 +159,7 @@ impl FileBrowser {
             ctx: None,
             theme: std::sync::Arc::new(Theme::dark()),
             keys: keys::KeyMap::builtin(),
+            last_primary_click: None,
         }
     }
 
@@ -770,6 +777,21 @@ impl FileBrowser {
         self.activate_row(&row, output, false);
     }
 
+    /// Records a primary click on `path`. True when the previous primary
+    /// click was this same path and still inside the double-click window.
+    fn repeats_primary_click(&mut self, ui: &Ui, path: &Path) -> bool {
+        let now = ui.input(|input| input.time);
+        let delay = ui
+            .ctx()
+            .options(|options| options.input_options.max_double_click_delay);
+        let again = self
+            .last_primary_click
+            .as_ref()
+            .is_some_and(|(prev, at)| prev == path && now >= *at && now - *at < delay);
+        self.last_primary_click = Some((path.to_path_buf(), now));
+        again
+    }
+
     fn activate_row(&mut self, row: &Row, output: &mut BrowserOutput, pin: bool) {
         if row.kind.openable() {
             output.open_file = Some(OpenFile {
@@ -818,15 +840,14 @@ impl FileBrowser {
                     let row = &rows[index];
                     if let Some(response) = self.paint_row(ui, row) {
                         self.row_rects.insert(row.path.clone(), response.rect);
-                        // A double click pins. egui reports a triple when another
-                        // row was clicked inside the triple-click window: that
-                        // count only measures the distance to the click just
-                        // before this one, so the press that should pin is a
-                        // triple, and `double_clicked` stays false.
-                        if response.double_clicked() || response.triple_clicked() {
-                            clicked = Some((index, true));
-                        } else if response.clicked() {
-                            clicked = Some((index, false));
+                        // A double click is two primary clicks on this path.
+                        // egui's count does not remember the row, and another
+                        // button inside the window advances it too.
+                        if response.clicked() {
+                            let path = row.path.clone();
+                            let openable = row.kind.openable();
+                            let again = self.repeats_primary_click(ui, &path);
+                            clicked = Some((index, again && openable));
                         }
                         response.dnd_set_drag_payload(Dragged(row.path.clone()));
                         let target = Self::drop_dir(row);

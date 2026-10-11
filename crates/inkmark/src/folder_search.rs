@@ -304,7 +304,9 @@ impl FolderSearch {
             }
             self.scroll_to = self.row_of(self.selected);
         }
-        if pin_enter || enter {
+        // The rows can still belong to the previous query while this one
+        // waits out the debounce. Opening one would land on that old hit.
+        if !self.dirty && (pin_enter || enter) {
             open = self.open_hit(self.selected).map(|open| SearchChoice {
                 open,
                 pin: pin_enter,
@@ -405,6 +407,9 @@ impl FolderSearch {
             })
             .inner;
         clicked.and_then(|(index, pin)| {
+            if self.dirty {
+                return None;
+            }
             self.selected = index;
             self.open_hit(index).map(|open| SearchChoice { open, pin })
         })

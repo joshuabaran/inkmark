@@ -99,12 +99,13 @@ impl FindState {
     }
 
     /// Drops the match list when the document is replaced. The query,
-    /// options, and replacement stay, so the next F3 searches the new file.
-    /// A new document starts at epoch 0, the same epoch a search in an
-    /// unedited file recorded, and `refresh` would otherwise keep the old
-    /// ranges and slice them out of the new rope.
+    /// options, and replacement stay. The next time the bar is shown it
+    /// searches the new document: a new document starts at epoch 0, the
+    /// same epoch a search in an unedited file recorded, and `refresh`
+    /// would otherwise keep the old ranges and slice them out of the new rope.
     pub fn reset_matches(&mut self) {
         self.clear_matches();
+        self.force = true;
     }
 
     /// Arms a search. A short single-line selection becomes the query when
