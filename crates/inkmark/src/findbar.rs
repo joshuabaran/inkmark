@@ -98,6 +98,15 @@ impl FindState {
         self.indexed = self.index.is_some().then_some(range);
     }
 
+    /// Drops the match list when the document is replaced. The query,
+    /// options, and replacement stay, so the next F3 searches the new file.
+    /// A new document starts at epoch 0, the same epoch a search in an
+    /// unedited file recorded, and `refresh` would otherwise keep the old
+    /// ranges and slice them out of the new rope.
+    pub fn reset_matches(&mut self) {
+        self.clear_matches();
+    }
+
     /// Arms a search. A short single-line selection becomes the query when
     /// the bar was closed. `replace` puts the caret in the replacement.
     /// `already_open` is the shell's bar, not this document's query.
@@ -568,6 +577,19 @@ fn select_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_matches_keeps_the_query_and_drops_the_old_ranges() {
+        let old = Document::from_text("aaaa aaaa cat\n");
+        let mut bar = FindState::default();
+        bar.open(0, Some("cat".into()), false, false);
+        let hit = bar.goto_next(&old, Selection::caret(0)).unwrap();
+        assert_eq!(hit.range(), 10..13);
+        bar.reset_matches();
+        let new = Document::from_text("cat dog\n");
+        let hit = bar.goto_next(&new, Selection::caret(0)).unwrap();
+        assert_eq!(hit.range(), 0..3);
+    }
 
     #[test]
     fn f3_steps_and_wraps_without_losing_the_index() {

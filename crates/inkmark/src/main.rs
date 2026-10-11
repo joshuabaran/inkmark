@@ -259,6 +259,11 @@ struct NewFilePrompt {
 ///
 /// The two panes use fixed egui ids. A second tab has to give its views
 /// their own ids, or the panes would share scroll and focus memory.
+///
+/// Keys, font size, line height, and the minimap flags are window
+/// settings. `install_keys`, `apply_settings`, and the minimap toggle
+/// write them onto every tab. A tab added later has to be built with
+/// the current ones.
 struct Tab {
     doc: Document,
     parse: ParseState,
@@ -269,13 +274,10 @@ struct Tab {
     banner: Option<Banner>,
     /// Query and matches for this document. The bar's open flag is on `App`.
     find: FindState,
-    /// A caret placement waiting until this document has been parsed.
-    /// The path is the file the jump belongs to, so a cancelled open does
-    /// not land it on whatever is still showing.
-    pending_jump: Option<(PathBuf, Jump)>,
     /// A preview tab is replaced by the next single click. T3 sets this.
     /// Until then every tab is pinned, which is today's one document.
-    #[allow(dead_code)]
+    /// The tests read it. The bin does not, until T3.
+    #[cfg_attr(not(test), expect(dead_code))]
     preview: bool,
 }
 
@@ -303,6 +305,11 @@ struct App {
     /// A history change waiting on a file being opened: committed once that
     /// file is open, undone if the open was cancelled or failed.
     pending_history: Option<(PathBuf, Place, Travel)>,
+    /// A caret placement waiting on that same open. It describes the
+    /// request, not the document on screen, so a cancelled open does not
+    /// land it on the file that is still showing. A later slice that opens
+    /// into another tab puts the jump on the tab the open lands in.
+    pending_jump: Option<(PathBuf, Jump)>,
     /// Tests record URLs here instead of starting a browser.
     #[cfg(test)]
     opened_urls: Vec<String>,
@@ -426,7 +433,6 @@ impl App {
                 focus: Pane::Code,
                 banner: None,
                 find: FindState::default(),
-                pending_jump: None,
                 preview: false,
             }],
             active: 0,
@@ -436,6 +442,7 @@ impl App {
             back: Vec::new(),
             forward: Vec::new(),
             pending_history: None,
+            pending_jump: None,
             #[cfg(test)]
             opened_urls: Vec::new(),
             dialog: None,
@@ -490,8 +497,10 @@ impl App {
                 }
             }
         }
-        app.tab_mut().code.show_minimap = code_minimap;
-        app.tab_mut().live.show_minimap = live_minimap;
+        for tab in &mut app.tabs {
+            tab.code.show_minimap = code_minimap;
+            tab.live.show_minimap = live_minimap;
+        }
         app.install_keys();
         // A live-only window keeps the keyboard on the pane that is showing.
         if app.mode == Mode::Live {
@@ -503,18 +512,19 @@ impl App {
         app
     }
 
-    /// Copies the current shortcuts onto the sidebar and both panes.
+    /// Copies the current shortcuts onto the sidebar and every tab's panes.
     fn install_keys(&mut self) {
         let keys = self.keys.clone();
-        let tab = self.tab_mut();
-        tab.code.set_keys(keys.clone());
-        tab.live.set_keys(keys.clone());
+        for tab in &mut self.tabs {
+            tab.code.set_keys(keys.clone());
+            tab.live.set_keys(keys.clone());
+        }
         self.browser.set_keys(keys);
     }
 
     /// Opens `path`, asking first if there are unsaved changes.
     fn request_open(&mut self, path: PathBuf) {
-        if self.tab_mut().doc.is_dirty() {
+        if self.tab().doc.is_dirty() {
             self.confirm = Some(Confirm::OpenPath(path));
         } else {
             self.open(path);
@@ -547,13 +557,14 @@ impl App {
         tab.live.reset();
         tab.parse.reset(&tab.doc);
         tab.banner = None;
+        tab.find.reset_matches();
         self.error = None;
     }
 
     /// Re-reads the open file. If it's gone, the buffer is kept (it may be
     /// the only copy left) and the missing-file banner says so.
     fn reload(&mut self) {
-        let Some(path) = self.tab_mut().doc.path().map(|p| p.to_path_buf()) else {
+        let Some(path) = self.tab().doc.path().map(|p| p.to_path_buf()) else {
             return;
         };
         match Document::open(&path) {
@@ -568,11 +579,11 @@ impl App {
     }
 
     fn save(&mut self) {
-        if self.tab_mut().doc.path().is_none() {
+        if self.tab().doc.path().is_none() {
             return self.spawn_dialog(DialogKind::SaveAs);
         }
         // Never overwrite someone else's changes without asking.
-        if matches!(self.tab_mut().doc.disk_status(), Ok(DiskStatus::Modified)) {
+        if matches!(self.tab().doc.disk_status(), Ok(DiskStatus::Modified)) {
             self.tab_mut().banner = Some(Banner::DiskChanged);
             return;
         }
@@ -586,10 +597,10 @@ impl App {
         // Saving as the open file is a save: don't overwrite changes made
         // by another program without asking.
         let canonical = |p: &std::path::Path| std::fs::canonicalize(p).ok();
-        let same_file = self.tab_mut().doc.path().is_some_and(|open| {
+        let same_file = self.tab().doc.path().is_some_and(|open| {
             open == path || canonical(open).is_some_and(|c| Some(c) == canonical(&path))
         });
-        if same_file && matches!(self.tab_mut().doc.disk_status(), Ok(DiskStatus::Modified)) {
+        if same_file && matches!(self.tab().doc.disk_status(), Ok(DiskStatus::Modified)) {
             self.tab_mut().banner = Some(Banner::DiskChanged);
             return;
         }
@@ -748,10 +759,14 @@ impl App {
         }
         let code_size = settings.code_size.unwrap_or(CODE_SIZE);
         let text_size = settings.text_size.unwrap_or(TEXT_SIZE);
-        self.tab_mut().code.font_size = code_size;
-        self.tab_mut().code.line_height = (code_size * CODE_LINE).round();
-        self.tab_mut().live.font_size = text_size;
-        self.tab_mut().live.line_height = (text_size * TEXT_LINE).round();
+        let code_height = (code_size * CODE_LINE).round();
+        let text_height = (text_size * TEXT_LINE).round();
+        for tab in &mut self.tabs {
+            tab.code.font_size = code_size;
+            tab.code.line_height = code_height;
+            tab.live.font_size = text_size;
+            tab.live.line_height = text_height;
+        }
         // Show what's wrong; once nothing is, take down only our own banner.
         if problems.is_empty() {
             if self.error.is_some() && self.error == self.settings_error {
@@ -886,10 +901,18 @@ impl App {
                 };
             }
             Action::ToggleMinimap => {
-                // Each pane keeps its own minimap setting.
-                match self.tab_mut().focus {
-                    Pane::Code => self.tab_mut().code.show_minimap ^= true,
-                    Pane::Live => self.tab_mut().live.show_minimap ^= true,
+                // The code pane and the live pane each keep their own
+                // minimap. The choice is the window's, so every tab follows.
+                let focus = self.tab().focus;
+                let on = match focus {
+                    Pane::Code => !self.tab().code.show_minimap,
+                    Pane::Live => !self.tab().live.show_minimap,
+                };
+                for tab in &mut self.tabs {
+                    match focus {
+                        Pane::Code => tab.code.show_minimap = on,
+                        Pane::Live => tab.live.show_minimap = on,
+                    }
                 }
                 self.remember_layout();
             }
@@ -902,7 +925,7 @@ impl App {
             Action::SaveAs => self.spawn_dialog(DialogKind::SaveAs),
             Action::Save => self.save(),
             Action::OpenFile => {
-                if self.tab_mut().doc.is_dirty() {
+                if self.tab().doc.is_dirty() {
                     self.confirm = Some(Confirm::Open);
                 } else {
                     self.spawn_dialog(DialogKind::Open);
@@ -1092,17 +1115,17 @@ impl App {
     fn guard_close(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|i| i.viewport().close_requested());
         if requested && !self.logged_close {
-            let cancel = self.tab_mut().doc.is_dirty() && !self.close_allowed;
+            let cancel = self.tab().doc.is_dirty() && !self.close_allowed;
             session::line(&format!(
                 "close_requested dirty={} cancel={cancel}",
-                self.tab_mut().doc.is_dirty()
+                self.tab().doc.is_dirty()
             ));
             self.logged_close = true;
         }
         if !requested {
             self.logged_close = false;
         }
-        if requested && self.tab_mut().doc.is_dirty() && !self.close_allowed {
+        if requested && self.tab().doc.is_dirty() && !self.close_allowed {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.confirm = Some(Confirm::Close);
         }
@@ -1117,11 +1140,7 @@ impl App {
 
     /// Heartbeat, focus changes, and the e2e harness's timed quit.
     fn note_session(&mut self, ctx: &egui::Context) {
-        let path = self
-            .tab_mut()
-            .doc
-            .path()
-            .map(|path| path.display().to_string());
+        let path = self.tab().doc.path().map(|path| path.display().to_string());
         let path = path.as_deref().unwrap_or("untitled");
         if self.focused.is_none() {
             session::line(&format!("first_frame path={path}"));
@@ -1135,7 +1154,7 @@ impl App {
             self.last_beat = Instant::now();
             session::line(&format!(
                 "alive focused={focused} dirty={} path={path}",
-                self.tab_mut().doc.is_dirty()
+                self.tab().doc.is_dirty()
             ));
         }
         if let Some(after) = self.quit_after {
@@ -1159,7 +1178,7 @@ impl App {
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
-        let dirty = if self.tab_mut().doc.is_dirty() {
+        let dirty = if self.tab().doc.is_dirty() {
             "● "
         } else {
             ""
@@ -1181,7 +1200,7 @@ impl App {
                 }
             });
         }
-        let Some(banner) = &self.tab_mut().banner else {
+        let Some(banner) = &self.tab().banner else {
             if action == Some("dismiss") {
                 self.error = None;
             }
@@ -1287,7 +1306,7 @@ impl App {
             self.tab_mut().live.release_focus(ctx);
             ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("file_browser")));
         } else if self.modal_was_open {
-            match self.tab_mut().focus {
+            match self.tab().focus {
                 Pane::Code => self.tab_mut().code.request_focus(ctx),
                 Pane::Live => self.tab_mut().live.request_focus(ctx),
             }
@@ -1383,13 +1402,13 @@ impl App {
             }
             ("save", Confirm::Open) => {
                 self.save();
-                if !self.tab_mut().doc.is_dirty() {
+                if !self.tab().doc.is_dirty() {
                     self.spawn_dialog(DialogKind::Open);
                 }
             }
             ("save", Confirm::OpenPath(path)) => {
                 self.save();
-                if !self.tab_mut().doc.is_dirty() {
+                if !self.tab().doc.is_dirty() {
                     self.open(path);
                 }
             }
@@ -1697,7 +1716,7 @@ impl App {
     /// `old` became `new`: the document, the recent list and the sidebar
     /// follow.
     fn moved(&mut self, old: &Path, new: &Path, was_unchanged: bool) {
-        if let Some(open) = self.tab_mut().doc.path().map(Path::to_path_buf)
+        if let Some(open) = self.tab().doc.path().map(Path::to_path_buf)
             && let Ok(rest) = open.strip_prefix(old)
         {
             let followed = if rest.as_os_str().is_empty() {
@@ -1722,7 +1741,7 @@ impl App {
                 follow(path);
             }
         }
-        if let Some((path, _)) = &mut self.tab_mut().pending_jump {
+        if let Some((path, _)) = &mut self.pending_jump {
             follow(path);
         }
         self.recent.moved(old, new);
@@ -1744,7 +1763,7 @@ impl App {
         });
         let (mut confirm, mut cancel) = (confirm_key, cancel_key);
         let open_inside = self
-            .tab_mut()
+            .tab()
             .doc
             .path()
             .is_some_and(|open| open.starts_with(&path));
@@ -1964,7 +1983,7 @@ impl App {
     fn open_search_hit(&mut self, hit: SearchOpen) {
         match hit {
             SearchOpen::File(path) => {
-                if self.tab_mut().doc.path() != Some(path.as_path()) {
+                if self.tab().doc.path() != Some(path.as_path()) {
                     self.request_open(path);
                 }
             }
@@ -1985,8 +2004,7 @@ impl App {
                     });
                     self.remember(here);
                 } else {
-                    self.tab_mut().pending_jump =
-                        Some((path.clone(), Jump::Select { range, text }));
+                    self.pending_jump = Some((path.clone(), Jump::Select { range, text }));
                     self.request_open(path);
                 }
             }
@@ -2080,7 +2098,7 @@ impl App {
                 self.show_hint(format!("{} doesn't exist", display_name(&path)));
             }
             links::Target::File { path, anchor } => {
-                self.tab_mut().pending_jump = anchor.map(|a| (path.clone(), Jump::Anchor(a)));
+                self.pending_jump = anchor.map(|a| (path.clone(), Jump::Anchor(a)));
                 self.pending_history = Some((path.clone(), here, Travel::Follow));
                 self.request_open(path);
             }
@@ -2134,7 +2152,7 @@ impl App {
                 self.unwind(travel);
             }
             Some(path) if Some(path.as_path()) != open.as_deref() => {
-                self.tab_mut().pending_jump = Some((path.clone(), Jump::Offset(place.offset)));
+                self.pending_jump = Some((path.clone(), Jump::Offset(place.offset)));
                 self.pending_history = Some((path.clone(), here, travel));
                 self.request_open(path.clone());
             }
@@ -2171,7 +2189,7 @@ impl App {
         let Some((path, here, travel)) = self.pending_history.clone() else {
             return;
         };
-        if self.tab_mut().doc.path() == Some(path.as_path()) {
+        if self.tab().doc.path() == Some(path.as_path()) {
             self.pending_history = None;
             self.commit(here, travel);
         } else if self.confirm.is_none() {
@@ -2211,20 +2229,20 @@ impl App {
     /// is open and parsed. Dropped if another file ended up open instead
     /// (the open failed, or the unsaved-changes prompt was cancelled).
     fn apply_pending_jump(&mut self) {
-        let Some((path, jump)) = self.tab().pending_jump.clone() else {
+        let Some((path, jump)) = self.pending_jump.clone() else {
             return;
         };
         let open = self.tab().doc.path().map(Path::to_path_buf);
         if open.as_deref() != Some(path.as_path()) {
             if self.confirm.is_none() {
-                self.tab_mut().pending_jump = None;
+                self.pending_jump = None;
             }
             return;
         }
         if !self.tab().parse.is_settled() {
             return;
         }
-        self.tab_mut().pending_jump = None;
+        self.pending_jump = None;
         match jump {
             Jump::Anchor(anchor) => {
                 self.jump_to_anchor(&anchor);
@@ -2467,12 +2485,12 @@ impl App {
 
 impl App {
     fn measure_step(&mut self, ctx: &egui::Context) {
-        if self.measure.is_none() {
-            return;
-        }
         let settled = self.tab().parse.is_settled();
         let lines = self.tab().doc.line_count();
-        let step = self.measure.as_mut().unwrap().frame(ctx, settled, lines);
+        let Some(m) = self.measure.as_mut() else {
+            return;
+        };
+        let step = m.frame(ctx, settled, lines);
         match step {
             measure::Step::Idle => {}
             measure::Step::ScrollTo(line) => {
@@ -3637,7 +3655,7 @@ mod tests {
     /// Frames until the parse is in and any jump from a followed link is done.
     fn settle(ctx: &egui::Context, app: &mut App, time: &mut f64) {
         let start = Instant::now();
-        while !app.tab().parse.is_settled() || app.tab().pending_jump.is_some() {
+        while !app.tab().parse.is_settled() || app.pending_jump.is_some() {
             drive(ctx, app, time, vec![]);
             assert!(start.elapsed() < Duration::from_secs(5), "never settled");
             std::thread::sleep(Duration::from_millis(2));
@@ -4148,6 +4166,27 @@ mod tests {
         run.key(egui::Key::Z, egui::Modifiers::COMMAND);
         assert_eq!(text(&run.app), "one cat\ntwo cat\n");
         assert!(!run.app.tab().doc.can_undo());
+    }
+
+    #[test]
+    fn f3_after_opening_another_file_searches_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "aaaa aaaa cat\n").unwrap();
+        fs::write(&b, "cat dog\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a));
+        run.key(egui::Key::F, egui::Modifiers::COMMAND);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("cat".into())]);
+        run.frame(vec![]);
+        assert_eq!(run.app.tab().code.selection().range(), 10..13);
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        run.app.open(b);
+        run.settle();
+        run.key(egui::Key::F3, egui::Modifiers::NONE);
+        assert_eq!(text(&run.app), "cat dog\n");
+        assert_eq!(run.app.tab().code.selection().range(), 0..3);
     }
 
     #[test]
