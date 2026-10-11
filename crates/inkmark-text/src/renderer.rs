@@ -666,6 +666,18 @@ impl TextRenderer {
     pub fn cached_lines(&self) -> usize {
         self.lines.len()
     }
+
+    /// Drops shaped lines. The next paint lays out what is on screen again.
+    /// Heights and the scroll anchor live with the view, not here.
+    pub fn release_line_cache(&mut self) {
+        self.lines.clear();
+    }
+
+    /// Source bytes held in the shaped-line cache. This is the text, not
+    /// the glyph meshes, and it is what a memory-pressure trim compares.
+    pub fn cached_line_bytes(&self) -> usize {
+        self.lines.values().map(|line| line.key.text.len()).sum()
+    }
 }
 
 fn layout<'a>(

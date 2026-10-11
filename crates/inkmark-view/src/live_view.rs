@@ -396,6 +396,21 @@ impl LiveView {
         self.selection_current = true;
     }
 
+    /// Uses `cache` instead of starting another decoder thread.
+    pub fn share_images(&mut self, cache: ImageCache) {
+        self.images = Some(cache);
+    }
+
+    /// Drops shaped lines. The scroll anchor and measured heights stay.
+    pub fn release_line_cache(&mut self) {
+        self.text.release_line_cache();
+    }
+
+    /// Source bytes in the shaped-line cache.
+    pub fn cached_line_bytes(&self) -> usize {
+        self.text.cached_line_bytes()
+    }
+
     pub fn reset(&mut self) {
         self.lines.reset();
         self.remeasure.clear();

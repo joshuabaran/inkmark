@@ -32,7 +32,10 @@ enum State {
     Failed(String),
 }
 
-pub(crate) struct ImageCache {
+/// One decoder and one texture map. Clone it into every live view so an
+/// image used by two documents is decoded once.
+#[derive(Clone)]
+pub struct ImageCache {
     states: Arc<Mutex<HashMap<PathBuf, State>>>,
     jobs: Sender<PathBuf>,
 }
@@ -78,7 +81,7 @@ impl ImageCache {
 
     /// The image at `dest` (as written in the Markdown), relative to `base`
     /// (the document's folder). The first request starts loading it.
-    pub fn get(&self, dest: &str, base: Option<&Path>) -> ImageSlot {
+    pub(crate) fn get(&self, dest: &str, base: Option<&Path>) -> ImageSlot {
         let Some(path) = resolve(dest, base) else {
             return ImageSlot::Remote;
         };
@@ -96,6 +99,11 @@ impl ImageCache {
                 ImageSlot::Loading
             }
         }
+    }
+
+    #[cfg(test)]
+    fn stored(&self) -> usize {
+        self.states.lock().expect("image cache poisoned").len()
     }
 }
 
@@ -265,6 +273,25 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn a_clone_is_the_same_cache() {
+        let ctx = egui::Context::default();
+        let cache = ImageCache::new(&ctx);
+        let other = cache.clone();
+        assert!(matches!(
+            cache.get("note.png", Some(Path::new("/notes"))),
+            ImageSlot::Loading
+        ));
+        assert_eq!(other.stored(), 1);
+        // The worker may already have failed the missing file. Either way
+        // the second view must not insert its own entry.
+        assert!(matches!(
+            other.get("note.png", Some(Path::new("/notes"))),
+            ImageSlot::Loading | ImageSlot::Failed(_)
+        ));
+        assert_eq!(cache.stored(), 1);
     }
 
     #[test]

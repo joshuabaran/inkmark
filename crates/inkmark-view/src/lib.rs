@@ -17,6 +17,7 @@ mod tables;
 pub mod theme;
 
 pub use browser::{BrowserOutput, FileBrowser, OpenFile};
+pub use images::ImageCache;
 
 /// A click that follows a link. Ctrl+click opens the preview tab.
 /// A middle click opens a pinned tab.

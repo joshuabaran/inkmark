@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,10 @@ use crate::{DefinitionLabel, MarkdownParser, ParseOutput, normalize_label};
 
 /// Quiet time after the last edit before a full background parse starts.
 pub const DEBOUNCE: Duration = Duration::from_millis(24);
+/// How long a tab that is not showing keeps an in-flight parse. A quick
+/// switch still uses that result. After this, the result is ignored and
+/// the worker goes back to sleep until the tab is shown again.
+const PARK_AFTER: Duration = Duration::from_secs(2);
 /// Regions larger than this skip the local reparse and wait for the
 /// background parse (e.g. edits inside a huge top-level list).
 const LOCAL_REPARSE_LIMIT: usize = 64 * 1024;
@@ -453,6 +458,16 @@ pub struct ParseState {
     revision: u64,
     jobs: Sender<Job>,
     results: Receiver<(u64, u64, ParseOutput)>,
+    /// When false, a finished parse does not wake the UI. The result stays
+    /// in the channel until [`update`](Self::update).
+    awake: Arc<AtomicBool>,
+    /// When the tab last went to sleep. `None` while it is awake, or once
+    /// the in-flight job has been parked.
+    slept_at: Option<Instant>,
+    /// A parked tab does not send another job until it is awake.
+    parked: bool,
+    /// [`park_if_idle`](Self::park_if_idle) waits this long. Tests shorten it.
+    park_after: Duration,
 }
 
 impl ParseState {
@@ -466,6 +481,8 @@ impl ParseState {
         let (jobs, job_rx) = mpsc::channel::<Job>();
         let (result_tx, results) = mpsc::channel();
         let worker_parser = Arc::clone(&parser);
+        let awake = Arc::new(AtomicBool::new(true));
+        let worker_awake = Arc::clone(&awake);
         std::thread::Builder::new()
             .name("inkmark-parse".into())
             .spawn(move || {
@@ -478,7 +495,11 @@ impl ParseState {
                     if result_tx.send((job.generation, job.epoch, output)).is_err() {
                         break;
                     }
-                    on_result();
+                    // A tab that is not showing must not wake the window.
+                    // The result waits until that tab is parsed again.
+                    if worker_awake.load(Ordering::Acquire) {
+                        on_result();
+                    }
                 }
             })
             .expect("spawn parse thread");
@@ -493,6 +514,10 @@ impl ParseState {
             revision: 0,
             jobs,
             results,
+            awake,
+            slept_at: None,
+            parked: false,
+            park_after: PARK_AFTER,
         };
         state.reset(doc);
         state
@@ -528,6 +553,37 @@ impl ParseState {
         self.full_epoch == Some(self.epoch)
     }
 
+    /// `false` for a tab that is not showing. Its worker still finishes the
+    /// job it already has, and does not ask for a frame when that job ends.
+    pub fn set_awake(&mut self, awake: bool) {
+        let was = self.awake.swap(awake, Ordering::Release);
+        if awake {
+            self.slept_at = None;
+            self.parked = false;
+        } else if was {
+            self.slept_at = Some(Instant::now());
+        }
+    }
+
+    /// After two seconds asleep, drop the in-flight job. The worker
+    /// finishes what it started and the result is ignored. The next
+    /// [`update`](Self::update) while awake starts a fresh parse.
+    pub fn park_if_idle(&mut self) {
+        if self.awake.load(Ordering::Acquire) || self.parked {
+            return;
+        }
+        let Some(at) = self.slept_at else {
+            return;
+        };
+        if at.elapsed() < self.park_after {
+            return;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.requested = None;
+        self.parked = true;
+        self.slept_at = None;
+    }
+
     /// Call every frame. Returns how long until it wants to run again (a
     /// pending debounce), if anything is pending.
     pub fn update(&mut self, doc: &Document) -> Option<Duration> {
@@ -544,6 +600,10 @@ impl ParseState {
             self.epoch = doc.epoch();
             self.revision = self.revision.wrapping_add(1);
             self.last_change = now;
+        }
+        // Asleep and parked: do not copy the document onto the worker.
+        if self.parked && !self.awake.load(Ordering::Acquire) {
+            return None;
         }
         if self.full_epoch == Some(self.epoch) || self.requested == Some(self.epoch) {
             return None;
@@ -612,5 +672,81 @@ mod tests {
         .unwrap();
         state.update(&doc);
         assert!(state.revision() > settled);
+    }
+
+    #[test]
+    fn a_sleeping_tab_does_not_wake_and_a_parked_job_is_ignored() {
+        use std::sync::atomic::AtomicUsize;
+
+        let mut doc = Document::from_text("# A\n\nParagraph.\n");
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&wakes);
+        let mut state = ParseState::new(Arc::new(GfmParser), &doc, move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state.is_settled() {
+            assert!(Instant::now() < deadline, "parse never settled");
+            state.update(&doc);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let settled_wakes = wakes.load(Ordering::Relaxed);
+        assert!(settled_wakes > 0);
+
+        state.set_awake(false);
+        let end = doc.len();
+        doc.apply(
+            vec![Edit::insert(end, " more\n")],
+            Selection::caret(end),
+            Selection::caret(end),
+            EditKind::Other,
+        )
+        .unwrap();
+        // The first update only starts the debounce. The second hands the
+        // text to the worker while the tab is asleep.
+        state.update(&doc);
+        std::thread::sleep(DEBOUNCE + Duration::from_millis(20));
+        state.update(&doc);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            settled_wakes,
+            "a background parse asked for a frame"
+        );
+        state.update(&doc);
+        assert!(state.is_settled(), "the background parse did not finish");
+        assert_eq!(wakes.load(Ordering::Relaxed), settled_wakes);
+
+        let end = doc.len();
+        doc.apply(
+            vec![Edit::insert(end, " again\n")],
+            Selection::caret(end),
+            Selection::caret(end),
+            EditKind::Other,
+        )
+        .unwrap();
+        state.update(&doc);
+        std::thread::sleep(DEBOUNCE + Duration::from_millis(20));
+        state.update(&doc);
+        assert_eq!(state.requested, Some(doc.epoch()));
+        state.park_after = Duration::ZERO;
+        state.park_if_idle();
+        assert!(state.parked);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            settled_wakes,
+            "a parked parse asked for a frame"
+        );
+        state.update(&doc);
+        assert!(!state.is_settled(), "a parked result landed");
+        state.set_awake(true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state.is_settled() {
+            assert!(Instant::now() < deadline, "parse did not catch up");
+            state.update(&doc);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(wakes.load(Ordering::Relaxed) > settled_wakes);
     }
 }

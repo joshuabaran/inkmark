@@ -9,11 +9,12 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use egui::{Event, Id, Key, Modifiers, Pos2, RawInput, Rect, UiBuilder, pos2};
 use inkmark_bench::{CountingAlloc, Reporter, allocations, fixtures, iterations};
-use inkmark_buffer::{Document, Selection};
+use inkmark_buffer::{Document, Edit, EditKind, Selection};
 use inkmark_parse::{GfmParser, ParseState};
 use inkmark_view::{CodeView, FileBrowser, LiveView, ScrollPos};
 
@@ -46,6 +47,8 @@ struct Panes {
     live: LiveView,
     doc: Document,
     parse: ParseState,
+    /// Times the parse worker asked for a frame.
+    wakes: Arc<AtomicUsize>,
     mode: Mode,
     time: f64,
     zoom: f32,
@@ -63,7 +66,11 @@ impl Panes {
     fn with_doc(doc: Document, mode: Mode) -> Self {
         let ctx = egui::Context::default();
         let fonts = inkmark_text::Fonts::shared(&ctx);
-        let parse = ParseState::new(Arc::new(GfmParser), &doc, || {});
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::clone(&wakes);
+        let parse = ParseState::new(Arc::new(GfmParser), &doc, move || {
+            wake.fetch_add(1, Ordering::Relaxed);
+        });
         let mut p = Self {
             code: CodeView::with_fonts(fonts.clone(), Id::new("code")),
             live: LiveView::with_fonts(fonts.clone(), Id::new("live")),
@@ -71,6 +78,7 @@ impl Panes {
             ctx,
             doc,
             parse,
+            wakes,
             mode,
             screen: SCREEN,
             time: 0.0,
@@ -876,11 +884,71 @@ fn tab_switch(r: &Reporter, book: &str) {
     run.report(r, "split/tab_switch_5mb", BUDGET, &[]);
 }
 
+/// Five settled 5 MB documents. Switching paints one of them. A background
+/// edit's parse must not ask for a frame. RSS is the process after the run.
+fn five_tabs(r: &Reporter, book: &str) {
+    if !r.wants("tabs") {
+        return;
+    }
+    let mut tabs: Vec<Panes> = (0..5).map(|_| Panes::new(book, Mode::Split)).collect();
+    let mut run = Run::default();
+    for i in 0..iterations(40, 10) {
+        run.push(tabs[i % 5].frame(vec![]));
+    }
+    let before: usize = tabs
+        .iter()
+        .map(|tab| tab.wakes.load(Ordering::Relaxed))
+        .sum();
+    for tab in &mut tabs {
+        tab.parse.set_awake(false);
+    }
+    {
+        let background = &mut tabs[1];
+        let end = background.doc.len();
+        background
+            .doc
+            .apply(
+                vec![Edit::insert(end, "\n")],
+                Selection::caret(end),
+                Selection::caret(end),
+                EditKind::Other,
+            )
+            .expect("background edit");
+        // The edit starts the debounce. The next update hands the text to
+        // the worker. A full parse of this note is about 25 ms, so the wait
+        // is long enough for that job to finish and for a wake to land.
+        background.parse.update(&background.doc);
+        std::thread::sleep(inkmark_parse::DEBOUNCE + Duration::from_millis(20));
+        background.parse.update(&background.doc);
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let during: usize = tabs
+        .iter()
+        .map(|tab| tab.wakes.load(Ordering::Relaxed))
+        .sum();
+    assert_eq!(during, before, "a background parse asked for a frame");
+    {
+        let background = &mut tabs[1];
+        background.parse.update(&background.doc);
+        assert!(
+            background.parse.is_settled(),
+            "the background parse did not finish"
+        );
+    }
+    run.report(
+        r,
+        "tabs/switch_five_5mb",
+        BUDGET,
+        &[("idle_wakes", 0.0), ("rss_mb", rss_mb())],
+    );
+}
+
 fn main() {
     let r = Reporter::new("frames");
     let book = fixtures::load("prose-5mb.md");
     typing(&r, &book);
     tab_switch(&r, &book);
+    five_tabs(&r, &book);
     paced(&r, &book);
     scrolling(&r, &book);
     idle(&r, &book);

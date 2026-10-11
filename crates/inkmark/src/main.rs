@@ -361,6 +361,9 @@ struct App {
     refocus_pane: bool,
     /// Kept so a tab opened later can wake its parse worker and take focus.
     ctx: egui::Context,
+    /// One image decoder for every live view. A picture used by two
+    /// documents is decoded once.
+    images: Option<inkmark_view::ImageCache>,
     mode: Mode,
     /// The last thing that failed (open, save, a dialog), until dismissed.
     error: Option<String>,
@@ -542,6 +545,7 @@ impl App {
             doc_epoch: 0,
             refocus_pane: false,
             ctx: ctx.clone(),
+            images: None,
             mode,
             error: None,
             hint: None,
@@ -1296,7 +1300,8 @@ impl App {
             self.poll_tabs_on_disk();
         }
         // The same one-second wake as before. A background tab does not
-        // ask for another frame unless its parse worker finishes a reload.
+        // ask for a frame: its parse waits until the tab is shown, and the
+        // worker does not call back while the tab is asleep.
         ctx.request_repaint_after(DISK_CHECK_INTERVAL);
     }
 
@@ -3409,7 +3414,64 @@ impl App {
         }
     }
 
+    /// The tab on screen parses. So does a tab whose jump is still waiting
+    /// on its parse. Every other worker sleeps, and after a pause its
+    /// in-flight job is dropped.
+    fn sync_parsers(&mut self) {
+        let pending = self.pending_jump.as_ref().map(|jump| jump.tab);
+        let active = self.active;
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            let awake = index == active || Some(tab.id) == pending;
+            tab.parse.set_awake(awake);
+            if !awake {
+                tab.parse.park_if_idle();
+            }
+        }
+    }
+
+    fn share_images(&mut self, ctx: &egui::Context) {
+        if self.images.is_none() {
+            self.images = Some(inkmark_view::ImageCache::new(ctx));
+        }
+        let Some(cache) = self.images.clone() else {
+            return;
+        };
+        for tab in &mut self.tabs {
+            tab.live.share_images(cache.clone());
+        }
+    }
+
+    /// Shaped-line source text kept across every tab. Past this, tabs that
+    /// are not showing drop their line caches first. The tab on screen
+    /// keeps its own, so switching back to it is still a paint.
+    const LINE_CACHE_BUDGET: usize = 8 * 1024 * 1024;
+
+    fn trim_background_line_caches(&mut self) {
+        self.trim_background_line_caches_over(Self::LINE_CACHE_BUDGET);
+    }
+
+    fn trim_background_line_caches_over(&mut self, budget: usize) {
+        let total: usize = self
+            .tabs
+            .iter()
+            .map(|tab| tab.code.cached_line_bytes() + tab.live.cached_line_bytes())
+            .sum();
+        if total <= budget {
+            return;
+        }
+        let active = self.active;
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            if index == active {
+                continue;
+            }
+            tab.code.release_line_cache();
+            tab.live.release_line_cache();
+        }
+    }
+
     fn panes(&mut self, ui: &mut egui::Ui) {
+        self.sync_parsers();
+        self.share_images(ui.ctx());
         let ctx = ui.ctx().clone();
         let hint = self.tab_mut().live.take_hint();
         if let Some(hint) = hint {
@@ -3616,6 +3678,7 @@ impl App {
         self.confirm_ui(&ctx);
         self.update_title(&ctx);
         self.measure_step(&ctx);
+        self.trim_background_line_caches();
         self.pin_edited_preview();
     }
 }
@@ -8507,5 +8570,53 @@ mod tests {
         }
         assert_eq!(tab_text(&run.app, 0), expected[0]);
         assert_eq!(tab_text(&run.app, 1), expected[1]);
+    }
+
+    #[test]
+    fn a_background_tab_keeps_its_line_cache_until_the_budget_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "# A\n\nAlpha paragraph.\n").unwrap();
+        fs::write(&b, "# B\n\nBeta paragraph.\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a.clone()));
+        run.frame(vec![]);
+        run.app.open_tab(b.clone(), true);
+        run.frame(vec![]);
+        assert!(run.app.tabs[1].code.cached_line_bytes() > 0);
+        run.app.trim_background_line_caches_over(0);
+        assert_eq!(run.app.tabs[0].code.cached_line_bytes(), 0);
+        assert_eq!(run.app.tabs[0].live.cached_line_bytes(), 0);
+        assert!(run.app.tabs[1].code.cached_line_bytes() > 0);
+        // Under the real budget the background cache stays, so a switch
+        // paints lines that were already shaped.
+        run.app.open_tab(a, true);
+        run.frame(vec![]);
+        let kept = run.app.tabs[1].code.cached_line_bytes();
+        run.app.trim_background_line_caches();
+        assert_eq!(run.app.tabs[1].code.cached_line_bytes(), kept);
+    }
+
+    #[test]
+    fn a_background_parse_does_not_ask_for_an_immediate_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "beta\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a));
+        run.app.open_tab(b, true);
+        run.settle();
+        run.frame(vec![]);
+        let delay = run
+            .out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.repaint_delay)
+            .unwrap_or(std::time::Duration::MAX);
+        assert!(
+            delay > std::time::Duration::from_millis(100),
+            "a background tab asked for a frame now ({delay:?})"
+        );
     }
 }
