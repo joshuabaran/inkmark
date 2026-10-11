@@ -14,7 +14,7 @@ use egui::{
     Align2, EventFilter, FontId, Id, Key, Modifiers, Rect, Response, RichText, ScrollArea, Sense,
     Ui, pos2, vec2,
 };
-use inkmark_files::{Entry, Pending, Row, Tree, Watch, list_dir};
+use inkmark_files::{Entry, Kind, Pending, Row, Tree, Watch, list_dir};
 
 use crate::keys::{self, Action};
 use crate::theme::{self, Theme};
@@ -236,15 +236,11 @@ impl FileBrowser {
     }
 
     pub fn row_count(&mut self) -> usize {
-        self.tree.rows().len()
+        self.snaps().len()
     }
 
     pub fn row_names(&mut self) -> Vec<String> {
-        self.tree
-            .rows()
-            .iter()
-            .map(|row| row.name.clone())
-            .collect()
+        self.snaps().into_iter().map(|row| row.name).collect()
     }
 
     /// Where a row was drawn last frame, if it was in view.
@@ -626,10 +622,14 @@ impl FileBrowser {
         }
     }
 
-    /// The selected row's path, if it's still in the tree.
+    /// The selected row's path, if it is still listed. A missing open file
+    /// stays listed after the tree drops it.
     fn selected_path(&mut self) -> Option<PathBuf> {
-        let pos = self.selected_pos()?;
-        Some(self.tree.rows()[pos].path.clone())
+        let selected = self.selected.clone()?;
+        self.snaps()
+            .iter()
+            .any(|row| row.path == selected)
+            .then_some(selected)
     }
 
     /// The folder a row dropped on `row` goes into: the row itself if it's
@@ -643,12 +643,53 @@ impl FileBrowser {
     }
 
     fn snaps(&mut self) -> Vec<Row> {
-        self.tree.rows().to_vec()
+        let mut rows = self.tree.rows().to_vec();
+        let mut missing: Vec<PathBuf> = self
+            .missing
+            .iter()
+            .filter(|path| rows.iter().all(|row| &row.path != *path))
+            .cloned()
+            .collect();
+        missing.sort();
+        for path in missing {
+            let name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            // The parent row's children, when that folder is on screen.
+            // Otherwise the file sits at the end. `index` is not a tree
+            // node: `set_expanded` must not see it.
+            let (depth, insert_at) = path
+                .parent()
+                .and_then(|parent| rows.iter().position(|row| row.path == parent))
+                .map(|pos| {
+                    let depth = rows[pos].depth + 1;
+                    let parent_depth = rows[pos].depth;
+                    let mut end = pos + 1;
+                    while end < rows.len() && rows[end].depth > parent_depth {
+                        end += 1;
+                    }
+                    (depth, end)
+                })
+                .unwrap_or((0, rows.len()));
+            rows.insert(
+                insert_at,
+                Row {
+                    index: usize::MAX,
+                    depth,
+                    name,
+                    path,
+                    kind: Kind::File { openable: true },
+                    expanded: false,
+                },
+            );
+        }
+        rows
     }
 
     fn selected_pos(&mut self) -> Option<usize> {
         let selected = self.selected.clone()?;
-        self.tree.rows().iter().position(|row| row.path == selected)
+        self.snaps().iter().position(|row| row.path == selected)
     }
 
     fn move_by(&mut self, delta: isize) {
@@ -1105,5 +1146,86 @@ mod tests {
         assert!(browser.reveal_path.is_none());
         assert_ne!(browser.selected.as_deref(), Some(pics.as_path()));
         assert_eq!(browser.new_file_dir(), dir.path());
+    }
+
+    #[test]
+    fn a_deleted_open_file_keeps_a_row_marked_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let mut browser = FileBrowser::new(dir.path());
+        let ctx = egui::Context::default();
+        let mut time = 0.0;
+        let start = Instant::now();
+        while !browser.row_names().iter().any(|name| name == "a.md") {
+            time += 1.0 / 60.0;
+            pump(&mut browser, &ctx, time);
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "root was not listed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs::remove_file(&a).unwrap();
+        browser.refresh_dir(dir.path());
+        let start = Instant::now();
+        while browser.row_names().iter().any(|name| name == "a.md") {
+            time += 1.0 / 60.0;
+            pump(&mut browser, &ctx, time);
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "the listing kept the deleted file"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut missing = std::collections::HashSet::new();
+        missing.insert(a.clone());
+        browser.set_missing(&missing);
+        browser.selected = Some(b.clone());
+        browser.move_by(1);
+        assert_eq!(browser.selected.as_deref(), Some(a.as_path()));
+
+        time += 1.0 / 60.0;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_max(pos2(0.0, 0.0), pos2(800.0, 600.0))),
+            time: Some(time),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(input, |ui| {
+            browser.show(ui);
+        });
+        let row = browser
+            .row_rect(&a)
+            .expect("the missing file still has a row");
+        fn centers(shape: &egui::Shape, text: &str, out: &mut Vec<egui::Pos2>) {
+            match shape {
+                egui::Shape::Text(painted) if painted.galley.text() == text => {
+                    out.push(
+                        painted
+                            .galley
+                            .rect
+                            .translate(painted.pos.to_vec2())
+                            .center(),
+                    );
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        centers(shape, text, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut marks = Vec::new();
+        for clip in &out.shapes {
+            centers(&clip.shape, "✕", &mut marks);
+        }
+        assert!(
+            marks.iter().any(|mark| row.contains(*mark)),
+            "the sidebar still shows ✕ after the listing drops the file"
+        );
     }
 }

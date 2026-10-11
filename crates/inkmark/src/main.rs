@@ -187,12 +187,14 @@ enum Banner {
 
 /// A save or discard the user has not answered yet.
 ///
-/// `Close` is the window, and one tab is unsaved. `CloseAll` is the
-/// window, and more than one tab is unsaved. `CloseTab` is that tab only,
-/// by its stable id. The strip index can move before the answer comes back.
+/// `Close` is the window, and one tab is unsaved: the id is that tab, so
+/// the prompt still names it if another tab is showing when the answer
+/// comes back. `CloseAll` is the window, and more than one tab is unsaved.
+/// `CloseTab` is that tab only. The strip index can move before the answer
+/// comes back, so both single-tab questions store the stable id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Confirm {
-    Close,
+    Close(u64),
     CloseAll,
     CloseTab(u64),
 }
@@ -209,7 +211,9 @@ enum AfterSave {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DialogKind {
     Open,
-    SaveAs,
+    /// Save As for this tab. The picker outlives the tab that was on screen
+    /// when it opened.
+    SaveAs(u64),
     Folder,
     /// Pick the folder to move this file or folder into.
     MoveTo(PathBuf),
@@ -217,7 +221,8 @@ enum DialogKind {
 
 enum DialogResult {
     Open(Option<PathBuf>),
-    SaveAs(Option<PathBuf>),
+    /// The tab that opened Save As, and the path it chose.
+    SaveAs(u64, Option<PathBuf>),
     Folder(Option<PathBuf>),
     MoveTo(PathBuf, Option<PathBuf>),
 }
@@ -902,7 +907,9 @@ impl App {
             return;
         }
         if self.tab().doc.path().is_none() {
-            return self.spawn_dialog(DialogKind::SaveAs);
+            let id = self.tab().id;
+            self.spawn_dialog(DialogKind::SaveAs(id));
+            return;
         }
         // Never overwrite someone else's changes without asking.
         if matches!(self.tab().doc.disk_status(), Ok(DiskStatus::Modified)) {
@@ -927,10 +934,11 @@ impl App {
         }
         // Saving as the open file is a save: don't overwrite changes made
         // by another program without asking.
-        let canonical = |p: &std::path::Path| std::fs::canonicalize(p).ok();
-        let same_file = self.tab().doc.path().is_some_and(|open| {
-            open == path || canonical(open).is_some_and(|c| Some(c) == canonical(&path))
-        });
+        let same_file = self
+            .tab()
+            .doc
+            .path()
+            .is_some_and(|open| same_file(open, &path));
         if same_file && matches!(self.tab().doc.disk_status(), Ok(DiskStatus::Modified)) {
             self.tab_mut().banner = Some(Banner::DiskChanged);
             self.tab_mut().disk = Some(Banner::DiskChanged);
@@ -959,10 +967,11 @@ impl App {
         }
     }
 
-    /// Another tab already has `path` open. The active tab does not count.
+    /// Another tab already has `path` open. The tab being saved does not count.
     fn path_open_elsewhere(&self, path: &Path) -> bool {
-        self.tabs.iter().enumerate().any(|(index, tab)| {
-            index != self.active && tab.doc.path().is_some_and(|open| same_file(open, path))
+        let except = self.tabs.get(self.active).map(|tab| tab.id);
+        self.tabs.iter().any(|tab| {
+            Some(tab.id) != except && tab.doc.path().is_some_and(|open| same_file(open, path))
         })
     }
 
@@ -1026,7 +1035,8 @@ impl App {
                         .add_filter("Markdown", MARKDOWN_EXTENSIONS)
                         .pick_file(),
                 ),
-                DialogKind::SaveAs => DialogResult::SaveAs(
+                DialogKind::SaveAs(id) => DialogResult::SaveAs(
+                    id,
                     dialog
                         .add_filter("Markdown", MARKDOWN_EXTENSIONS)
                         .set_file_name("untitled.md")
@@ -1052,7 +1062,7 @@ impl App {
             }
             // Edits may have been made while the dialog was up.
             Ok(DialogResult::Open(Some(path))) => self.request_open(path),
-            Ok(DialogResult::SaveAs(Some(path))) => self.save_as(path),
+            Ok(DialogResult::SaveAs(id, Some(path))) => self.finish_save_as(id, path),
             Ok(DialogResult::Folder(Some(path))) => {
                 self.browser.set_root(path);
                 // The picker can be opened while the sidebar is hidden.
@@ -1060,7 +1070,7 @@ impl App {
                 self.sidebar.save();
                 self.browser.request_focus();
             }
-            Ok(DialogResult::Open(None) | DialogResult::SaveAs(None)) => {
+            Ok(DialogResult::Open(None) | DialogResult::SaveAs(_, None)) => {
                 self.after_save = None;
             }
             Ok(DialogResult::MoveTo(path, Some(dir))) => self.move_entry(path, dir),
@@ -1070,6 +1080,20 @@ impl App {
             }
         }
         self.dialog = None;
+    }
+
+    /// Save As finished. The tab that opened the picker may have been
+    /// switched away from, or closed, while the dialog was up. A missing
+    /// tab writes nothing.
+    fn finish_save_as(&mut self, id: u64, path: PathBuf) {
+        let Some(index) = self.index_of_tab(id) else {
+            self.after_save = None;
+            return;
+        };
+        if index != self.active {
+            self.activate(index);
+        }
+        self.save_as(path);
     }
 
     /// Reads config.toml and the system fonts and applies them: config
@@ -1170,15 +1194,19 @@ impl App {
     }
 
     /// Every open file, not only the one on screen. A clean background file
-    /// is re-read. A dirty one keeps its text and is marked. The banner
-    /// appears when that tab is showing.
+    /// with no disk alert is re-read. One already marked missing or changed
+    /// keeps the buffer, so a path that comes back does not throw away the
+    /// only remaining copy. A dirty one keeps its text and is marked. The
+    /// banner appears when that tab is showing.
     fn poll_tabs_on_disk(&mut self) {
         let active = self.active;
         for index in 0..self.tabs.len() {
             let status = self.tabs[index].doc.disk_status();
             let dirty = self.tabs[index].doc.is_dirty();
             match status {
-                Ok(DiskStatus::Modified) if !dirty && index != active => {
+                Ok(DiskStatus::Modified)
+                    if !dirty && index != active && self.tabs[index].disk.is_none() =>
+                {
                     self.reload_background(index);
                 }
                 Ok(DiskStatus::Modified) => {
@@ -1369,6 +1397,11 @@ impl App {
         if !Self::ctrl_held(ctx) {
             self.end_mru_walk();
         }
+        // The close prompt names one tab. A chord here would switch tabs
+        // under that question, and the answer would land on the wrong file.
+        if self.confirm.is_some() {
+            return;
+        }
         // App chords are taken before a pane sees the key. Matching is
         // exact, so a pane chord that adds Shift or Alt (Ctrl+Alt+1 is a
         // heading, Alt+Shift+Left moves a table column) is left for the pane.
@@ -1445,7 +1478,10 @@ impl App {
             Action::Back => self.go_back(),
             Action::Forward => self.go_forward(),
             Action::OpenFolder => self.spawn_dialog(DialogKind::Folder),
-            Action::SaveAs => self.spawn_dialog(DialogKind::SaveAs),
+            Action::SaveAs => {
+                let id = self.tab().id;
+                self.spawn_dialog(DialogKind::SaveAs(id));
+            }
             Action::Save => self.save(),
             Action::OpenFile => self.spawn_dialog(DialogKind::Open),
             Action::CloseTab => self.close_tab(self.active),
@@ -1694,7 +1730,8 @@ impl App {
                 if index != self.active {
                     self.activate(index);
                 }
-                self.confirm = Some(Confirm::Close);
+                let id = self.tabs[index].id;
+                self.confirm = Some(Confirm::Close(id));
             } else {
                 self.confirm = Some(Confirm::CloseAll);
             }
@@ -1976,7 +2013,7 @@ impl App {
             ui.set_min_width(480.0);
             ui.heading("Recent files");
             ui.add_space(6.0);
-            if let Some(path) = Self::recent_rows(ui, &entries, selected) {
+            if let Some(path) = Self::recent_rows(ui, &entries, selected, false) {
                 chosen = Some(path);
             }
             ui.add_space(6.0);
@@ -1994,7 +2031,14 @@ impl App {
     }
 
     /// Recent-file rows. The clicked path, when a row was clicked.
-    fn recent_rows(ui: &mut egui::Ui, entries: &[PathBuf], selected: usize) -> Option<PathBuf> {
+    /// `reveal` scrolls the selected row into view. The modal list passes
+    /// false; it has no scroll parent.
+    fn recent_rows(
+        ui: &mut egui::Ui,
+        entries: &[PathBuf],
+        selected: usize,
+        reveal: bool,
+    ) -> Option<PathBuf> {
         let mut chosen = None;
         for (i, path) in entries.iter().enumerate() {
             let name = path.file_name().map_or_else(
@@ -2008,6 +2052,9 @@ impl App {
             let missing = if path.exists() { "" } else { "  (missing)" };
             let text = RichText::new(format!("{name}{missing}")).strong();
             let row = ui.selectable_label(i == selected, text).on_hover_text(&dir);
+            if reveal && i == selected {
+                row.scroll_to_me(Some(egui::Align::Center));
+            }
             ui.label(RichText::new(dir).small().weak());
             if row.clicked() {
                 chosen = Some(path.clone());
@@ -2029,6 +2076,7 @@ impl App {
         let ctx = ui.ctx().clone();
         let keys = !self.modal_open() && !self.search.is_open() && !self.browser.has_focus(&ctx);
         let mut open_path = None;
+        let mut reveal = false;
         if keys && !entries.is_empty() {
             let (up, down, enter) = ui.input_mut(|i| {
                 (
@@ -2039,9 +2087,11 @@ impl App {
             });
             if up {
                 self.empty_recent = self.empty_recent.saturating_sub(1);
+                reveal = true;
             }
             if down {
                 self.empty_recent = (self.empty_recent + 1).min(entries.len() - 1);
+                reveal = true;
             }
             if enter {
                 open_path = Some(entries[self.empty_recent].clone());
@@ -2069,7 +2119,19 @@ impl App {
                         }
                     });
                 } else {
-                    chosen = Self::recent_rows(ui, &entries, selected);
+                    // Ten entries are two rows each. A short window clips the
+                    // lower ones unless this list scrolls and follows the
+                    // selection. The hint stays put, under the list.
+                    let hint = 28.0;
+                    let height = (ui.max_rect().bottom() - ui.cursor().min.y - hint).max(40.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("empty_recent")
+                        .auto_shrink([false, false])
+                        .animated(false)
+                        .max_height(height)
+                        .show(ui, |ui| {
+                            chosen = Self::recent_rows(ui, &entries, selected, reveal);
+                        });
                     ui.add_space(6.0);
                     ui.label(RichText::new("Up/Down select · Enter open").small().weak());
                 }
@@ -2090,10 +2152,16 @@ impl App {
         };
         let all = matches!(confirm, Confirm::CloseAll);
         let labels = if all { self.dirty_labels() } else { Vec::new() };
-        let name = if all || self.tabs.is_empty() {
-            String::new()
-        } else {
-            self.file_name()
+        let name = match &confirm {
+            Confirm::CloseAll => String::new(),
+            Confirm::Close(id) | Confirm::CloseTab(id) => {
+                let id = *id;
+                self.tabs
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .map(|tab| tab.title())
+                    .unwrap_or_else(|| "untitled".to_owned())
+            }
         };
         let mut choice = None;
         egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
@@ -2122,7 +2190,13 @@ impl App {
         let Some(choice) = choice else { return };
         self.confirm = None;
         match (choice, confirm) {
-            ("save", Confirm::Close) => {
+            ("save", Confirm::Close(id)) => {
+                let Some(index) = self.index_of_tab(id) else {
+                    return;
+                };
+                if index != self.active {
+                    self.activate(index);
+                }
                 self.after_save = Some(AfterSave::Window);
                 self.save();
             }
@@ -2148,7 +2222,7 @@ impl App {
                     self.close_allowed = true;
                 }
             }
-            ("discard", Confirm::Close | Confirm::CloseAll) => self.close_allowed = true,
+            ("discard", Confirm::Close(_) | Confirm::CloseAll) => self.close_allowed = true,
             ("discard", Confirm::CloseTab(id)) => {
                 if let Some(index) = self.index_of_tab(id) {
                     self.remove_tab(index);
@@ -3408,16 +3482,63 @@ fn binding_tip(keys: &keys::KeyMap, action: Action) -> String {
     }
 }
 
-/// Two paths that name one file. A missing file compares as written,
-/// because it has nothing to canonicalize.
+/// Two paths that name one file. A missing file is the nearest existing
+/// ancestor's canonical path plus the unresolved suffix, so `sub/../draft.md`
+/// and `draft.md` are the same file before either exists.
 fn same_file(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
     }
-    matches!(
-        (std::fs::canonicalize(a), std::fs::canonicalize(b)),
-        (Ok(left), Ok(right)) if left == right
-    )
+    normalized_path(a) == normalized_path(b)
+}
+
+/// `path` with `.` and `..` collapsed, then the longest existing prefix
+/// canonicalized. The missing tail is appended unchanged.
+fn normalized_path(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let collapsed = collapse_dots(&absolute);
+    let mut missing = Vec::new();
+    let mut cursor = collapsed.as_path();
+    loop {
+        if cursor.as_os_str().is_empty() {
+            return collapsed;
+        }
+        if let Ok(canon) = std::fs::canonicalize(cursor) {
+            let mut out = canon;
+            for part in missing.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        let Some(parent) = cursor.parent() else {
+            return collapsed;
+        };
+        if parent == cursor {
+            return collapsed;
+        }
+        if let Some(name) = cursor.file_name() {
+            missing.push(name.to_os_string());
+        }
+        cursor = parent;
+    }
+}
+
+/// Lexical `.` and `..`, without asking the filesystem. An absolute path
+/// cannot climb above its root.
+fn collapse_dots(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() && !out.has_root() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// A file or folder's name for messages.
@@ -5166,6 +5287,34 @@ mod tests {
             self.app.next_disk_check = Instant::now();
             self.frame(vec![]);
         }
+
+        fn frame_sized(&mut self, events: Vec<egui::Event>, size: egui::Vec2) {
+            self.time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            self.run(input);
+        }
+
+        /// `text` was drawn inside the clip that contains it, so a row
+        /// scrolled off the list does not count.
+        fn text_in_view(&self, text: &str) -> bool {
+            fn find(shape: &egui::Shape, text: &str) -> Option<egui::Rect> {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == text => {
+                        Some(t.galley.rect.translate(t.pos.to_vec2()))
+                    }
+                    egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, text)),
+                    _ => None,
+                }
+            }
+            self.out.shapes.iter().any(|clip| {
+                find(&clip.shape, text).is_some_and(|rect| clip.clip_rect.intersects(rect))
+            })
+        }
     }
 
     #[test]
@@ -5411,7 +5560,7 @@ mod tests {
         let mut r = Run::new(dir.path(), Some(path.clone()));
         type_into(&mut r.app, "two\n");
         r.close_window();
-        assert_eq!(r.app.confirm, Some(Confirm::Close));
+        assert_eq!(r.app.confirm, Some(Confirm::Close(r.app.tabs[0].id)));
         assert!(
             r.sent(&ViewportCommand::CancelClose),
             "the close is held back"
@@ -5478,7 +5627,7 @@ mod tests {
         assert_eq!(r.app.tab().doc.path(), Some(b.as_path()));
         assert!(r.app.confirm.is_none());
         r.close_window();
-        assert_eq!(r.app.confirm, Some(Confirm::Close));
+        assert_eq!(r.app.confirm, Some(Confirm::Close(r.app.tabs[0].id)));
         assert_eq!(r.app.tab().doc.path(), Some(a.as_path()));
         assert!(r.sent(&ViewportCommand::CancelClose));
         r.click_text("Cancel");
@@ -7231,6 +7380,204 @@ mod tests {
         assert!(
             marks.iter().any(|mark| b_row.contains(mark.center())),
             "b.md is dirty"
+        );
+    }
+
+    #[test]
+    fn the_close_prompt_stays_on_the_dirty_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(a.clone()));
+        type_into(&mut r.app, "unsaved");
+        r.app.request_open(b.clone());
+        r.frame(vec![]);
+        let dirty = r.app.tabs[0].id;
+        r.close_window();
+        assert_eq!(r.app.confirm, Some(Confirm::Close(dirty)));
+        assert_eq!(r.app.tab().doc.path(), Some(a.as_path()));
+        r.frame(vec![]);
+        assert!(r.text_rect("a.md has unsaved changes.").is_some());
+        r.key(egui::Key::Tab, egui::Modifiers::COMMAND);
+        assert_eq!(
+            r.app.tab().doc.path(),
+            Some(a.as_path()),
+            "Ctrl+Tab does not switch under the prompt"
+        );
+        assert_eq!(r.app.confirm, Some(Confirm::Close(dirty)));
+        r.click_text("Save");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "a\nunsaved");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "b\n");
+        assert!(r.sent(&ViewportCommand::Close));
+    }
+
+    #[test]
+    fn save_as_writes_the_tab_that_opened_the_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(a.clone()));
+        type_into(&mut app, "A");
+        app.request_open(b.clone());
+        type_into(&mut app, "B");
+        let id = app.tab().id;
+        let (hook, kinds) = mpsc::channel();
+        app.dialog_hook = Some(hook);
+        app.spawn_dialog(DialogKind::SaveAs(id));
+        assert_eq!(kinds.try_recv().unwrap(), DialogKind::SaveAs(id));
+        app.activate(0);
+        assert_eq!(app.tab().doc.path(), Some(a.as_path()));
+        let dest = dir.path().join("out.md");
+        let (tx, rx) = mpsc::channel();
+        app.dialog = Some(rx);
+        tx.send(DialogResult::SaveAs(id, Some(dest.clone())))
+            .unwrap();
+        app.poll_dialog(&ctx);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "b\nB");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "a\n");
+        assert_eq!(tab_text(&app, 0), "a\nA");
+        let saved = app.tabs.iter().find(|tab| tab.id == id).unwrap();
+        assert_eq!(saved.doc.path(), Some(dest.as_path()));
+        assert!(!saved.doc.is_dirty());
+
+        let gone = dir.path().join("gone.md");
+        let (tx, rx) = mpsc::channel();
+        app.dialog = Some(rx);
+        tx.send(DialogResult::SaveAs(999, Some(gone.clone())))
+            .unwrap();
+        app.poll_dialog(&ctx);
+        assert!(!gone.exists());
+        assert!(app.after_save.is_none());
+        assert_eq!(fs::read_to_string(&a).unwrap(), "a\n");
+    }
+
+    #[test]
+    fn save_as_refuses_another_spelling_of_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        let via = dir.path().join("sub/../draft.md");
+        let direct = dir.path().join("draft.md");
+        let nested = dir.path().join("sub/missing/../../draft.md");
+        assert!(same_file(&via, &direct));
+        assert!(same_file(&nested, &direct));
+        assert!(!same_file(&dir.path().join("sub/draft.md"), &direct));
+
+        let other = dir.path().join("other.md");
+        fs::write(&other, "other\n").unwrap();
+        let mut app = app(dir.path(), Some(via.clone()));
+        assert!(!direct.exists());
+        app.request_open(other);
+        type_into(&mut app, "x");
+        app.save_as(direct.clone());
+        assert!(
+            app.error.as_deref().unwrap().contains("already open"),
+            "{:?}",
+            app.error
+        );
+        assert!(!direct.exists());
+        assert_eq!(tab_text(&app, 1), "other\nx");
+        assert_eq!(app.tabs[0].doc.path(), Some(via.as_path()));
+    }
+
+    #[test]
+    fn a_missing_background_file_is_not_reloaded_when_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(a.clone()));
+        r.app.request_open(b.clone());
+        r.settle();
+        fs::remove_file(&a).unwrap();
+        r.check_disk_now();
+        assert_eq!(tab_text(&r.app, 0), "a\n");
+        assert!(matches!(r.app.tabs[0].disk, Some(Banner::DiskMissing)));
+        fs::write(&a, "replaced\n").unwrap();
+        r.check_disk_now();
+        assert_eq!(tab_text(&r.app, 0), "a\n");
+        assert!(matches!(r.app.tabs[0].disk, Some(Banner::DiskChanged)));
+        assert!(r.app.tabs[0].banner.is_none());
+        r.click_tab("a.md");
+        assert!(matches!(r.app.tab().banner, Some(Banner::DiskChanged)));
+        assert_eq!(text(&r.app), "a\n");
+    }
+
+    #[test]
+    fn a_reloaded_fold_is_kept_only_when_it_is_still_a_heading() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        let src = "# One\nbody one\n# Two\nbody two\n";
+        fs::write(&a, src).unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(a.clone()));
+        r.click_code_mark("▾");
+        r.click_code_mark("▾");
+        let before = r.app.tab().code.hidden_ranges().to_vec();
+        assert_eq!(before.len(), 2, "{before:?}");
+        r.app.request_open(b.clone());
+        r.settle();
+        let replaced = "plain\nbody one\n# Two\nbody two\n";
+        assert_eq!(replaced.len(), src.len());
+        fs::write(&a, replaced).unwrap();
+        r.check_disk_now();
+        assert_eq!(tab_text(&r.app, 0), replaced);
+        assert!(
+            r.app.tabs[0].code.hidden_ranges().is_empty(),
+            "the body stays visible until the new parse settles"
+        );
+        r.click_tab("a.md");
+        r.settle();
+        let after = r.app.tab().code.hidden_ranges().to_vec();
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert_eq!(after[0], before[1]);
+    }
+
+    #[test]
+    fn the_empty_list_scrolls_the_selected_row_into_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for i in 0..10 {
+            let path = dir.path().join(format!("n{i:02}.md"));
+            fs::write(&path, "x\n").unwrap();
+            paths.push(path);
+        }
+        let mut run = Run::new(dir.path(), Some(paths[0].clone()));
+        for path in paths.iter().skip(1) {
+            run.app.request_open(path.clone());
+        }
+        run.settle();
+        run.app.sidebar.visible = false;
+        while !run.app.tabs.is_empty() {
+            run.key(egui::Key::W, egui::Modifiers::COMMAND);
+        }
+        assert!(run.app.tabs.is_empty());
+        run.ctx
+            .memory_mut(|m| m.surrender_focus(egui::Id::new("file_browser")));
+        let size = egui::vec2(1000.0, 200.0);
+        run.frame_sized(vec![], size);
+        assert_eq!(run.app.empty_recent, 0);
+        for _ in 0..9 {
+            run.frame_sized(
+                vec![shortcut(egui::Key::ArrowDown, egui::Modifiers::NONE)],
+                size,
+            );
+        }
+        run.frame_sized(vec![], size);
+        assert_eq!(run.app.empty_recent, 9);
+        assert!(
+            run.text_in_view("n00.md"),
+            "Down leaves the selected row on screen"
+        );
+        assert!(
+            !run.text_in_view("n09.md"),
+            "the first row scrolls off a short window"
         );
     }
 
