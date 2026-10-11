@@ -338,6 +338,17 @@ impl LiveView {
         self.keys = keys;
     }
 
+    /// The shortcuts this pane was built or last updated with.
+    pub fn keys(&self) -> &keys::KeyMap {
+        &self.keys
+    }
+
+    /// The egui id. A second document uses a different one, so scroll and
+    /// focus stay with the document they belong to.
+    pub fn id(&self) -> Id {
+        self.id
+    }
+
     /// The offset of a link Ctrl+clicked since the last call.
     pub fn take_follow(&mut self) -> Option<usize> {
         self.follow.take()

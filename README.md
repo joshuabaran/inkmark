@@ -173,6 +173,20 @@ inkmark               # browses the current directory and shows recent files
 | Ctrl+Shift+B | Show or hide the outline (`toggle_outline`) |
 | Ctrl+Shift+N | New folder in the selected folder, or the open folder (`new_folder`) |
 | F1 | Show or hide the key bindings (`show_keys`) |
+| Ctrl+W | Close the tab (`close_tab`) |
+| Ctrl+Tab | Switch to the next most recently used tab (`tab_next`) |
+| Ctrl+Shift+Tab | Switch to the previous most recently used tab (`tab_previous`) |
+| Ctrl+PageUp | Switch to the tab on the left (`tab_left`) |
+| Ctrl+PageDown | Switch to the tab on the right (`tab_right`) |
+| Alt+1 | Switch to tab 1 (`tab_1`) |
+| Alt+2 | Switch to tab 2 (`tab_2`) |
+| Alt+3 | Switch to tab 3 (`tab_3`) |
+| Alt+4 | Switch to tab 4 (`tab_4`) |
+| Alt+5 | Switch to tab 5 (`tab_5`) |
+| Alt+6 | Switch to tab 6 (`tab_6`) |
+| Alt+7 | Switch to tab 7 (`tab_7`) |
+| Alt+8 | Switch to tab 8 (`tab_8`) |
+| Alt+9 | Switch to tab 9 (`tab_9`) |
 
 Arrows, Home, End, Page Up, Page Down, Backspace, Enter and Tab edit as
 usual, and holding Shift extends a selection. Those keys are not in the
@@ -261,8 +275,8 @@ otherwise inkmark's own dark or light theme. `INKMARK_THEME=path/to/colors.toml`
 uses an Omarchy-style palette file instead.
 
 Ctrl+click follows a link in either pane. Links to other Markdown files
-(relative to the open file) open them, through the usual unsaved-changes
-prompt; `#heading` jumps by GitHub's anchor rules; a footnote reference
+(relative to the open file) open them in a tab beside this one;
+`#heading` jumps by GitHub's anchor rules; a footnote reference
 jumps to its note; `http`, `https` and `mailto` links open in your
 default app, and so do links to images, PDFs, plain text, audio, video
 and office documents. Anything else (scripts, `.desktop` files, any file
@@ -272,7 +286,8 @@ inkmark keeps your line endings (LF/CRLF) and byte-order mark, saves
 atomically, and never overwrites changes made by other programs without
 asking: if the open file changes on disk, a banner offers **Reload** or
 **Keep mine**; if it's deleted, your text stays and saving recreates it.
-Opening another file or closing with unsaved changes asks first.
+Opening another file keeps the unsaved tab and shows the new file beside
+it. Closing the window with unsaved changes asks first.
 
 ## Develop
 

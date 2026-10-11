@@ -476,11 +476,11 @@ From `~/Projects/inkmark/PRODUCT_REVIEW.md`, outside the repo. This is the order
 | Math | A live-only overlay from the source span, drawn and never written back, and only once a note you have open uses it. Mermaid and other diagrams wait until a document you have open needs them. |
 | Live line length | The live pane wraps to the width of its panel, as the code pane does (changed by CRO-127, 2026-10-08; it was about 70–80 characters). |
 | Reading scroll | Measure a live block before its height can move the scroll position. Estimate only below the viewport. |
-| Unsaved mark | The open file shows ● on its sidebar row, the same mark the footer puts beside the path. |
+| Unsaved mark | Every open dirty file shows ● on its sidebar row, the same mark the footer puts beside the path. |
 
 ### Tabs (2026-10-10)
 
-Joshua approved these on 2026-10-10. They replace the "one document" lock. [CRO-130](https://linear.app/cronch/issue/CRO-130/tabs-multiple-open-documents). T1 (CRO-131) only moves the open document into a `Tab`. One tab, no strip, no new keys.
+Joshua approved these on 2026-10-10. They replace the "one document" lock. [CRO-130](https://linear.app/cronch/issue/CRO-130/tabs-multiple-open-documents). T1 (CRO-131) moves the open document into a `Tab`. T2 (CRO-132) is the strip and the tab keys; preview tabs, dirty close, and session restore stay in later slices.
 
 1. A single click in the sidebar opens a preview tab (italic title). The next single click replaces it. A double click, or any edit, pins it.
 2. A click on a file that is already open focuses that tab. It is never opened twice.
@@ -494,6 +494,8 @@ Joshua approved these on 2026-10-10. They replace the "one document" lock. [CRO-
 10. Trashing an open file from the sidebar keeps the text in the tab and marks it missing, as today. A rename or move follows the tab.
 11. Launching with no file argument reopens the last session's tabs and which one was active: paths, caret, and scroll anchor. Unsaved text is not restored. A file argument opens beside those tabs.
 12. There is no tab limit. A background tab does not parse or paint.
+
+**T2 (CRO-132), as built.** Several pinned tabs. Opening a file focuses the tab that already has it (two spellings of one path count as one), or appends a pinned tab. The blank untitled tab a window starts with is replaced, so launching a file does not leave an empty tab. The strip sits above both panes and is hidden when one tab is open. Ctrl+W, Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+PgUp, Ctrl+PgDn, and Alt+1 through Alt+9 go through `keys.rs`. Ctrl+Shift+T waits for T6. A back or forward step whose tab was closed reopens that file in a new tab at the saved place. Closing a dirty tab, and closing the last tab, is refused with a status hint until T4, which has the Save/Discard prompt, the empty window, and the window-close list. Each tab's panes use their own egui ids. A new tab is built with the window's current keys, font size, line height, and minimap flags.
 
 **Slices, in order**
 
