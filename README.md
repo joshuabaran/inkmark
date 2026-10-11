@@ -235,8 +235,8 @@ new folder keeps the name you type. A blank name, a slash, a backslash,
 `.`, or `..` is refused. Right-click an entry to rename it,
 move it (or drag it onto a folder), move it to the trash, or create a
 file or a folder next to it. Nothing is ever overwritten: a name that's
-taken is refused. If the open file is renamed or moved, it stays open
-with your unsaved edits. The sidebar's width, and whether it is showing,
+taken is refused. If a file open in a tab is renamed or moved, that tab stays open
+with its unsaved edits. Trashing it keeps the text and marks the tab missing. The sidebar's width, and whether it is showing,
 are remembered under `$XDG_STATE_HOME/inkmark`, with the editor layout:
 which of the code and live panes are open, each pane's minimap, the split
 between them, the outline's width, and whether the outline is showing.
@@ -287,7 +287,7 @@ atomically, and never overwrites changes made by other programs without
 asking: if the open file changes on disk, a banner offers **Reload** or
 **Keep mine**; if it's deleted, your text stays and saving recreates it.
 Opening another file keeps the unsaved tab and shows the new file beside
-it. Closing the window with unsaved changes asks first.
+it. Closing the window asks about each unsaved tab, one at a time.
 
 ## Develop
 

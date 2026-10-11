@@ -857,8 +857,8 @@ fn sidebar(r: &Reporter) {
     );
 }
 
-/// A warm 5 MB document shown again. Tabs stay parsed and painted, so a
-/// switch costs a frame of the view that becomes active.
+/// A warm 5 MB view shown again. A switch costs one frame of the view
+/// that becomes active. This does not parse or paint a background tab.
 fn tab_switch(r: &Reporter, book: &str) {
     let mut left = Panes::new(book, Mode::Split);
     let mut right = Panes::new(book, Mode::Split);

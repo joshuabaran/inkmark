@@ -184,9 +184,11 @@ enum Banner {
     DiskMissing,
 }
 
-/// Closing the window with unsaved changes. Opening a file no longer asks:
-/// the edited tab stays, and the file opens beside it. A dirty tab still
-/// cannot be closed until that prompt exists (T4).
+/// Closing the window with unsaved changes. Save writes the tab on screen
+/// and, if another tab is unsaved, asks about that one next. Discard
+/// closes. Cancel stays. Opening a file no longer asks: the edited tab
+/// stays, and the file opens beside it. Closing one dirty tab is still
+/// refused until that prompt exists (T4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Confirm {
     Close,
@@ -303,9 +305,13 @@ impl Tab {
 struct App {
     tabs: Vec<Tab>,
     active: usize,
-    /// Front is the active tab. Ctrl+Tab rotates this list. A click, an
-    /// open, or Alt+1 moves that tab to the front instead.
+    /// Front is the active tab once Ctrl is released. While Ctrl is held,
+    /// [`Self::mru_at`] selects an entry and this order stays put. A click,
+    /// an open, or Alt+1 moves that tab to the front instead.
     mru: Vec<usize>,
+    /// Index into [`Self::mru`] while Ctrl+Tab is held. `None` once the
+    /// walk has settled.
+    mru_at: Option<usize>,
     /// The next tab's egui-id salt. The first tab is 1.
     next_tab_id: u64,
     /// Kept so a tab opened later can wake its parse worker and take focus.
@@ -454,6 +460,7 @@ impl App {
             }],
             active: 0,
             mru: vec![0],
+            mru_at: None,
             next_tab_id: 2,
             ctx: ctx.clone(),
             mode,
@@ -608,25 +615,41 @@ impl App {
         self.focus_active();
     }
 
-    /// Moves `index` to the front of the MRU list.
+    /// Moves `index` to the front of the MRU list and ends a Ctrl+Tab walk.
     fn note_mru(&mut self, index: usize) {
+        self.mru_at = None;
         self.mru.retain(|slot| *slot != index);
         self.mru.insert(0, index);
     }
 
-    /// Ctrl+Tab walks most-recently-used order. The list is rotated and the
-    /// new front becomes active. `note_mru` would undo that rotation.
+    /// Ctrl+Tab walks most-recently-used order. The list stays put while
+    /// Ctrl is held, so a second press walks further. `note_mru` here would
+    /// undo that and only ever toggle the last two tabs.
     fn cycle_mru(&mut self, forward: bool) {
         if self.mru.len() < 2 {
             return;
         }
-        if forward {
-            self.mru.rotate_left(1);
+        let n = self.mru.len();
+        let cursor = self.mru_at.unwrap_or(0);
+        let next = if forward {
+            (cursor + 1) % n
         } else {
-            self.mru.rotate_right(1);
-        }
-        self.active = self.mru[0];
+            (cursor + n - 1) % n
+        };
+        self.mru_at = Some(next);
+        self.active = self.mru[next];
         self.focus_active();
+    }
+
+    /// Ctrl went up: the tab on screen becomes the most recent.
+    fn end_mru_walk(&mut self) {
+        let Some(at) = self.mru_at.take() else {
+            return;
+        };
+        let Some(&index) = self.mru.get(at) else {
+            return;
+        };
+        self.note_mru(index);
     }
 
     /// Ctrl+PgUp / Ctrl+PgDn. `delta` is in strip order, and it wraps.
@@ -665,6 +688,7 @@ impl App {
                 *slot -= 1;
             }
         }
+        self.mru_at = None;
         self.active = self.mru[0];
         self.focus_active();
     }
@@ -789,7 +813,16 @@ impl App {
     fn saved(&mut self) {
         self.tab_mut().banner = None;
         self.error = None;
-        if self.close_after_save {
+        if !self.close_after_save {
+            return;
+        }
+        // The tab just saved may not have been the only unsaved one.
+        // Ask about the next, still in strip order. Discard is what closes
+        // while others remain unsaved.
+        if let Some(index) = self.first_dirty_tab() {
+            self.activate(index);
+            self.confirm = Some(Confirm::Close);
+        } else {
             self.close_allowed = true;
         }
     }
@@ -1051,7 +1084,30 @@ impl App {
         self.layout.save();
     }
 
+    /// Ctrl is down when the modifier state says so, or when this frame's
+    /// key press carries Ctrl. A headless shortcut is only the key event,
+    /// so the event has to count. Releasing Ctrl is a frame with neither.
+    fn ctrl_held(ctx: &egui::Context) -> bool {
+        ctx.input(|input| {
+            if input.modifiers.command || input.modifiers.ctrl {
+                return true;
+            }
+            input.events.iter().any(|event| match event {
+                egui::Event::Key {
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => modifiers.command || modifiers.ctrl,
+                _ => false,
+            })
+        })
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // Releasing Ctrl settles a tab walk before this frame's keys run.
+        if !Self::ctrl_held(ctx) {
+            self.end_mru_walk();
+        }
         // App chords are taken before a pane sees the key. Matching is
         // exact, so a pane chord that adds Shift or Alt (Ctrl+Alt+1 is a
         // heading, Alt+Shift+Left moves a table column) is left for the pane.
@@ -1299,20 +1355,36 @@ impl App {
         }
     }
 
+    /// The first unsaved tab in strip order, if there is one.
+    fn first_dirty_tab(&self) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.doc.is_dirty())
+    }
+
+    /// A dirty tab holds the window open. The first unsaved tab in strip
+    /// order is shown, and Save asks about the next one. Discard closes
+    /// and drops any that remain. T4 replaces this with one dialog that
+    /// names every file.
     fn guard_close(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|i| i.viewport().close_requested());
+        let dirty = self.first_dirty_tab();
         if requested && !self.logged_close {
-            let cancel = self.tab().doc.is_dirty() && !self.close_allowed;
+            let cancel = dirty.is_some() && !self.close_allowed;
             session::line(&format!(
                 "close_requested dirty={} cancel={cancel}",
-                self.tab().doc.is_dirty()
+                dirty.is_some()
             ));
             self.logged_close = true;
         }
         if !requested {
             self.logged_close = false;
         }
-        if requested && self.tab().doc.is_dirty() && !self.close_allowed {
+        if requested
+            && !self.close_allowed
+            && let Some(index) = dirty
+        {
+            if index != self.active {
+                self.activate(index);
+            }
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.confirm = Some(Confirm::Close);
         }
@@ -1584,6 +1656,7 @@ impl App {
                 self.save();
             }
             ("discard", Confirm::Close) => self.close_allowed = true,
+            ("cancel", Confirm::Close) => self.close_after_save = false,
             _ => {}
         }
     }
@@ -1838,11 +1911,11 @@ impl App {
         if !submit {
             return;
         }
-        let was_unchanged = self.unchanged_if_affected(&prompt.path);
+        let followed = self.tabs_under(&prompt.path);
         match rename(&prompt.path, &prompt.name) {
             Ok(new) => {
                 self.rename = None;
-                self.moved(&prompt.path, &new, was_unchanged);
+                self.moved(&prompt.path, &new, &followed);
             }
             Err(e @ (inkmark_files::OpError::Exists(_) | inkmark_files::OpError::Invalid)) => {
                 if let Some(prompt) = &mut self.rename {
@@ -1861,57 +1934,66 @@ impl App {
     }
 
     fn move_entry(&mut self, path: PathBuf, dir: PathBuf) {
-        let was_unchanged = self.unchanged_if_affected(&path);
+        let followed = self.tabs_under(&path);
         match move_into(&path, &dir) {
             Ok(new) if new == path => {}
-            Ok(new) => self.moved(&path, &new, was_unchanged),
+            Ok(new) => self.moved(&path, &new, &followed),
             Err(e) => {
                 self.error = Some(format!("Couldn't move {}: {e}", display_name(&path)));
             }
         }
     }
 
-    /// Whether the open document is `path` or inside it, and matched the
-    /// disk just now (asked before a rename or move changes its ctime).
-    /// `false` when the document isn't affected.
-    fn unchanged_if_affected(&self, path: &Path) -> bool {
-        self.tab()
-            .doc
-            .path()
-            .is_some_and(|open| open.starts_with(path))
-            && matches!(self.tab().doc.disk_status(), Ok(DiskStatus::Unchanged))
+    /// Every tab whose file is `path` or inside it, and whether that tab
+    /// matched the disk just now. Asked before a rename or move changes
+    /// ctime. The bool is false when the disk copy already differs.
+    fn tabs_under(&self, path: &Path) -> Vec<(usize, bool)> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                let open = tab.doc.path()?;
+                if !open.starts_with(path) {
+                    return None;
+                }
+                let unchanged = matches!(tab.doc.disk_status(), Ok(DiskStatus::Unchanged));
+                Some((index, unchanged))
+            })
+            .collect()
     }
 
-    /// `old` became `new`: the document, the recent list and the sidebar
-    /// follow.
-    fn moved(&mut self, old: &Path, new: &Path, was_unchanged: bool) {
-        if let Some(open) = self.tab().doc.path().map(Path::to_path_buf)
-            && let Ok(rest) = open.strip_prefix(old)
-        {
-            let followed = if rest.as_os_str().is_empty() {
+    /// `old` became `new`: every tab on that path, the recent list, and
+    /// the sidebar follow. `followed` is the snapshot from before the
+    /// rename or move.
+    fn moved(&mut self, old: &Path, new: &Path, followed: &[(usize, bool)]) {
+        let relocate = |path: &Path| -> Option<PathBuf> {
+            let rest = path.strip_prefix(old).ok()?;
+            Some(if rest.as_os_str().is_empty() {
                 new.to_path_buf()
             } else {
                 new.join(rest)
+            })
+        };
+        for &(index, was_unchanged) in followed {
+            let Some(open) = self.tabs[index].doc.path().map(Path::to_path_buf) else {
+                continue;
             };
-            self.tab_mut().doc.moved_to(followed, was_unchanged);
+            if let Some(path) = relocate(&open) {
+                self.tabs[index].doc.moved_to(path, was_unchanged);
+            }
         }
         // Places to go back to, and a jump waiting on a file, follow too.
-        let follow = |p: &mut PathBuf| {
-            if let Ok(rest) = p.strip_prefix(old) {
-                *p = if rest.as_os_str().is_empty() {
-                    new.to_path_buf()
-                } else {
-                    new.join(rest)
-                };
-            }
-        };
         for place in self.back.iter_mut().chain(self.forward.iter_mut()) {
-            if let Some(path) = &mut place.path {
-                follow(path);
+            if let Some(path) = &mut place.path
+                && let Some(updated) = relocate(path)
+            {
+                *path = updated;
             }
         }
-        if let Some((path, _)) = &mut self.pending_jump {
-            follow(path);
+        if let Some((path, _)) = &mut self.pending_jump
+            && let Some(updated) = relocate(path)
+        {
+            *path = updated;
         }
         self.recent.moved(old, new);
         for dir in [old.parent(), new.parent()].into_iter().flatten() {
@@ -1932,10 +2014,9 @@ impl App {
         });
         let (mut confirm, mut cancel) = (confirm_key, cancel_key);
         let open_inside = self
-            .tab()
-            .doc
-            .path()
-            .is_some_and(|open| open.starts_with(&path));
+            .tabs
+            .iter()
+            .any(|tab| tab.doc.path().is_some_and(|open| open.starts_with(&path)));
         egui::Modal::new(egui::Id::new("trash")).show(ctx, |ui| {
             ui.set_min_width(420.0);
             ui.heading(format!("Move “{}” to the trash?", display_name(&path)));
@@ -1962,7 +2043,11 @@ impl App {
                         self.browser.refresh_dir(dir);
                     }
                     if open_inside {
-                        self.tab_mut().banner = Some(Banner::DiskMissing);
+                        for tab in &mut self.tabs {
+                            if tab.doc.path().is_some_and(|open| open.starts_with(&path)) {
+                                tab.banner = Some(Banner::DiskMissing);
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -3903,6 +3988,108 @@ mod tests {
         assert!(matches!(app.tab().banner, Some(Banner::DiskMissing)));
     }
 
+    #[test]
+    fn renaming_a_background_tab_keeps_its_edits_on_the_new_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("a.md");
+        let other = dir.path().join("b.md");
+        fs::write(&old, "a\n").unwrap();
+        fs::write(&other, "b\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(old.clone()));
+        type_into(&mut app, "unsaved\n");
+        app.request_open(other.clone());
+        assert_eq!(app.tab().doc.path(), Some(other.as_path()));
+        app.begin_rename(old.clone());
+        app.rename.as_mut().unwrap().name = "renamed.md".into();
+        let mut time = 0.0;
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        let new = dir.path().join("renamed.md");
+        assert!(app.rename.is_none());
+        assert_eq!(app.tabs[0].doc.path(), Some(new.as_path()));
+        assert_eq!(tab_text(&app, 0), "a\nunsaved\n");
+        assert!(app.tabs[0].doc.is_dirty());
+        assert_eq!(app.tab().doc.path(), Some(other.as_path()));
+        app.activate(0);
+        app.next_disk_check = Instant::now();
+        app.check_disk(&ctx);
+        assert!(
+            app.tab().banner.is_none(),
+            "the rename is not a disk change"
+        );
+        app.save();
+        assert_eq!(fs::read_to_string(&new).unwrap(), "a\nunsaved\n");
+        assert!(!old.exists(), "saving must not recreate the old path");
+    }
+
+    #[test]
+    fn moving_a_background_files_folder_follows_that_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        let archive = dir.path().join("archive");
+        fs::create_dir(&notes).unwrap();
+        fs::create_dir(&archive).unwrap();
+        let file = notes.join("a.md");
+        let other = dir.path().join("b.md");
+        fs::write(&file, "a\n").unwrap();
+        fs::write(&other, "b\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(file.clone()));
+        type_into(&mut app, "unsaved\n");
+        app.request_open(other.clone());
+        let (tx, rx) = mpsc::channel();
+        app.dialog = Some(rx);
+        tx.send(DialogResult::MoveTo(notes.clone(), Some(archive.clone())))
+            .unwrap();
+        app.poll_dialog(&ctx);
+        let moved = archive.join("notes/a.md");
+        assert!(moved.exists());
+        assert!(!file.exists());
+        assert_eq!(app.tabs[0].doc.path(), Some(moved.as_path()));
+        assert_eq!(tab_text(&app, 0), "a\nunsaved\n");
+        assert!(app.tabs[0].doc.is_dirty());
+        assert_eq!(app.tab().doc.path(), Some(other.as_path()));
+        app.activate(0);
+        app.save();
+        assert_eq!(fs::read_to_string(&moved).unwrap(), "a\nunsaved\n");
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn trashing_a_background_file_marks_that_tab_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        let other = dir.path().join("b.md");
+        fs::write(&file, "a\n").unwrap();
+        fs::write(&other, "b\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app(dir.path(), Some(file.clone()));
+        type_into(&mut app, "unsaved\n");
+        app.request_open(other.clone());
+        app.trash = Box::new(FolderTrash(bin.path().to_path_buf()));
+        app.trash_confirm = Some(file.clone());
+        let mut time = 0.0;
+        drive(
+            &ctx,
+            &mut app,
+            &mut time,
+            vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert!(!file.exists());
+        assert!(bin.path().join("a.md").exists());
+        assert_eq!(tab_text(&app, 0), "a\nunsaved\n");
+        assert!(matches!(app.tabs[0].banner, Some(Banner::DiskMissing)));
+        assert!(app.tabs[1].banner.is_none());
+        assert_eq!(app.tab().doc.path(), Some(other.as_path()));
+        assert_eq!(text(&app), "b\n");
+    }
+
     /// Frames until the parse is in and any jump from a followed link is done.
     fn settle(ctx: &egui::Context, app: &mut App, time: &mut f64) {
         let start = Instant::now();
@@ -4710,6 +4897,94 @@ mod tests {
         r.close_window();
         assert!(r.app.confirm.is_none());
         assert!(!r.sent(&ViewportCommand::CancelClose));
+    }
+
+    #[test]
+    fn closing_asks_about_a_dirty_tab_that_is_not_showing() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(a.clone()));
+        type_into(&mut r.app, "unsaved");
+        r.app.request_open(b.clone());
+        r.frame(vec![]);
+        assert_eq!(r.app.tab().doc.path(), Some(b.as_path()));
+        assert!(r.app.confirm.is_none());
+        r.close_window();
+        assert_eq!(r.app.confirm, Some(Confirm::Close));
+        assert_eq!(r.app.tab().doc.path(), Some(a.as_path()));
+        assert!(r.sent(&ViewportCommand::CancelClose));
+        r.click_text("Cancel");
+        assert!(r.app.confirm.is_none());
+        assert!(!r.app.close_after_save);
+        assert!(!r.sent(&ViewportCommand::Close));
+        assert_eq!(tab_text(&r.app, 0), "a\nunsaved");
+        r.app.save();
+        r.frame(vec![]);
+        assert!(!r.sent(&ViewportCommand::Close), "a later save stays open");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "a\nunsaved");
+    }
+
+    #[test]
+    fn closing_saves_each_dirty_tab_before_the_window_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+
+        let mut r = Run::new(dir.path(), Some(a.clone()));
+        type_into(&mut r.app, "A");
+        r.app.request_open(b.clone());
+        type_into(&mut r.app, "B");
+        r.close_window();
+        assert_eq!(r.app.tab().doc.path(), Some(a.as_path()));
+        r.click_text("Save");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "a\nA");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "b\n");
+        assert_eq!(r.app.confirm, Some(Confirm::Close));
+        assert_eq!(r.app.tab().doc.path(), Some(b.as_path()));
+        assert!(!r.sent(&ViewportCommand::Close));
+        r.click_text("Save");
+        assert!(r.sent(&ViewportCommand::Close));
+        assert_eq!(fs::read_to_string(&b).unwrap(), "b\nB");
+
+        // Save the first, then Cancel: the window stays, and saving the
+        // rest later does not close it.
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(a.clone()));
+        type_into(&mut r.app, "A");
+        r.app.request_open(b.clone());
+        type_into(&mut r.app, "B");
+        r.close_window();
+        r.click_text("Save");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "a\nA");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "b\n");
+        r.click_text("Cancel");
+        assert!(r.app.confirm.is_none());
+        assert!(!r.app.close_after_save);
+        assert!(!r.sent(&ViewportCommand::Close));
+        assert_eq!(r.app.tab().doc.path(), Some(b.as_path()));
+        assert_eq!(tab_text(&r.app, 1), "b\nB");
+        r.app.save();
+        r.frame(vec![]);
+        assert!(!r.sent(&ViewportCommand::Close));
+        assert_eq!(fs::read_to_string(&b).unwrap(), "b\nB");
+
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(a.clone()));
+        type_into(&mut r.app, "A");
+        r.app.request_open(b.clone());
+        type_into(&mut r.app, "B");
+        r.close_window();
+        r.click_text("Discard");
+        assert!(r.sent(&ViewportCommand::Close));
+        assert_eq!(fs::read_to_string(&a).unwrap(), "a\n");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "b\n");
     }
 
     #[test]
@@ -5954,6 +6229,40 @@ mod tests {
         assert_eq!(text(&run.app), "a\nQ");
         assert_eq!(tab_text(&run.app, 1), "b\n");
         assert_eq!(tab_text(&run.app, 2), "c\n");
+    }
+
+    #[test]
+    fn releasing_ctrl_makes_the_landed_tab_most_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        let c = dir.path().join("c.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        fs::write(&c, "c\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a.clone()));
+        run.app.request_open(b.clone());
+        run.app.request_open(c.clone());
+        run.settle();
+        assert_eq!(run.app.tab().doc.path(), Some(c.as_path()));
+
+        // One press, then Ctrl up: the next press returns to the tab we left.
+        run.key(egui::Key::Tab, egui::Modifiers::COMMAND);
+        assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
+        run.frame(vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+        run.key(egui::Key::Tab, egui::Modifiers::COMMAND);
+        assert_eq!(run.app.tab().doc.path(), Some(c.as_path()));
+        run.frame(vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+
+        // Held across two presses, the walk continues past b. Releasing
+        // lands on a, and the next press returns to where that walk started.
+        run.key(egui::Key::Tab, egui::Modifiers::COMMAND);
+        assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
+        run.key(egui::Key::Tab, egui::Modifiers::COMMAND);
+        assert_eq!(run.app.tab().doc.path(), Some(a.as_path()));
+        run.frame(vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+        run.key(egui::Key::Tab, egui::Modifiers::COMMAND);
+        assert_eq!(run.app.tab().doc.path(), Some(c.as_path()));
     }
 
     #[test]
