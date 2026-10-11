@@ -729,8 +729,9 @@ fn ctrl_click_on_a_link_reports_it_and_leaves_the_caret() {
     s.hold(Modifiers::COMMAND);
     s.click(on_link);
     s.hold(Modifiers::NONE);
-    let at = s.live.take_follow().expect("Ctrl+click follows the link");
-    assert!(at < src.find("](").unwrap(), "{at}");
+    let click = s.live.take_follow().expect("Ctrl+click follows the link");
+    assert!(!click.pin);
+    assert!(click.at < src.find("](").unwrap(), "{}", click.at);
     assert_eq!(
         s.live.selection(),
         Selection::caret(caret),
@@ -746,7 +747,7 @@ fn ctrl_click_on_a_link_reports_it_and_leaves_the_caret() {
     s.hold(Modifiers::COMMAND);
     s.click(pos2(30.0, 10.0));
     s.hold(Modifiers::NONE);
-    assert!(s.code.take_follow().is_some());
+    assert!(s.code.take_follow().is_some_and(|click| !click.pin));
 }
 
 #[test]

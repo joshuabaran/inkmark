@@ -21,11 +21,19 @@ use crate::theme::{self, Theme};
 
 const ROW_H: f32 = 22.0;
 
+/// A file the sidebar asked to open. `pin` is a double click; a single
+/// click or Enter leaves it false so the app can use the preview tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenFile {
+    pub path: PathBuf,
+    pub pin: bool,
+}
+
 #[derive(Default)]
 pub struct BrowserOutput {
     /// A Markdown file the user asked to open. The app focuses that file's
     /// tab, or opens a new one.
-    pub open_file: Option<PathBuf>,
+    pub open_file: Option<OpenFile>,
     /// The Open Folder… button. The app shows the portal folder picker.
     pub open_folder: bool,
     /// New file, in the selected folder or the root.
@@ -111,6 +119,12 @@ pub struct FileBrowser {
     theme: std::sync::Arc<Theme>,
     /// Shortcuts, shared with the editor panes and the app shell.
     keys: keys::KeyMap,
+    /// The last primary click on a row: its path, and the `Ui` input time.
+    /// The next primary click on that same path, inside the double-click
+    /// window, pins. A middle click does not update this. egui's own count
+    /// is global to the pointer, so another row or another button inside
+    /// the window would otherwise count as a double or a triple.
+    last_primary_click: Option<(PathBuf, f64)>,
 }
 
 impl FileBrowser {
@@ -145,6 +159,7 @@ impl FileBrowser {
             ctx: None,
             theme: std::sync::Arc::new(Theme::dark()),
             keys: keys::KeyMap::builtin(),
+            last_primary_click: None,
         }
     }
 
@@ -759,12 +774,30 @@ impl FileBrowser {
             return;
         };
         let row = self.snaps()[pos].clone();
-        self.activate_row(&row, output);
+        self.activate_row(&row, output, false);
     }
 
-    fn activate_row(&mut self, row: &Row, output: &mut BrowserOutput) {
+    /// Records a primary click on `path`. True when the previous primary
+    /// click was this same path and still inside the double-click window.
+    fn repeats_primary_click(&mut self, ui: &Ui, path: &Path) -> bool {
+        let now = ui.input(|input| input.time);
+        let delay = ui
+            .ctx()
+            .options(|options| options.input_options.max_double_click_delay);
+        let again = self
+            .last_primary_click
+            .as_ref()
+            .is_some_and(|(prev, at)| prev == path && now >= *at && now - *at < delay);
+        self.last_primary_click = Some((path.to_path_buf(), now));
+        again
+    }
+
+    fn activate_row(&mut self, row: &Row, output: &mut BrowserOutput, pin: bool) {
         if row.kind.openable() {
-            output.open_file = Some(row.path.clone());
+            output.open_file = Some(OpenFile {
+                path: row.path.clone(),
+                pin,
+            });
         } else if row.kind.is_dir() && !row.kind.looped() {
             self.tree.set_expanded(row.index, !row.expanded);
         }
@@ -778,7 +811,7 @@ impl FileBrowser {
         let mut area = ScrollArea::vertical()
             .auto_shrink([false, false])
             .id_salt(self.id);
-        let mut clicked = None;
+        let mut clicked: Option<(usize, bool)> = None;
         let mut menu = None;
         let mut dropped = None;
         ui.scope(|ui| {
@@ -807,8 +840,14 @@ impl FileBrowser {
                     let row = &rows[index];
                     if let Some(response) = self.paint_row(ui, row) {
                         self.row_rects.insert(row.path.clone(), response.rect);
+                        // A double click is two primary clicks on this path.
+                        // egui's count does not remember the row, and another
+                        // button inside the window advances it too.
                         if response.clicked() {
-                            clicked = Some(index);
+                            let path = row.path.clone();
+                            let openable = row.kind.openable();
+                            let again = self.repeats_primary_click(ui, &path);
+                            clicked = Some((index, again && openable));
                         }
                         response.dnd_set_drag_payload(Dragged(row.path.clone()));
                         let target = Self::drop_dir(row);
@@ -863,11 +902,11 @@ impl FileBrowser {
                 }
             });
         });
-        if let Some(index) = clicked {
+        if let Some((index, pin)) = clicked {
             let row = rows[index].clone();
             self.selected = Some(row.path.clone());
             ui.memory_mut(|m| m.request_focus(self.id));
-            self.activate_row(&row, output);
+            self.activate_row(&row, output, pin);
         }
         output.dropped = output.dropped.take().or(dropped);
         match menu {

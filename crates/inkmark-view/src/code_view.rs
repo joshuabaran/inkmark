@@ -73,7 +73,7 @@ pub struct CodeView {
     /// A scroll position set from outside, applied after the next sync.
     pending_scroll: Option<ScrollPos>,
     /// A link was Ctrl+clicked at this offset; the app follows it.
-    follow: Option<usize>,
+    follow: Option<crate::LinkClick>,
     /// Colors, refreshed from the context every frame.
     theme: std::sync::Arc<Theme>,
     /// The caret at this offset is at the end of a row that wrapped
@@ -274,8 +274,8 @@ impl CodeView {
         self.pending_reveal = true;
     }
 
-    /// The offset of a link Ctrl+clicked since the last call.
-    pub fn take_follow(&mut self) -> Option<usize> {
+    /// A link click since the last call. `pin` is a middle click.
+    pub fn take_follow(&mut self) -> Option<crate::LinkClick> {
         self.follow.take()
     }
 
@@ -439,17 +439,28 @@ impl CodeView {
             .as_deref()
             .map(ParseState::output)
             .filter(|p| p.map.len() == doc.len());
-        let link = crate::link_under_pointer(ui, &response, current, |pos| {
-            self.offset_at(doc, frame, pos)
-        });
+        let pinned = {
+            let mut offset_at = |pos| self.offset_at(doc, frame, pos);
+            crate::middle_clicked_link(&response, current, &mut offset_at)
+        };
+        let mut followed = false;
+        if let Some(at) = pinned {
+            self.follow = Some(crate::LinkClick { at, pin: true });
+            followed = true;
+        }
+        let link = {
+            let mut offset_at = |pos| self.offset_at(doc, frame, pos);
+            crate::link_under_pointer(ui, &response, current, &mut offset_at)
+        };
         // Over a link with Ctrl held, clicks follow it and nothing else.
         match link {
             Some((at, pressed)) => {
-                if pressed {
-                    self.follow = Some(at);
+                if pressed && !followed {
+                    self.follow = Some(crate::LinkClick { at, pin: false });
                 }
             }
-            None => self.handle_pointer(ui, &response, doc, frame),
+            None if !followed => self.handle_pointer(ui, &response, doc, frame),
+            None => {}
         }
         let bar = Rect::from_min_max(pos2(frame.bar_left, rect.top()), rect.max);
         let mut minimap_hovered = false;

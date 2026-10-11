@@ -258,7 +258,7 @@ pub struct LiveView {
     /// A short explanation for a key that did nothing, for the status bar.
     hint: Option<&'static str>,
     /// A link was Ctrl+clicked at this offset; the app follows it.
-    follow: Option<usize>,
+    follow: Option<crate::LinkClick>,
     /// The table the caret is in: its start, and its text when the caret
     /// came in. Leaving it changed re-pads it.
     table_visit: Option<(usize, String)>,
@@ -349,8 +349,8 @@ impl LiveView {
         self.id
     }
 
-    /// The offset of a link Ctrl+clicked since the last call.
-    pub fn take_follow(&mut self) -> Option<usize> {
+    /// A link click since the last call. `pin` is a middle click.
+    pub fn take_follow(&mut self) -> Option<crate::LinkClick> {
         self.follow.take()
     }
 
@@ -599,18 +599,30 @@ impl LiveView {
             self.preedit.clear();
         }
         let parse = state.output();
-        let link = crate::link_under_pointer(ui, &response, Some(parse), |pos| {
-            self.offset_at(doc, parse, frame, pos)
-        });
+        let pinned = {
+            let mut offset_at = |pos| self.offset_at(doc, parse, frame, pos);
+            crate::middle_clicked_link(&response, Some(parse), &mut offset_at)
+        };
+        let mut followed = false;
+        if let Some(at) = pinned {
+            self.follow = Some(crate::LinkClick { at, pin: true });
+            followed = true;
+        }
+        let link = {
+            let mut offset_at = |pos| self.offset_at(doc, parse, frame, pos);
+            crate::link_under_pointer(ui, &response, Some(parse), &mut offset_at)
+        };
         // Over a link with Ctrl held, clicks follow it and nothing else
         // (not even the release half of a double click).
         match link {
             Some((at, pressed)) => {
-                if pressed {
-                    self.follow = Some(at);
+                if pressed && !followed {
+                    self.follow = Some(crate::LinkClick { at, pin: false });
                 }
             }
-            None if !box_clicked => self.handle_pointer(ui, &response, doc, parse, frame),
+            None if !box_clicked && !followed => {
+                self.handle_pointer(ui, &response, doc, parse, frame)
+            }
             None => {}
         }
         if self.context_menu(&response, doc, state, frame) {

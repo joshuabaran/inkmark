@@ -51,7 +51,7 @@ mod session;
 mod tabs;
 
 use findbar::FindState;
-use folder_search::{FolderSearch, SearchOpen};
+use folder_search::{FolderSearch, SearchChoice, SearchOpen};
 use gotoline::GoToLine;
 pub(crate) use layout::Mode;
 mod sidebar;
@@ -256,6 +256,26 @@ enum Jump {
     },
 }
 
+/// A caret placement waiting on the tab an open landed in. Applied once
+/// that tab's parse has settled, even if another tab is showing. Dropped
+/// if that tab is gone or its file is no longer `path`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingJump {
+    tab: u64,
+    path: PathBuf,
+    jump: Jump,
+}
+
+/// A history change waiting on the tab an open landed in. Committed once
+/// that tab is open on `path`, undone if the open failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingHistory {
+    tab: u64,
+    path: PathBuf,
+    here: Place,
+    travel: Travel,
+}
+
 #[derive(Clone)]
 struct RenamePrompt {
     path: PathBuf,
@@ -297,9 +317,8 @@ struct Tab {
     disk: Option<Banner>,
     /// Query and matches for this document. The bar's open flag is on `App`.
     find: FindState,
-    /// A preview tab is replaced by the next single click. T3 sets this.
-    /// Until then every tab is pinned. The strip still reads it, so a
-    /// preview title is italic when one exists.
+    /// Replaced by the next preview open. A double click or an edit clears
+    /// it. The strip draws the title in italic while it is set.
     preview: bool,
 }
 
@@ -334,6 +353,12 @@ struct App {
     mru_at: Option<usize>,
     /// The next tab's egui-id salt. The first tab is 1.
     next_tab_id: u64,
+    /// Epoch of the active document after the last open or tab switch.
+    /// An edit moves it, which pins a preview tab.
+    doc_epoch: u64,
+    /// The click that opened a tab focuses the sidebar for that pass.
+    /// The next frame puts focus on the opened tab's pane.
+    refocus_pane: bool,
     /// Kept so a tab opened later can wake its parse worker and take focus.
     ctx: egui::Context,
     mode: Mode,
@@ -345,13 +370,10 @@ struct App {
     back: Vec<Place>,
     /// Places gone back from, most recent last (Alt+Right).
     forward: Vec<Place>,
-    /// A history change waiting on a file being opened: committed once that
-    /// file is open, undone if the open was cancelled or failed.
-    pending_history: Option<(PathBuf, Place, Travel)>,
-    /// A caret placement waiting on an open. The tab that open lands in is
-    /// activated immediately, so this still names the file on screen.
-    /// Dropped if that open fails.
-    pending_jump: Option<(PathBuf, Jump)>,
+    /// A history change waiting on the tab an open landed in.
+    pending_history: Option<PendingHistory>,
+    /// A caret placement waiting on the tab an open landed in.
+    pending_jump: Option<PendingJump>,
     /// Tests record URLs here instead of starting a browser.
     #[cfg(test)]
     opened_urls: Vec<String>,
@@ -517,6 +539,8 @@ impl App {
             mru: vec![0],
             mru_at: None,
             next_tab_id: 2,
+            doc_epoch: 0,
+            refocus_pane: false,
             ctx: ctx.clone(),
             mode,
             error: None,
@@ -609,15 +633,26 @@ impl App {
     /// tab. The one blank untitled tab a window starts with is replaced, so
     /// launching a file does not leave an empty tab beside it.
     fn request_open(&mut self, path: PathBuf) {
-        if let Some(index) = self.tab_index(&path) {
-            self.recent.add(&path);
-            self.activate(index);
-            return;
-        }
-        self.open(path);
+        self.open_tab(path, true);
     }
 
     fn open(&mut self, path: PathBuf) {
+        self.open_tab(path, true);
+    }
+
+    /// `pin` keeps the tab. Otherwise the file goes in the one preview tab
+    /// (italic title), which the next preview open replaces. A file that is
+    /// already open is focused, and a pin request pins that tab.
+    fn open_tab(&mut self, path: PathBuf, pin: bool) {
+        self.pin_edited_preview();
+        if let Some(index) = self.tab_index(&path) {
+            self.recent.add(&path);
+            if pin {
+                self.tabs[index].preview = false;
+            }
+            self.activate(index);
+            return;
+        }
         let doc = match Document::open(&path) {
             Ok(doc) => doc,
             // A path that doesn't exist yet becomes a new file there.
@@ -633,16 +668,29 @@ impl App {
         };
         // Only files that opened (or are deliberately new) are remembered.
         self.recent.add(&path);
-        if let Some(index) = self.tab_index(&path) {
-            self.activate(index);
-            return;
+        if !pin && let Some(index) = self.tabs.iter().position(|tab| tab.preview) {
+            // An edit pins a preview, and so does an unanswered disk alert.
+            // Replacing the slot would drop the only buffer of a missing file.
+            if self.tabs[index].doc.is_dirty() || self.tabs[index].disk.is_some() {
+                self.tabs[index].preview = false;
+            } else {
+                self.activate(index);
+                self.replace_document(doc);
+                self.tabs[self.active].preview = true;
+                self.focus_active();
+                return;
+            }
         }
         if self.sole_blank_tab() {
             self.replace_document(doc);
+            self.tabs[self.active].preview = !pin;
             self.note_mru(self.active);
             self.focus_active();
         } else {
             self.push_tab(doc);
+            if !pin {
+                self.tabs[self.active].preview = true;
+            }
         }
     }
 
@@ -666,10 +714,43 @@ impl App {
         if index >= self.tabs.len() {
             return;
         }
+        let switched = index != self.active;
+        if switched {
+            self.pin_edited_preview();
+        }
         self.active = index;
         self.note_mru(index);
         self.reveal_disk();
         self.focus_active();
+        if switched {
+            self.remember_epoch();
+        }
+    }
+
+    /// The active document's epoch, so a later edit can pin a preview.
+    fn remember_epoch(&mut self) {
+        self.doc_epoch = self
+            .tabs
+            .get(self.active)
+            .map(|tab| tab.doc.epoch())
+            .unwrap_or(0);
+    }
+
+    /// An edit since the last open or tab switch pins the preview tab.
+    fn pin_edited_preview(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if tab.preview && tab.doc.epoch() != self.doc_epoch {
+            self.tabs[self.active].preview = false;
+        }
+    }
+
+    /// A middle click asked to pin, and the destination is this document.
+    fn pin_if(&mut self, pin: bool) {
+        if pin {
+            self.tab_mut().preview = false;
+        }
     }
 
     /// The on-screen tab shows a disk banner it picked up in the background.
@@ -703,10 +784,21 @@ impl App {
         } else {
             (cursor + n - 1) % n
         };
+        let index = self.mru[next];
+        let leaving = self.active;
+        if index != leaving {
+            // The tab we leave keeps a pin if this frame edited it.
+            // Remembering the landed tab stops the frame-end check from
+            // pinning a preview that was only switched to.
+            self.pin_edited_preview();
+        }
         self.mru_at = Some(next);
-        self.active = self.mru[next];
+        self.active = index;
         self.reveal_disk();
         self.focus_active();
+        if index != leaving {
+            self.remember_epoch();
+        }
     }
 
     /// Ctrl went up: the tab on screen becomes the most recent.
@@ -762,6 +854,7 @@ impl App {
         if index >= self.tabs.len() {
             return;
         }
+        let shown = self.tabs.get(self.active).map(|tab| tab.id);
         self.tabs.remove(index);
         self.mru.retain(|slot| *slot != index);
         for slot in &mut self.mru {
@@ -773,6 +866,7 @@ impl App {
         if self.tabs.is_empty() {
             self.active = 0;
             self.mru.clear();
+            self.doc_epoch = 0;
             self.confirm = None;
             self.after_save = None;
             self.find_open = false;
@@ -782,6 +876,13 @@ impl App {
             return;
         }
         self.active = self.mru[0];
+        // The closed tab is already gone. Remember the landed document
+        // when it is a different tab, and do not pin it: that would compare
+        // its epoch with the tab we just left. Closing a background tab
+        // keeps the same document, so an edit in this frame can still pin it.
+        if self.tabs.get(self.active).map(|tab| tab.id) != shown {
+            self.remember_epoch();
+        }
         self.reveal_disk();
         self.focus_active();
     }
@@ -796,8 +897,12 @@ impl App {
 
     fn focus_active(&mut self) {
         if self.tabs.is_empty() {
+            self.refocus_pane = false;
             return;
         }
+        // A sidebar click focuses the tree in the same pass, after this
+        // request, so the next frame asks again once that click is over.
+        self.refocus_pane = true;
         let pane = self.tab().focus;
         let ctx = self.ctx.clone();
         self.focus_pane(&ctx, pane);
@@ -868,6 +973,7 @@ impl App {
         if was_empty {
             self.recent_list = None;
         }
+        self.remember_epoch();
         self.focus_active();
     }
 
@@ -881,6 +987,7 @@ impl App {
         tab.disk = None;
         tab.find.reset_matches();
         self.error = None;
+        self.remember_epoch();
     }
 
     /// Re-reads the open file. If it's gone, the buffer is kept (it may be
@@ -1674,7 +1781,11 @@ impl App {
 
     /// Selects `selection` in the focused pane and mirrors it to the other.
     fn show_match(&mut self, selection: Selection) {
-        let tab = self.tab_mut();
+        self.show_match_in(self.active, selection);
+    }
+
+    fn show_match_in(&mut self, index: usize, selection: Selection) {
+        let tab = &mut self.tabs[index];
         match tab.focus {
             Pane::Code => {
                 tab.code.set_selection(selection);
@@ -2566,10 +2677,20 @@ impl App {
                 *path = updated;
             }
         }
-        if let Some((path, _)) = &mut self.pending_jump
-            && let Some(updated) = relocate(path)
+        if let Some(pending) = &mut self.pending_jump
+            && let Some(updated) = relocate(&pending.path)
         {
-            *path = updated;
+            pending.path = updated;
+        }
+        if let Some(pending) = &mut self.pending_history {
+            if let Some(updated) = relocate(&pending.path) {
+                pending.path = updated;
+            }
+            if let Some(path) = pending.here.path.as_mut()
+                && let Some(updated) = relocate(path)
+            {
+                *path = updated;
+            }
         }
         self.recent.moved(old, new);
         for dir in [old.parent(), new.parent()].into_iter().flatten() {
@@ -2899,45 +3020,39 @@ impl App {
     }
 
     /// A folder-search row. The same file selects the match; another file
-    /// opens, and the match is selected once that file is parsed.
-    fn open_search_hit(&mut self, hit: SearchOpen) {
-        if self.tabs.is_empty() {
-            match hit {
-                SearchOpen::File(path) => self.request_open(path),
-                SearchOpen::Match { path, range, text } => {
-                    self.pending_jump = Some((path.clone(), Jump::Select { range, text }));
-                    self.request_open(path);
-                }
+    /// opens in the preview tab, or a pinned tab when `pin` is set. The
+    /// match is selected in the tab that open lands in.
+    fn open_search_hit(&mut self, hit: SearchChoice) {
+        let SearchChoice { open, pin } = hit;
+        let (path, jump) = match open {
+            SearchOpen::File(path) => (path, None),
+            SearchOpen::Match { path, range, text } => (path, Some(Jump::Select { range, text })),
+        };
+        if !self.tabs.is_empty() && self.tab().doc.path() == Some(path.as_path()) {
+            if pin {
+                self.tab_mut().preview = false;
             }
+            let Some(Jump::Select { range, text }) = jump else {
+                return;
+            };
+            // Field borrow, so `search` and the document are borrowed together.
+            let located = self
+                .search
+                .locate(&self.tabs[self.active].doc, range, &text);
+            let Some(range) = located else {
+                return;
+            };
+            let here = self.here();
+            self.show_match(Selection {
+                anchor: range.start,
+                head: range.end,
+            });
+            self.remember(here);
             return;
         }
-        match hit {
-            SearchOpen::File(path) => {
-                if self.tab().doc.path() != Some(path.as_path()) {
-                    self.request_open(path);
-                }
-            }
-            SearchOpen::Match { path, range, text } => {
-                let same = self.tab().doc.path() == Some(path.as_path());
-                if same {
-                    // Field borrow, so `search` and the document are borrowed together.
-                    let located = self
-                        .search
-                        .locate(&self.tabs[self.active].doc, range, &text);
-                    let Some(range) = located else {
-                        return;
-                    };
-                    let here = self.here();
-                    self.show_match(Selection {
-                        anchor: range.start,
-                        head: range.end,
-                    });
-                    self.remember(here);
-                } else {
-                    self.pending_jump = Some((path.clone(), Jump::Select { range, text }));
-                    self.request_open(path);
-                }
-            }
+        self.open_tab(path.clone(), pin);
+        if let Some(jump) = jump {
+            self.remember_open(path, Some(jump), None);
         }
     }
 
@@ -2945,8 +3060,8 @@ impl App {
         if output.open_folder {
             self.spawn_dialog(DialogKind::Folder);
         }
-        if let Some(path) = &output.open_file {
-            self.request_open(path.clone());
+        if let Some(open) = &output.open_file {
+            self.open_tab(open.path.clone(), open.pin);
         }
         if output.new_file {
             self.begin_new_file();
@@ -2975,7 +3090,14 @@ impl App {
     }
 
     /// Follows the link at `at` in the open document (Ctrl+click).
+    /// Another file opens in the preview tab.
+    #[cfg(test)]
     fn follow(&mut self, at: usize) {
+        self.follow_link(at, false);
+    }
+
+    /// Follows the link at `at`. `pin` opens another file in a new pinned tab.
+    fn follow_link(&mut self, at: usize, pin: bool) {
         let link = {
             let tab = self.tab();
             inkmark_parse::link_at(&tab.doc, tab.parse.output(), at)
@@ -2986,6 +3108,7 @@ impl App {
         let here = self.here();
         let dest = match link {
             inkmark_parse::Link::Footnote(label) => {
+                self.pin_if(pin);
                 let offset = {
                     let tab = self.tab();
                     inkmark_parse::footnote_offset(&tab.doc, tab.parse.output(), &label)
@@ -3013,6 +3136,7 @@ impl App {
                 self.open_external(path.to_string_lossy().into_owned());
             }
             links::Target::Anchor(anchor) => {
+                self.pin_if(pin);
                 if self.jump_to_anchor(&anchor) {
                     self.remember(here);
                 }
@@ -3020,6 +3144,7 @@ impl App {
             links::Target::File { path, anchor }
                 if Some(path.as_path()) == open_path.as_deref() =>
             {
+                self.pin_if(pin);
                 if anchor.is_none_or(|a| self.jump_to_anchor(&a)) {
                     self.remember(here);
                 }
@@ -3028,9 +3153,11 @@ impl App {
                 self.show_hint(format!("{} doesn't exist", display_name(&path)));
             }
             links::Target::File { path, anchor } => {
-                self.pending_jump = anchor.map(|a| (path.clone(), Jump::Anchor(a)));
-                self.pending_history = Some((path.clone(), here, Travel::Follow));
-                self.request_open(path);
+                let jump = anchor.map(Jump::Anchor);
+                self.open_tab(path.clone(), pin);
+                if self.open_landed(&path).is_some() {
+                    self.remember_open(path, jump, Some((here, Travel::Follow)));
+                }
             }
             links::Target::Refused(reason) => self.show_hint(reason),
         }
@@ -3082,9 +3209,14 @@ impl App {
                 self.unwind(travel);
             }
             Some(path) if Some(path.as_path()) != open.as_deref() => {
-                self.pending_jump = Some((path.clone(), Jump::Offset(place.offset)));
-                self.pending_history = Some((path.clone(), here, travel));
+                let path = path.clone();
+                let offset = place.offset;
                 self.request_open(path.clone());
+                if self.open_landed(&path).is_some() {
+                    self.remember_open(path, Some(Jump::Offset(offset)), Some((here, travel)));
+                } else {
+                    self.unwind(travel);
+                }
             }
             _ => {
                 self.commit(here, travel);
@@ -3112,30 +3244,77 @@ impl App {
         }
     }
 
-    /// Settles a history change waiting on an open: done once that file is
-    /// the one on screen; undone if the open failed and a different file
-    /// is showing.
-    fn settle_history(&mut self) {
-        let Some((path, here, travel)) = self.pending_history.clone() else {
+    /// The tab `open_tab` just activated, when its file is exactly `path`.
+    fn open_landed(&self, path: &Path) -> Option<u64> {
+        let tab = self.tabs.get(self.active)?;
+        (tab.doc.path() == Some(path)).then_some(tab.id)
+    }
+
+    /// Records a jump and a history change against the tab that opened
+    /// `path`. Does nothing when that open did not land there.
+    fn remember_open(
+        &mut self,
+        path: PathBuf,
+        jump: Option<Jump>,
+        history: Option<(Place, Travel)>,
+    ) {
+        let Some(tab) = self.open_landed(&path) else {
             return;
         };
-        if self.tab().doc.path() == Some(path.as_path()) {
-            self.pending_history = None;
-            self.commit(here, travel);
-        } else if self.confirm.is_none() {
-            self.pending_history = None;
-            self.unwind(travel);
+        if let Some(jump) = jump {
+            self.pending_jump = Some(PendingJump {
+                tab,
+                path: path.clone(),
+                jump,
+            });
+        }
+        if let Some((here, travel)) = history {
+            self.pending_history = Some(PendingHistory {
+                tab,
+                path,
+                here,
+                travel,
+            });
         }
     }
 
+    /// Settles a history change waiting on an open: done once that tab
+    /// exists with the file it was opened for, even if another tab is
+    /// showing. Undone if that tab is gone or its file changed.
+    fn settle_history(&mut self) {
+        let Some(pending) = self.pending_history.clone() else {
+            return;
+        };
+        let Some(index) = self.index_of_tab(pending.tab) else {
+            if self.confirm.is_none() {
+                self.pending_history = None;
+                self.unwind(pending.travel);
+            }
+            return;
+        };
+        if self.tabs[index].doc.path() != Some(pending.path.as_path()) {
+            if self.confirm.is_none() {
+                self.pending_history = None;
+                self.unwind(pending.travel);
+            }
+            return;
+        }
+        self.pending_history = None;
+        self.commit(pending.here, pending.travel);
+    }
+
     fn jump_to_anchor(&mut self, anchor: &str) -> bool {
+        self.jump_to_anchor_in(self.active, anchor)
+    }
+
+    fn jump_to_anchor_in(&mut self, index: usize, anchor: &str) -> bool {
         let offset = {
-            let tab = self.tab();
+            let tab = &self.tabs[index];
             inkmark_parse::heading_offset(&tab.doc, tab.parse.output(), anchor)
         };
         match offset {
             Some(offset) => {
-                self.jump_to(offset);
+                self.jump_to_in(index, offset);
                 true
             }
             None => {
@@ -3149,48 +3328,66 @@ impl App {
     /// Ctrl+click lands here before its release moves focus to the clicked
     /// pane, whose caret is then mirrored to the other.
     fn jump_to(&mut self, offset: usize) {
+        self.jump_to_in(self.active, offset);
+    }
+
+    fn jump_to_in(&mut self, index: usize, offset: usize) {
         let caret = inkmark_buffer::Selection::caret(offset);
-        let tab = self.tab_mut();
+        let tab = &mut self.tabs[index];
         tab.code.set_selection(caret);
         tab.live.set_selection(caret);
     }
 
-    /// Applies a jump waiting on a file opened from a link, once that file
-    /// is on screen and parsed. Dropped if the open failed and a different
-    /// file is showing.
+    /// Applies a jump waiting on the tab an open landed in, once that tab's
+    /// parse has settled. Another tab being on screen does not drop it.
+    /// Dropped if that tab is gone or its file changed.
     fn apply_pending_jump(&mut self) {
-        let Some((path, jump)) = self.pending_jump.clone() else {
+        let Some(pending) = self.pending_jump.clone() else {
             return;
         };
-        let open = self.tab().doc.path().map(Path::to_path_buf);
-        if open.as_deref() != Some(path.as_path()) {
+        let Some(index) = self.index_of_tab(pending.tab) else {
+            if self.confirm.is_none() {
+                self.pending_jump = None;
+            }
+            return;
+        };
+        if self.tabs[index].doc.path() != Some(pending.path.as_path()) {
             if self.confirm.is_none() {
                 self.pending_jump = None;
             }
             return;
         }
-        if !self.tab().parse.is_settled() {
+        // A background tab is not drawn, so this is what accepts its parse.
+        let wait = {
+            let tab = &mut self.tabs[index];
+            tab.parse.update(&tab.doc)
+        };
+        if let Some(wait) = wait {
+            self.ctx.request_repaint_after(wait);
+        }
+        if !self.tabs[index].parse.is_settled() {
             return;
         }
         self.pending_jump = None;
-        match jump {
+        match pending.jump {
             Jump::Anchor(anchor) => {
-                self.jump_to_anchor(&anchor);
+                self.jump_to_anchor_in(index, &anchor);
             }
             Jump::Offset(offset) => {
-                let len = self.tab().doc.len();
-                self.jump_to(offset.min(len));
+                let len = self.tabs[index].doc.len();
+                self.jump_to_in(index, offset.min(len));
             }
             Jump::Select { range, text } => {
                 // Field borrow, so `search` and the document are borrowed together.
-                let located = self
-                    .search
-                    .locate(&self.tabs[self.active].doc, range, &text);
+                let located = self.search.locate(&self.tabs[index].doc, range, &text);
                 if let Some(range) = located {
-                    self.show_match(Selection {
-                        anchor: range.start,
-                        head: range.end,
-                    });
+                    self.show_match_in(
+                        index,
+                        Selection {
+                            anchor: range.start,
+                            head: range.end,
+                        },
+                    );
                 }
             }
         }
@@ -3223,8 +3420,8 @@ impl App {
             let tab = self.tab_mut();
             tab.live.take_follow().or(tab.code.take_follow())
         };
-        if let Some(at) = followed {
-            self.follow(at);
+        if let Some(click) = followed {
+            self.follow_link(click.at, click.pin);
         }
         self.settle_history();
         self.apply_pending_jump();
@@ -3344,6 +3541,10 @@ impl App {
     /// drive exactly this, without a real window.
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if std::mem::take(&mut self.refocus_pane) && !self.tabs.is_empty() {
+            let pane = self.tab().focus;
+            self.focus_pane(&ctx, pane);
+        }
         self.os_theme.poll(&ctx);
         self.note_session(&ctx);
         self.handle_shortcuts(&ctx);
@@ -3415,6 +3616,7 @@ impl App {
         self.confirm_ui(&ctx);
         self.update_title(&ctx);
         self.measure_step(&ctx);
+        self.pin_edited_preview();
     }
 }
 
@@ -4832,7 +5034,165 @@ mod tests {
         assert!(app.confirm.is_none());
         assert_eq!(app.tabs.len(), 2);
         assert_eq!(app.tab().doc.path(), Some(b.as_path()));
+        assert!(app.tab().preview);
         assert!(tab_text(&app, 0).ends_with("draft"));
+    }
+
+    #[test]
+    fn a_middle_click_on_a_link_opens_a_pinned_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "[next](b.md)\n").unwrap();
+        fs::write(&b, "# B\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a.clone()));
+        run.app.sidebar.visible = false;
+        run.frame(vec![egui::Event::ModifiersChanged(
+            egui::Modifiers::COMMAND,
+        )]);
+        let mut found = None;
+        for x in (20..240).step_by(4) {
+            for y in [16.0_f32, 24.0, 32.0] {
+                let pos = egui::pos2(x as f32, y);
+                run.frame(vec![egui::Event::PointerMoved(pos)]);
+                if run.out.platform_output.cursor_icon == egui::CursorIcon::PointingHand {
+                    found = Some(pos);
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let pos = found.expect("the link shows a hand under Ctrl");
+        run.frame(vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+        run.click_pos(pos, egui::PointerButton::Middle);
+        run.settle();
+        assert_eq!(run.app.tabs.len(), 2);
+        assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
+        assert!(!run.app.tab().preview);
+        assert_eq!(run.app.tabs[0].doc.path(), Some(a.as_path()));
+        assert_eq!(tab_text(&run.app, 0), "[next](b.md)\n");
+    }
+
+    #[test]
+    fn a_middle_click_on_a_same_file_link_pins_the_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "[see](#part)\n\n## Part\n\nend\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a.clone()));
+        run.app.sidebar.visible = true;
+        let at = run.row_center(&b);
+        run.click_pos(at, egui::PointerButton::Primary);
+        run.settle();
+        assert_eq!(run.app.tabs.len(), 2);
+        assert!(run.app.tab().preview);
+        run.app.sidebar.visible = false;
+        run.frame(vec![]);
+        let pos = run.link_hand();
+        run.click_pos(pos, egui::PointerButton::Middle);
+        run.settle();
+        assert_eq!(run.app.tabs.len(), 2);
+        assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
+        assert!(!run.app.tab().preview);
+        assert_eq!(run.app.selection().head, offset_of(&run.app, "Part"));
+        assert!(
+            run.app
+                .tabs
+                .iter()
+                .filter(|tab| tab.doc.path() == Some(b.as_path()))
+                .count()
+                == 1
+        );
+    }
+
+    #[test]
+    fn a_middle_click_on_a_footnote_pins_the_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "See [^1].\n\n[^1]: the note\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a));
+        run.app.sidebar.visible = true;
+        let at = run.row_center(&b);
+        run.click_pos(at, egui::PointerButton::Primary);
+        run.settle();
+        assert!(run.app.tab().preview);
+        run.app.sidebar.visible = false;
+        run.frame(vec![]);
+        let pos = run.link_hand();
+        run.click_pos(pos, egui::PointerButton::Middle);
+        run.settle();
+        assert_eq!(run.app.tabs.len(), 2);
+        assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
+        assert!(!run.app.tab().preview);
+        assert_eq!(run.app.selection().head, offset_of(&run.app, "the note"));
+    }
+
+    #[test]
+    fn a_middle_click_on_another_file_leaves_the_source_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        let c = dir.path().join("c.md");
+        fs::write(&a, "[next](b.md)\n").unwrap();
+        fs::write(&b, "# B\n").unwrap();
+        fs::write(&c, "gamma\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(c));
+        run.app.sidebar.visible = true;
+        let at = run.row_center(&a);
+        run.click_pos(at, egui::PointerButton::Primary);
+        run.settle();
+        assert!(run.app.tab().preview);
+        assert_eq!(run.app.tab().doc.path(), Some(a.as_path()));
+        run.app.sidebar.visible = false;
+        run.frame(vec![]);
+        let pos = run.link_hand();
+        run.click_pos(pos, egui::PointerButton::Middle);
+        run.settle();
+        assert_eq!(run.app.tabs.len(), 3);
+        assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
+        assert!(!run.app.tab().preview);
+        assert!(
+            run.app
+                .tabs
+                .iter()
+                .any(|tab| tab.doc.path() == Some(a.as_path()) && tab.preview)
+        );
+    }
+
+    #[test]
+    fn a_followed_link_keeps_its_jump_after_switching_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "Intro.\n\nSee [the second part](b.md#second-part).\n").unwrap();
+        fs::write(&b, "# First\n\ntext\n\n## Second part\n\nend\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a.clone()));
+        let from = offset_of(&run.app, "Intro") + 2;
+        run.app.jump_to(from);
+        run.app.follow(offset_of(&run.app, "second part"));
+        assert!(run.app.pending_jump.is_some());
+        assert!(run.app.pending_history.is_some());
+        run.app.activate(0);
+        let kept = run.app.tab().code.selection();
+        run.settle();
+        assert!(run.app.pending_history.is_none());
+        assert!(!run.app.back.is_empty());
+        assert_eq!(run.app.tab().doc.path(), Some(a.as_path()));
+        assert_eq!(run.app.tab().code.selection(), kept);
+        let opened = run
+            .app
+            .tabs
+            .iter()
+            .find(|tab| tab.doc.path() == Some(b.as_path()))
+            .expect("b stayed open");
+        let head = opened.code.selection().head;
+        let end = opened.doc.len().min(head + "Second part".len());
+        assert_eq!(opened.doc.slice(head..end).as_ref(), "Second part");
     }
 
     #[test]
@@ -5209,6 +5569,56 @@ mod tests {
             self.frame(vec![]);
         }
 
+        /// Where a link under the pointer shows a hand while Ctrl is held.
+        fn link_hand(&mut self) -> egui::Pos2 {
+            self.frame(vec![egui::Event::ModifiersChanged(
+                egui::Modifiers::COMMAND,
+            )]);
+            let mut found = None;
+            for x in (8..480).step_by(4) {
+                for y in (12..96).step_by(4) {
+                    let pos = egui::pos2(x as f32, y as f32);
+                    self.frame(vec![egui::Event::PointerMoved(pos)]);
+                    if self.out.platform_output.cursor_icon == egui::CursorIcon::PointingHand {
+                        found = Some(pos);
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            self.frame(vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+            found.expect("the link shows a hand under Ctrl")
+        }
+
+        fn click_pos(&mut self, pos: egui::Pos2, button: egui::PointerButton) {
+            let press = |pressed| egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            self.frame(vec![egui::Event::PointerMoved(pos), press(true)]);
+            self.frame(vec![press(false)]);
+            self.frame(vec![]);
+        }
+
+        fn row_center(&mut self, path: &Path) -> egui::Pos2 {
+            let start = Instant::now();
+            loop {
+                if let Some(row) = self.app.browser.row_rect(path) {
+                    return row.center();
+                }
+                self.frame(vec![]);
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "sidebar listing did not arrive"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
         /// Every place the last frame drew `text`.
         fn text_rects(&self, text: &str) -> Vec<egui::Rect> {
             fn walk(shape: &egui::Shape, text: &str, out: &mut Vec<egui::Rect>) {
@@ -5393,6 +5803,7 @@ mod tests {
             Some(std::ffi::OsString::from("alpha.md"))
         );
         assert_eq!(text(&run.app), "hello\n");
+        assert!(run.app.tab().preview);
     }
 
     #[test]
@@ -5425,6 +5836,471 @@ mod tests {
                 .as_ref(),
             "token"
         );
+        assert!(run.app.tab().preview);
+    }
+
+    #[test]
+    fn a_single_click_reuses_the_preview_and_a_double_click_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        let c = dir.path().join("c.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "beta\n").unwrap();
+        fs::write(&c, "gamma\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a.clone()));
+        run.app.sidebar.visible = true;
+        let at_b = run.row_center(&b);
+        run.click_pos(at_b, egui::PointerButton::Primary);
+        assert_eq!(run.app.tabs.len(), 2);
+        assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
+        assert!(run.app.tab().preview);
+        assert!(run.app.tab().code.has_focus(&run.ctx));
+        assert_eq!(text(&run.app), "beta\n");
+        assert_eq!(tab_text(&run.app, 0), "alpha\n");
+
+        let at_c = run.row_center(&c);
+        run.click_pos(at_c, egui::PointerButton::Primary);
+        assert_eq!(run.app.tabs.len(), 2);
+        assert_eq!(run.app.tab().doc.path(), Some(c.as_path()));
+        assert!(run.app.tab().preview);
+        assert!(
+            run.app
+                .tabs
+                .iter()
+                .all(|tab| tab.doc.path() != Some(b.as_path()))
+        );
+
+        // The second click of a double click pins, and the pinned file stays
+        // when the next single click opens something else.
+        run.click_pos(at_b, egui::PointerButton::Primary);
+        run.click_pos(at_b, egui::PointerButton::Primary);
+        assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
+        assert!(!run.app.tab().preview);
+        assert!(run.app.confirm.is_none());
+        run.click_pos(at_c, egui::PointerButton::Primary);
+        assert_eq!(run.app.tabs.len(), 3);
+        assert_eq!(run.app.tabs[1].doc.path(), Some(b.as_path()));
+        assert!(!run.app.tabs[1].preview);
+        assert!(run.app.tab().preview);
+        assert_eq!(run.app.tab().doc.path(), Some(c.as_path()));
+    }
+
+    #[test]
+    fn editing_a_preview_pins_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        let c = dir.path().join("c.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "beta\n").unwrap();
+        fs::write(&c, "gamma\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a));
+        run.app.sidebar.visible = true;
+        let at_b = run.row_center(&b);
+        run.click_pos(at_b, egui::PointerButton::Primary);
+        assert!(run.app.tab().preview);
+        run.frame(vec![egui::Event::Text("Z".into())]);
+        assert!(!run.app.tab().preview);
+        assert_eq!(text(&run.app), "Zbeta\n");
+        let at_c = run.row_center(&c);
+        run.click_pos(at_c, egui::PointerButton::Primary);
+        assert_eq!(run.app.tabs.len(), 3);
+        assert_eq!(run.app.tabs[1].doc.path(), Some(b.as_path()));
+        assert!(!run.app.tabs[1].preview);
+        assert_eq!(tab_text(&run.app, 1), "Zbeta\n");
+    }
+
+    #[test]
+    fn a_double_click_does_not_replace_a_dirty_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "beta\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a));
+        run.app.sidebar.visible = true;
+        run.frame(vec![egui::Event::Text("Z".into())]);
+        let at = run.row_center(&b);
+        run.click_pos(at, egui::PointerButton::Primary);
+        run.click_pos(at, egui::PointerButton::Primary);
+        assert!(run.app.confirm.is_none());
+        assert_eq!(run.app.tabs.len(), 2);
+        assert_eq!(tab_text(&run.app, 0), "Zalpha\n");
+        assert!(!run.app.tabs[0].preview);
+        assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
+        assert!(!run.app.tab().preview);
+    }
+
+    #[test]
+    fn a_missing_preview_is_kept_when_another_file_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        let c = dir.path().join("c.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "beta\n").unwrap();
+        fs::write(&c, "gamma\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a));
+        run.app.sidebar.visible = true;
+        let at_b = run.row_center(&b);
+        run.click_pos(at_b, egui::PointerButton::Primary);
+        assert!(run.app.tab().preview);
+        fs::remove_file(&b).unwrap();
+        run.check_disk_now();
+        assert!(matches!(run.app.tab().disk, Some(Banner::DiskMissing)));
+        // The listing drops b.md and puts its missing row at the end, on the
+        // rectangle c.md just left. A click there is a second click on b.md.
+        run.app.open_tab(c.clone(), false);
+        assert!(run.app.confirm.is_none());
+        assert_eq!(run.app.tabs.len(), 3);
+        assert_eq!(run.app.tab().doc.path(), Some(c.as_path()));
+        assert!(run.app.tab().preview);
+        let kept = run
+            .app
+            .tabs
+            .iter()
+            .find(|tab| tab.doc.path() == Some(b.as_path()))
+            .expect("the missing preview stayed open");
+        assert!(!kept.preview);
+        assert!(matches!(kept.disk, Some(Banner::DiskMissing)));
+        assert_eq!(tab_text(&run.app, 1), "beta\n");
+    }
+
+    #[test]
+    fn ctrl_tab_onto_a_preview_does_not_pin_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "beta\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a.clone()));
+        run.app.sidebar.visible = true;
+        run.frame(vec![egui::Event::Text("Z".into())]);
+        let at_b = run.row_center(&b);
+        run.click_pos(at_b, egui::PointerButton::Primary);
+        assert!(run.app.tab().preview);
+        run.click_tab("a.md");
+        assert_eq!(run.app.tab().doc.path(), Some(a.as_path()));
+        run.key(egui::Key::Tab, egui::Modifiers::COMMAND);
+        assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
+        assert!(run.app.tab().preview);
+    }
+
+    #[test]
+    fn closing_the_front_tab_does_not_pin_the_preview_it_lands_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "beta\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a.clone()));
+        run.app.sidebar.visible = true;
+        run.frame(vec![egui::Event::Text("Z".into())]);
+        run.key(egui::Key::Z, egui::Modifiers::COMMAND);
+        assert!(!run.app.tab().doc.is_dirty());
+        assert_ne!(run.app.tab().doc.epoch(), 0);
+        let at_b = run.row_center(&b);
+        run.click_pos(at_b, egui::PointerButton::Primary);
+        assert!(run.app.tab().preview);
+        run.click_tab("a.md");
+        run.key(egui::Key::W, egui::Modifiers::COMMAND);
+        assert!(run.app.confirm.is_none());
+        assert_eq!(run.app.tabs.len(), 1);
+        assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
+        assert!(run.app.tab().preview);
+        assert_eq!(text(&run.app), "beta\n");
+    }
+
+    #[test]
+    fn closing_a_background_tab_still_pins_an_edited_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        let c = dir.path().join("c.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "beta\n").unwrap();
+        fs::write(&c, "gamma\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a));
+        run.app.sidebar.visible = true;
+        let at_c = run.row_center(&c);
+        run.click_pos(at_c, egui::PointerButton::Primary);
+        run.click_pos(at_c, egui::PointerButton::Primary);
+        assert!(!run.app.tab().preview);
+        let at_b = run.row_center(&b);
+        run.click_pos(at_b, egui::PointerButton::Primary);
+        assert!(run.app.tab().preview);
+        assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
+        type_into(&mut run.app, "xx");
+        assert!(run.app.tab().preview);
+        let c_index = run
+            .app
+            .tabs
+            .iter()
+            .position(|tab| tab.doc.path() == Some(c.as_path()))
+            .unwrap();
+        run.app.remove_tab(c_index);
+        run.frame(vec![]);
+        assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
+        assert!(!run.app.tab().preview);
+        assert!(text(&run.app).ends_with("xx"));
+        assert!(
+            run.app
+                .tabs
+                .iter()
+                .all(|tab| tab.doc.path() != Some(c.as_path()))
+        );
+    }
+
+    #[test]
+    fn a_search_hit_lands_in_the_preview_without_moving_the_other_caret() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        let c = dir.path().join("c.md");
+        fs::write(&a, "alpha stays\n").unwrap();
+        fs::write(&b, "beta\n").unwrap();
+        fs::write(&c, "see token here\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a.clone()));
+        run.app.sidebar.visible = true;
+        let at_b = run.row_center(&b);
+        run.click_pos(at_b, egui::PointerButton::Primary);
+        run.click_tab("a.md");
+        assert_eq!(run.app.tab().doc.path(), Some(a.as_path()));
+        run.app.jump_to(6);
+        run.frame(vec![]);
+        let kept = run.app.tab().code.selection();
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("token".into())]);
+        run.wait_search();
+        run.click_text("c.md  see token here");
+        run.settle();
+        assert!(run.app.tab().preview);
+        assert_eq!(run.app.tab().doc.path(), Some(c.as_path()));
+        assert_eq!(
+            run.app
+                .tab()
+                .doc
+                .slice(run.app.tab().code.selection().range())
+                .as_ref(),
+            "token"
+        );
+        assert_eq!(run.app.tabs[0].doc.path(), Some(a.as_path()));
+        assert_eq!(run.app.tabs[0].code.selection(), kept);
+        assert!(
+            run.app
+                .tabs
+                .iter()
+                .all(|tab| tab.doc.path() != Some(b.as_path()))
+        );
+    }
+
+    #[test]
+    fn a_search_jump_survives_switching_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let c = dir.path().join("c.md");
+        fs::write(&a, "alpha stays\n").unwrap();
+        fs::write(&c, "see token here\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a.clone()));
+        run.app.jump_to(6);
+        run.frame(vec![]);
+        let kept = run.app.tab().code.selection();
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("token".into())]);
+        run.wait_search();
+        let at = run
+            .text_rect("c.md  see token here")
+            .expect("the hit is on screen")
+            .center();
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        run.frame(vec![egui::Event::PointerMoved(at), press(true)]);
+        run.frame(vec![press(false)]);
+        assert!(
+            run.app.pending_jump.is_some(),
+            "the open frame does not apply the jump"
+        );
+        run.app.activate(0);
+        run.settle();
+        assert_eq!(run.app.tab().doc.path(), Some(a.as_path()));
+        assert_eq!(run.app.tab().code.selection(), kept);
+        let opened = run
+            .app
+            .tabs
+            .iter()
+            .find(|tab| tab.doc.path() == Some(c.as_path()))
+            .expect("the search hit stayed open");
+        assert_eq!(
+            opened.doc.slice(opened.code.selection().range()).as_ref(),
+            "token"
+        );
+    }
+
+    #[test]
+    fn replacing_a_preview_drops_the_old_find_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        let c = dir.path().join("c.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, format!("{}cat\n", "x".repeat(80))).unwrap();
+        fs::write(&c, "no\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a));
+        run.app.sidebar.visible = true;
+        let at_b = run.row_center(&b);
+        run.click_pos(at_b, egui::PointerButton::Primary);
+        run.key(egui::Key::F, egui::Modifiers::COMMAND);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("cat".into())]);
+        run.frame(vec![]);
+        assert_eq!(
+            run.app
+                .tab()
+                .doc
+                .slice(run.app.tab().code.selection().range())
+                .as_ref(),
+            "cat"
+        );
+        let at_c = run.row_center(&c);
+        run.click_pos(at_c, egui::PointerButton::Primary);
+        assert_eq!(text(&run.app), "no\n");
+        run.key(egui::Key::F3, egui::Modifiers::NONE);
+        assert_eq!(text(&run.app), "no\n");
+        let range = run.app.tab().code.selection().range();
+        assert!(range.end <= run.app.tab().doc.len());
+    }
+
+    #[test]
+    fn an_open_find_bar_searches_the_file_that_replaces_a_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        let c = dir.path().join("c.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "cat in b\n").unwrap();
+        fs::write(&c, "see cat here\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a));
+        run.app.sidebar.visible = true;
+        let at_b = run.row_center(&b);
+        run.click_pos(at_b, egui::PointerButton::Primary);
+        run.key(egui::Key::F, egui::Modifiers::COMMAND);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("cat".into())]);
+        run.frame(vec![]);
+        assert_eq!(
+            run.app
+                .tab()
+                .doc
+                .slice(run.app.tab().code.selection().range())
+                .as_ref(),
+            "cat"
+        );
+        let at_c = run.row_center(&c);
+        run.click_pos(at_c, egui::PointerButton::Primary);
+        assert_eq!(text(&run.app), "see cat here\n");
+        assert!(run.app.tab().find.match_count() > 0);
+        assert_eq!(
+            run.app
+                .tab()
+                .doc
+                .slice(run.app.tab().code.selection().range())
+                .as_ref(),
+            "cat"
+        );
+    }
+
+    #[test]
+    fn ctrl_enter_and_a_middle_click_pin_a_search_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        let c = dir.path().join("c.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "beta\n").unwrap();
+        fs::write(&c, "gamma\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a));
+        run.app.sidebar.visible = true;
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("b".into())]);
+        run.wait_search();
+        run.key(egui::Key::Enter, egui::Modifiers::COMMAND);
+        run.settle();
+        assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
+        assert!(!run.app.tab().preview);
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("c".into())]);
+        run.wait_search();
+        run.click_text_button("c.md", egui::PointerButton::Middle);
+        run.settle();
+        assert_eq!(run.app.tabs.len(), 3);
+        assert_eq!(run.app.tab().doc.path(), Some(c.as_path()));
+        assert!(!run.app.tab().preview);
+        assert!(
+            run.app
+                .tabs
+                .iter()
+                .any(|tab| tab.doc.path() == Some(b.as_path()) && !tab.preview)
+        );
+    }
+
+    #[test]
+    fn enter_while_search_is_debouncing_does_not_open_the_old_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = dir.path().join("start.md");
+        fs::write(&start, "start\n").unwrap();
+        fs::write(dir.path().join("alpha.md"), "one\n").unwrap();
+        fs::write(dir.path().join("beta.md"), "two\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(start.clone()));
+        run.app.sidebar.visible = true;
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("alpha".into())]);
+        run.wait_search();
+        let at = run
+            .text_rect("alpha.md")
+            .expect("the old hit is still on screen")
+            .center();
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // The query change, the click on the old row, and Ctrl+Enter share
+        // one frame, so the debounce clock cannot elapse between them.
+        run.frame(vec![
+            shortcut(egui::Key::A, egui::Modifiers::COMMAND),
+            egui::Event::Text("beta".into()),
+            egui::Event::PointerMoved(at),
+            press(true),
+            press(false),
+            shortcut(egui::Key::Enter, egui::Modifiers::COMMAND),
+        ]);
+        assert_eq!(run.app.tab().doc.path(), Some(start.as_path()));
+        assert_eq!(run.app.tabs.len(), 1);
+        run.wait_search();
+        // The click above leaves the query field, so Enter would not steer.
+        // The new query's row is what opens once the debounce has elapsed.
+        run.click_text("beta.md");
+        run.settle();
+        assert_eq!(
+            run.app.tab().doc.path(),
+            Some(dir.path().join("beta.md").as_path())
+        );
+        assert!(run.app.tab().preview);
     }
 
     #[test]
