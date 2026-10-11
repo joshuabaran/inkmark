@@ -99,9 +99,23 @@ pub enum Action {
     ToggleOutline = 58,
     NewFolder = 59,
     ShowKeys = 60,
+    CloseTab = 61,
+    TabNext = 62,
+    TabPrevious = 63,
+    TabLeft = 64,
+    TabRight = 65,
+    Tab1 = 66,
+    Tab2 = 67,
+    Tab3 = 68,
+    Tab4 = 69,
+    Tab5 = 70,
+    Tab6 = 71,
+    Tab7 = 72,
+    Tab8 = 73,
+    Tab9 = 74,
 }
 
-const COUNT: usize = 61;
+const COUNT: usize = 75;
 
 impl Action {
     pub const ALL: [Action; COUNT] = [
@@ -166,6 +180,20 @@ impl Action {
         Action::ToggleOutline,
         Action::NewFolder,
         Action::ShowKeys,
+        Action::CloseTab,
+        Action::TabNext,
+        Action::TabPrevious,
+        Action::TabLeft,
+        Action::TabRight,
+        Action::Tab1,
+        Action::Tab2,
+        Action::Tab3,
+        Action::Tab4,
+        Action::Tab5,
+        Action::Tab6,
+        Action::Tab7,
+        Action::Tab8,
+        Action::Tab9,
     ];
 
     pub const fn index(self) -> usize {
@@ -237,6 +265,20 @@ impl Action {
             ToggleOutline => "toggle_outline",
             NewFolder => "new_folder",
             ShowKeys => "show_keys",
+            CloseTab => "close_tab",
+            TabNext => "tab_next",
+            TabPrevious => "tab_previous",
+            TabLeft => "tab_left",
+            TabRight => "tab_right",
+            Tab1 => "tab_1",
+            Tab2 => "tab_2",
+            Tab3 => "tab_3",
+            Tab4 => "tab_4",
+            Tab5 => "tab_5",
+            Tab6 => "tab_6",
+            Tab7 => "tab_7",
+            Tab8 => "tab_8",
+            Tab9 => "tab_9",
         }
     }
 
@@ -305,6 +347,20 @@ impl Action {
             ToggleOutline => "Show or hide the outline",
             NewFolder => "New folder in the selected folder, or the open folder",
             ShowKeys => "Show or hide the key bindings",
+            CloseTab => "Close the tab",
+            TabNext => "Switch to the next most recently used tab",
+            TabPrevious => "Switch to the previous most recently used tab",
+            TabLeft => "Switch to the tab on the left",
+            TabRight => "Switch to the tab on the right",
+            Tab1 => "Switch to tab 1",
+            Tab2 => "Switch to tab 2",
+            Tab3 => "Switch to tab 3",
+            Tab4 => "Switch to tab 4",
+            Tab5 => "Switch to tab 5",
+            Tab6 => "Switch to tab 6",
+            Tab7 => "Switch to tab 7",
+            Tab8 => "Switch to tab 8",
+            Tab9 => "Switch to tab 9",
         }
     }
 
@@ -314,7 +370,8 @@ impl Action {
             CycleMode | FocusCode | FocusLive | ToggleMinimap | OpenFile | Save | SaveAs
             | OpenFolder | ToggleSidebar | NewFile | RecentFiles | Back | Forward | Find
             | Replace | FindNext | FindPrevious | GoToLine | SearchFolder | ToggleOutline
-            | NewFolder | ShowKeys => Scope::App,
+            | NewFolder | ShowKeys | CloseTab | TabNext | TabPrevious | TabLeft | TabRight
+            | Tab1 | Tab2 | Tab3 | Tab4 | Tab5 | Tab6 | Tab7 | Tab8 | Tab9 => Scope::App,
             Rename | MoveToTrash => Scope::Browser,
             InsertRowAbove | InsertRowBelow | InsertColumnLeft | InsertColumnRight | DeleteRow
             | DeleteColumn | MoveRowUp | MoveRowDown | MoveColumnLeft | MoveColumnRight
@@ -948,6 +1005,20 @@ fn default_chords(action: Action) -> Vec<Chord> {
         ToggleOutline => vec![chord(ctrl_shift, Key::B)],
         NewFolder => vec![chord(ctrl_shift, Key::N)],
         ShowKeys => vec![chord(Modifiers::NONE, Key::F1)],
+        CloseTab => vec![chord(ctrl, Key::W)],
+        TabNext => vec![chord(ctrl, Key::Tab)],
+        TabPrevious => vec![chord(ctrl_shift, Key::Tab)],
+        TabLeft => vec![chord(ctrl, Key::PageUp)],
+        TabRight => vec![chord(ctrl, Key::PageDown)],
+        Tab1 => vec![chord(alt, Key::Num1)],
+        Tab2 => vec![chord(alt, Key::Num2)],
+        Tab3 => vec![chord(alt, Key::Num3)],
+        Tab4 => vec![chord(alt, Key::Num4)],
+        Tab5 => vec![chord(alt, Key::Num5)],
+        Tab6 => vec![chord(alt, Key::Num6)],
+        Tab7 => vec![chord(alt, Key::Num7)],
+        Tab8 => vec![chord(alt, Key::Num8)],
+        Tab9 => vec![chord(alt, Key::Num9)],
         SelectWord => vec![chord(ctrl, Key::D)],
         SelectParagraph => vec![chord(ctrl_shift, Key::P)],
         MatchBracket => vec![chord(ctrl_shift, Key::Backslash)],
@@ -1007,6 +1078,13 @@ mod tests {
         assert_eq!(map.shortcut_text(Action::ToggleOutline), "Ctrl+Shift+B");
         assert_eq!(map.shortcut_text(Action::NewFolder), "Ctrl+Shift+N");
         assert_eq!(map.shortcut_text(Action::ShowKeys), "F1");
+        assert_eq!(map.shortcut_text(Action::CloseTab), "Ctrl+W");
+        assert_eq!(map.shortcut_text(Action::TabNext), "Ctrl+Tab");
+        assert_eq!(map.shortcut_text(Action::TabPrevious), "Ctrl+Shift+Tab");
+        assert_eq!(map.shortcut_text(Action::TabLeft), "Ctrl+PageUp");
+        assert_eq!(map.shortcut_text(Action::TabRight), "Ctrl+PageDown");
+        assert_eq!(map.shortcut_text(Action::Tab1), "Alt+1");
+        assert_eq!(map.shortcut_text(Action::Tab9), "Alt+9");
     }
 
     #[test]

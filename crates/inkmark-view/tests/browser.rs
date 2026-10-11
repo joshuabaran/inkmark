@@ -2,6 +2,7 @@
 //! the worker thread, so waits poll until a deadline instead of sleeping a
 //! fixed time.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -63,6 +64,28 @@ impl Harness {
             }
         }
         self.shapes.iter().find_map(|c| find(&c.shape, text))
+    }
+
+    /// Every place the last frame drew `text`.
+    fn text_rects(&self, text: &str) -> Vec<Rect> {
+        fn walk(shape: &egui::Shape, text: &str, out: &mut Vec<Rect>) {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == text => {
+                    out.push(t.galley.rect.translate(t.pos.to_vec2()));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, text, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clip in &self.shapes {
+            walk(&clip.shape, text, &mut out);
+        }
+        out
     }
 
     fn press(&mut self, key: Key) -> BrowserOutput {
@@ -523,7 +546,7 @@ fn the_open_file_shows_the_unsaved_mark() {
     h.wait_until(|browser| browser.row_rect(&note).is_some() && browser.row_rect(&other).is_some());
 
     h.browser.set_current(Some(note.clone()));
-    h.browser.set_dirty(false);
+    h.browser.set_dirty(&HashSet::new());
     h.frame(vec![]);
     assert!(h.text_rect("note.md").is_some());
     assert!(
@@ -531,7 +554,7 @@ fn the_open_file_shows_the_unsaved_mark() {
         "a saved file was marked unsaved"
     );
 
-    h.browser.set_dirty(true);
+    h.browser.set_dirty(&HashSet::from([note.clone()]));
     h.frame(vec![]);
     let name = h.text_rect("note.md").expect("file name");
     let mark = h.text_rect("●").expect("unsaved mark");
@@ -550,9 +573,36 @@ fn the_open_file_shows_the_unsaved_mark() {
         "the mark belongs on the open file"
     );
 
-    h.browser.set_dirty(false);
+    h.browser.set_dirty(&HashSet::new());
     h.frame(vec![]);
     assert!(h.text_rect("●").is_none(), "a saved file was still marked");
+
+    // A dirty file that is not the one on screen is marked too.
+    h.browser.set_dirty(&HashSet::from([other.clone()]));
+    h.frame(vec![]);
+    let mark = h.text_rect("●").expect("the other file is unsaved");
+    let other_row = h.browser.row_rect(&other).expect("other row");
+    let note_row = h.browser.row_rect(&note).expect("note row");
+    assert!(
+        other_row.contains(mark.center()),
+        "the mark should sit on the dirty file"
+    );
+    assert!(
+        !note_row.contains(mark.center()),
+        "the clean open file should not be marked"
+    );
+    h.browser
+        .set_dirty(&HashSet::from([note.clone(), other.clone()]));
+    h.frame(vec![]);
+    let marks = h.text_rects("●");
+    assert!(
+        marks.iter().any(|mark| note_row.contains(mark.center())),
+        "the open dirty file should be marked"
+    );
+    assert!(
+        marks.iter().any(|mark| other_row.contains(mark.center())),
+        "the other dirty file should be marked"
+    );
 }
 
 #[test]
@@ -565,7 +615,7 @@ fn a_long_name_keeps_the_unsaved_mark_in_the_row() {
     h.wait_until(|browser| browser.row_rect(&note).is_some());
 
     h.browser.set_current(Some(note.clone()));
-    h.browser.set_dirty(true);
+    h.browser.set_dirty(&HashSet::from([note.clone()]));
     h.frame(vec![]);
     let row = h.browser.row_rect(&note).expect("row");
     let mark = h.text_rect("●").expect("unsaved mark");

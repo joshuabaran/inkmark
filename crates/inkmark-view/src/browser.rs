@@ -23,8 +23,8 @@ const ROW_H: f32 = 22.0;
 
 #[derive(Default)]
 pub struct BrowserOutput {
-    /// A Markdown file the user asked to open. The app runs this through the
-    /// same unsaved-changes prompt as Ctrl+O.
+    /// A Markdown file the user asked to open. The app focuses that file's
+    /// tab, or opens a new one.
     pub open_file: Option<PathBuf>,
     /// The Open Folder… button. The app shows the portal folder picker.
     pub open_folder: bool,
@@ -78,8 +78,9 @@ pub struct FileBrowser {
     inflight: HashSet<(usize, u64)>,
     selected: Option<PathBuf>,
     current: Option<PathBuf>,
-    /// The open document has unsaved edits. Only that row is marked.
-    dirty: bool,
+    /// Open documents with unsaved edits. Every one of those rows is marked,
+    /// not only the file on screen.
+    dirty: HashSet<PathBuf>,
     focus_next: bool,
     /// The open file was scrolled into view for the current path.
     revealed: bool,
@@ -120,7 +121,7 @@ impl FileBrowser {
             inflight: HashSet::new(),
             selected: None,
             current: None,
-            dirty: false,
+            dirty: HashSet::new(),
             focus_next: false,
             revealed: false,
             id: Id::new("file_browser"),
@@ -179,10 +180,11 @@ impl FileBrowser {
         }
     }
 
-    /// The open document's unsaved mark, drawn beside its name like the footer.
-    pub fn set_dirty(&mut self, dirty: bool) {
-        if self.dirty != dirty {
-            self.dirty = dirty;
+    /// Which open files have unsaved edits. Each of those rows gets the ●
+    /// the footer draws beside the active path.
+    pub fn set_dirty(&mut self, dirty: &HashSet<PathBuf>) {
+        if &self.dirty != dirty {
+            self.dirty.clone_from(dirty);
             self.wake();
         }
     }
@@ -869,7 +871,7 @@ impl FileBrowser {
             self.theme.markup,
         );
         let name_x = indent + 16.0;
-        if current && self.dirty {
+        if self.dirty.contains(&row.path) {
             // Leave room for ● at the end of the row. A long name otherwise
             // pushes the mark past the clip, and the row looks saved.
             let mark_width = ui

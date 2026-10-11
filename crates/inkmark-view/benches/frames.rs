@@ -857,10 +857,30 @@ fn sidebar(r: &Reporter) {
     );
 }
 
+/// A warm 5 MB view shown again. A switch costs one frame of the view
+/// that becomes active. This does not parse or paint a background tab.
+fn tab_switch(r: &Reporter, book: &str) {
+    let mut left = Panes::new(book, Mode::Split);
+    let mut right = Panes::new(book, Mode::Split);
+    left.frame(vec![]);
+    right.frame(vec![]);
+    let mut run = Run::default();
+    for i in 0..iterations(80, 20) {
+        let cost = if i % 2 == 0 {
+            left.frame(vec![])
+        } else {
+            right.frame(vec![])
+        };
+        run.push(cost);
+    }
+    run.report(r, "split/tab_switch_5mb", BUDGET, &[]);
+}
+
 fn main() {
     let r = Reporter::new("frames");
     let book = fixtures::load("prose-5mb.md");
     typing(&r, &book);
+    tab_switch(&r, &book);
     paced(&r, &book);
     scrolling(&r, &book);
     idle(&r, &book);
