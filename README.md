@@ -291,9 +291,10 @@ Opening another file keeps the unsaved tab and shows the new file beside
 it. Closing one dirty tab asks Save, Discard, or Cancel for that tab.
 Closing the window with several unsaved tabs asks once, names each file,
 and offers Save all, Discard all, or Cancel. Closing the last tab leaves
-the window open on the recent-files list. A clean file another program
-changes in a background tab is reloaded. A dirty one is marked ↻, and the
-banner appears when that tab is selected. A missing file keeps its text
+the window open, with recent files in the empty pane. A clean file another
+program changes in a background tab is reloaded, and that tab keeps its
+caret and scroll line. A dirty one is marked ↻, and the banner appears
+when that tab is selected. A missing file keeps its text
 and is marked ✕. Saving a tab as a path another tab already has open is
 refused.
 

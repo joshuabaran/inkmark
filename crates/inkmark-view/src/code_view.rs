@@ -237,6 +237,18 @@ impl CodeView {
         self.folds.ranges()
     }
 
+    /// Puts folds back after a reload. A range is kept only when it still
+    /// covers whole lines of `doc`. One that starts mid-line, or past the
+    /// end, is dropped: the bytes it named are no longer that fold.
+    pub fn restore_hidden_ranges(&mut self, ranges: &[Range<usize>], doc: &Document) {
+        let kept = ranges
+            .iter()
+            .filter(|range| hidden_range_maps(doc, range))
+            .cloned()
+            .collect();
+        self.folds.replace(kept);
+    }
+
     /// The height currently stored for `line` (0 while that line is folded).
     pub fn measured_height(&self, line: usize) -> f32 {
         if line < self.lines.heights.len() {
@@ -323,6 +335,9 @@ impl CodeView {
         self.drag = None;
         self.folds.clear();
         self.pending_reveal = false;
+        // A leftover reveal would scroll the new text to the caret and drop
+        // a scroll position restored after this reset.
+        self.reveal_caret = 0;
         self.fold_resync = false;
         self.marker_hits.clear();
         self.regions.clear();
@@ -1602,6 +1617,20 @@ impl CodeView {
     }
 }
 
+/// A fold still names whole lines. `end` may be the document's end.
+fn hidden_range_maps(doc: &Document, range: &Range<usize>) -> bool {
+    if range.is_empty() || range.end > doc.len() {
+        return false;
+    }
+    if !doc.is_char_boundary(range.start) || !doc.is_char_boundary(range.end) {
+        return false;
+    }
+    if doc.line_to_byte(doc.byte_to_line(range.start)) != range.start {
+        return false;
+    }
+    range.end == doc.len() || doc.line_to_byte(doc.byte_to_line(range.end)) == range.end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1685,5 +1714,26 @@ mod tests {
         view.selection = Selection { anchor: 6, head: 6 };
         view.move_to(&mut doc, 21, true);
         assert!(view.folds.ranges().is_empty(), "{:?}", view.folds.ranges());
+    }
+
+    #[test]
+    fn a_reload_keeps_folds_that_still_cover_whole_lines() {
+        let (mut view, doc) = two_folds();
+        let ranges = view.hidden_ranges().to_vec();
+        view.reset();
+        assert!(view.hidden_ranges().is_empty());
+        view.restore_hidden_ranges(&ranges, &doc);
+        assert_eq!(view.hidden_ranges(), ranges.as_slice());
+
+        let more = Document::from_text(&format!("{}more\n", doc.slice(0..doc.len())));
+        view.restore_hidden_ranges(&ranges, &more);
+        assert_eq!(view.hidden_ranges(), ranges.as_slice());
+
+        let shifted = Document::from_text(&format!("x{}", doc.slice(0..doc.len())));
+        view.restore_hidden_ranges(&ranges, &shifted);
+        assert!(
+            view.hidden_ranges().is_empty(),
+            "a byte inserted above the fold drops it"
+        );
     }
 }

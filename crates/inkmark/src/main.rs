@@ -15,7 +15,7 @@ use inkmark_files::{
 use inkmark_parse::{GfmParser, ParseState};
 use inkmark_text::Fonts;
 use inkmark_view::keys::{self, Action, Scope};
-use inkmark_view::{BrowserOutput, CodeView, FileBrowser, LiveView, theme};
+use inkmark_view::{BrowserOutput, CodeView, FileBrowser, LiveView, ScrollPos, theme};
 
 /// Font sizes, in points, unless config.toml sets them, and line height as
 /// a multiple of the size.
@@ -188,12 +188,13 @@ enum Banner {
 /// A save or discard the user has not answered yet.
 ///
 /// `Close` is the window, and one tab is unsaved. `CloseAll` is the
-/// window, and more than one tab is unsaved. `CloseTab` is that tab only.
+/// window, and more than one tab is unsaved. `CloseTab` is that tab only,
+/// by its stable id. The strip index can move before the answer comes back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Confirm {
     Close,
     CloseAll,
-    CloseTab(usize),
+    CloseTab(u64),
 }
 
 /// What a successful save should do afterwards.
@@ -368,8 +369,11 @@ struct App {
     title: String,
     measure: Option<measure::Measure>,
     recent: recent::Recent,
-    /// The recent-files list is open, with this entry selected.
+    /// The recent-files dialog is open, with this entry selected. The empty
+    /// window draws its list in the pane and leaves this `None`.
     recent_list: Option<usize>,
+    /// Which recent file the empty pane has selected.
+    empty_recent: usize,
     browser: FileBrowser,
     sidebar: sidebar::Sidebar,
     /// Mode, minimaps, the split, and the outline width, restored on open.
@@ -418,6 +422,37 @@ struct App {
     /// Tests receive the dialog kind instead of opening a portal window.
     #[cfg(test)]
     dialog_hook: Option<mpsc::Sender<DialogKind>>,
+}
+
+/// Caret offsets that still land on a character of `doc`.
+fn clamp_selection(selection: Selection, doc: &Document) -> Selection {
+    Selection {
+        anchor: clamp_offset(doc, selection.anchor),
+        head: clamp_offset(doc, selection.head),
+    }
+}
+
+fn clamp_offset(doc: &Document, offset: usize) -> usize {
+    let at = offset.min(doc.len());
+    if doc.is_char_boundary(at) {
+        at
+    } else {
+        doc.prev_char_boundary(at)
+    }
+}
+
+fn clamp_scroll(pos: ScrollPos, lines: usize) -> ScrollPos {
+    if lines == 0 || pos.line >= lines {
+        ScrollPos {
+            line: lines.saturating_sub(1),
+            frac: 0.0,
+        }
+    } else {
+        ScrollPos {
+            line: pos.line,
+            frac: pos.frac.clamp(0.0, 1.0),
+        }
+    }
 }
 
 impl App {
@@ -502,6 +537,7 @@ impl App {
             measure: None,
             recent,
             recent_list: None,
+            empty_recent: 0,
             browser: FileBrowser::new(root.clone()),
             sidebar: sidebar::Sidebar::load(sidebar_store),
             layout,
@@ -704,13 +740,19 @@ impl App {
             if index != self.active {
                 self.activate(index);
             }
-            self.confirm = Some(Confirm::CloseTab(index));
+            let id = self.tabs[index].id;
+            self.confirm = Some(Confirm::CloseTab(id));
             return;
         }
         self.remove_tab(index);
     }
 
-    /// Drops the tab. The last one leaves the window on the recent-files list.
+    fn index_of_tab(&self, id: u64) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    /// Drops the tab. The last one leaves the window open. Recent files are
+    /// drawn in the empty pane, not as a dialog, so the sidebar still gets clicks.
     fn remove_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
@@ -730,7 +772,8 @@ impl App {
             self.after_save = None;
             self.find_open = false;
             self.goto.close();
-            self.recent_list = Some(0);
+            self.recent_list = None;
+            self.empty_recent = 0;
             return;
         }
         self.active = self.mru[0];
@@ -738,11 +781,11 @@ impl App {
         self.focus_active();
     }
 
-    /// A window with no document stays on the recent-files list. Another
-    /// dialog that just closed must not leave a blank editor.
+    /// A dialog that just closed must not leave the recent-files dialog up.
+    /// With no document, the pane already shows that list.
     fn show_recent_if_empty(&mut self) {
-        if self.tabs.is_empty() && !self.modal_open() {
-            self.recent_list = Some(self.recent_list.unwrap_or(0));
+        if self.tabs.is_empty() {
+            self.recent_list = None;
         }
     }
 
@@ -1165,10 +1208,21 @@ impl App {
     }
 
     /// Re-reads a tab that is not showing. Its text matched the last save,
-    /// so the new bytes replace it. A failure leaves the buffer and a mark.
+    /// so the new bytes replace it. The caret and scroll line stay, clamped
+    /// to the new text. A failure leaves the buffer and a mark.
     fn reload_background(&mut self, index: usize) {
         let Some(path) = self.tabs[index].doc.path().map(|path| path.to_path_buf()) else {
             return;
+        };
+        let (code_sel, live_sel, code_scroll, live_scroll, folds) = {
+            let tab = &self.tabs[index];
+            (
+                tab.code.selection(),
+                tab.live.selection(),
+                tab.code.scroll_pos(),
+                tab.live.scroll_pos(&tab.doc, tab.parse.output()),
+                tab.code.hidden_ranges().to_vec(),
+            )
         };
         match Document::open(&path) {
             Ok(doc) => {
@@ -1180,6 +1234,20 @@ impl App {
                 tab.banner = None;
                 tab.disk = None;
                 tab.find.reset_matches();
+                let lines = tab.doc.line_count();
+                // mirror, not set_selection: set_selection scrolls to the caret
+                // and would throw away the line the view was on.
+                tab.code
+                    .mirror_selection(clamp_selection(code_sel, &tab.doc));
+                tab.live
+                    .mirror_selection(clamp_selection(live_sel, &tab.doc));
+                tab.code.set_scroll_pos(clamp_scroll(code_scroll, lines));
+                tab.code.restore_hidden_ranges(&folds, &tab.doc);
+                let pos = clamp_scroll(live_scroll, lines);
+                let Tab {
+                    doc, parse, live, ..
+                } = tab;
+                live.set_scroll_pos(doc, parse.output(), pos);
             }
             Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 self.tabs[index].disk = Some(Banner::DiskMissing);
@@ -1311,38 +1379,21 @@ impl App {
     }
 
     fn run_app_action(&mut self, ctx: &egui::Context, action: Action) {
-        // Open, Recent, New, and the sidebar still work with no document.
-        // Editing, find, and tab walking do not.
+        // With no document, only opening, the sidebar, and the key list run.
+        // A new action is blocked until it is named here, so it cannot call
+        // `tab()` on an empty window.
         if self.tabs.is_empty()
-            && matches!(
+            && !matches!(
                 action,
-                Action::ToggleMinimap
-                    | Action::CycleMode
-                    | Action::FocusCode
-                    | Action::FocusLive
-                    | Action::Back
-                    | Action::Forward
-                    | Action::SaveAs
-                    | Action::Save
-                    | Action::CloseTab
-                    | Action::TabNext
-                    | Action::TabPrevious
-                    | Action::TabLeft
-                    | Action::TabRight
-                    | Action::Tab1
-                    | Action::Tab2
-                    | Action::Tab3
-                    | Action::Tab4
-                    | Action::Tab5
-                    | Action::Tab6
-                    | Action::Tab7
-                    | Action::Tab8
-                    | Action::Tab9
-                    | Action::Find
-                    | Action::Replace
-                    | Action::FindNext
-                    | Action::FindPrevious
-                    | Action::GoToLine
+                Action::OpenFile
+                    | Action::OpenFolder
+                    | Action::NewFile
+                    | Action::NewFolder
+                    | Action::RecentFiles
+                    | Action::ToggleSidebar
+                    | Action::ToggleOutline
+                    | Action::SearchFolder
+                    | Action::ShowKeys
             )
         {
             return;
@@ -1356,9 +1407,11 @@ impl App {
             Action::RecentFiles => {
                 self.show_keys = false;
                 if self.tabs.is_empty() {
+                    // The pane already shows the list. Ctrl+R only clears a
+                    // dialog that was covering it.
                     self.new_file = None;
                     self.new_folder = None;
-                    self.recent_list = Some(self.recent_list.unwrap_or(0));
+                    self.recent_list = None;
                 } else {
                     self.recent_list = match self.recent_list {
                         Some(_) => None,
@@ -1889,14 +1942,17 @@ impl App {
         self.modal_was_open = open;
     }
 
-    /// The recent-files list: arrows and Enter, or a click, open one.
-    /// With no document open the list stays up, including when it is empty.
+    /// The recent-files dialog, while a document is open. An empty window
+    /// draws the same rows in the pane instead, so this stays closed.
     fn recent_ui(&mut self, ctx: &egui::Context) {
+        if self.tabs.is_empty() {
+            self.recent_list = None;
+            return;
+        }
         let Some(mut selected) = self.recent_list else {
             return;
         };
         let entries = self.recent.entries().to_vec();
-        let empty_window = self.tabs.is_empty();
         let (up, down, enter, escape) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::NONE, Key::ArrowUp),
@@ -1905,55 +1961,126 @@ impl App {
                 i.consume_key(Modifiers::NONE, Key::Escape),
             )
         });
-        if !empty_window && (entries.is_empty() || escape) {
+        if entries.is_empty() || escape {
             self.recent_list = None;
             return;
         }
-        if !entries.is_empty() {
-            if up {
-                selected = selected.saturating_sub(1);
-            }
-            if down {
-                selected = (selected + 1).min(entries.len() - 1);
-            }
+        if up {
+            selected = selected.saturating_sub(1);
         }
-        let mut chosen = (enter && !entries.is_empty()).then(|| entries[selected].clone());
+        if down {
+            selected = (selected + 1).min(entries.len() - 1);
+        }
+        let mut chosen = enter.then(|| entries[selected].clone());
         egui::Modal::new(egui::Id::new("recent")).show(ctx, |ui| {
             ui.set_min_width(480.0);
             ui.heading("Recent files");
             ui.add_space(6.0);
-            if entries.is_empty() {
-                ui.label("No recent files");
-            }
-            for (i, path) in entries.iter().enumerate() {
-                let name = path.file_name().map_or_else(
-                    || path.display().to_string(),
-                    |n| n.to_string_lossy().into_owned(),
-                );
-                let dir = path
-                    .parent()
-                    .map(|d| d.display().to_string())
-                    .unwrap_or_default();
-                let missing = if path.exists() { "" } else { "  (missing)" };
-                let text = RichText::new(format!("{name}{missing}")).strong();
-                let row = ui.selectable_label(i == selected, text).on_hover_text(&dir);
-                ui.label(RichText::new(dir).small().weak());
-                if row.clicked() {
-                    chosen = Some(path.clone());
-                }
+            if let Some(path) = Self::recent_rows(ui, &entries, selected) {
+                chosen = Some(path);
             }
             ui.add_space(6.0);
-            let hint = if empty_window {
-                "Up/Down select · Enter open"
-            } else {
-                "Up/Down select · Enter open · Esc close"
-            };
-            ui.label(RichText::new(hint).small().weak());
+            ui.label(
+                RichText::new("Up/Down select · Enter open · Esc close")
+                    .small()
+                    .weak(),
+            );
         });
         self.recent_list = Some(selected);
         if let Some(path) = chosen {
             self.recent_list = None;
             self.request_open(path);
+        }
+    }
+
+    /// Recent-file rows. The clicked path, when a row was clicked.
+    fn recent_rows(ui: &mut egui::Ui, entries: &[PathBuf], selected: usize) -> Option<PathBuf> {
+        let mut chosen = None;
+        for (i, path) in entries.iter().enumerate() {
+            let name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let dir = path
+                .parent()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default();
+            let missing = if path.exists() { "" } else { "  (missing)" };
+            let text = RichText::new(format!("{name}{missing}")).strong();
+            let row = ui.selectable_label(i == selected, text).on_hover_text(&dir);
+            ui.label(RichText::new(dir).small().weak());
+            if row.clicked() {
+                chosen = Some(path.clone());
+            }
+        }
+        chosen
+    }
+
+    /// Recent files in the empty pane, where a document would be. Not a
+    /// dialog: the sidebar beside it still receives clicks. With nothing
+    /// recent, Open and New are the way back to a document.
+    fn empty_pane(&mut self, ui: &mut egui::Ui) {
+        let entries = self.recent.entries().to_vec();
+        if entries.is_empty() {
+            self.empty_recent = 0;
+        } else if self.empty_recent >= entries.len() {
+            self.empty_recent = entries.len() - 1;
+        }
+        let ctx = ui.ctx().clone();
+        let keys = !self.modal_open() && !self.search.is_open() && !self.browser.has_focus(&ctx);
+        let mut open_path = None;
+        if keys && !entries.is_empty() {
+            let (up, down, enter) = ui.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                    i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                    i.consume_key(Modifiers::NONE, Key::Enter),
+                )
+            });
+            if up {
+                self.empty_recent = self.empty_recent.saturating_sub(1);
+            }
+            if down {
+                self.empty_recent = (self.empty_recent + 1).min(entries.len() - 1);
+            }
+            if enter {
+                open_path = Some(entries[self.empty_recent].clone());
+            }
+        }
+        let selected = self.empty_recent;
+        let mut chosen = None;
+        let mut open_file = false;
+        let mut new_file = false;
+        ui.add_space(24.0);
+        ui.horizontal(|ui| {
+            ui.add_space(24.0);
+            ui.vertical(|ui| {
+                ui.heading("Recent files");
+                ui.add_space(6.0);
+                if entries.is_empty() {
+                    ui.label("No recent files");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Open…").clicked() {
+                            open_file = true;
+                        }
+                        if ui.button("New").clicked() {
+                            new_file = true;
+                        }
+                    });
+                } else {
+                    chosen = Self::recent_rows(ui, &entries, selected);
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Up/Down select · Enter open").small().weak());
+                }
+            });
+        });
+        if let Some(path) = open_path.or(chosen) {
+            self.request_open(path);
+        } else if open_file {
+            self.spawn_dialog(DialogKind::Open);
+        } else if new_file {
+            self.begin_new_file();
         }
     }
 
@@ -1999,12 +2126,15 @@ impl App {
                 self.after_save = Some(AfterSave::Window);
                 self.save();
             }
-            ("save", Confirm::CloseTab(index)) => {
-                if let Some(tab) = self.tabs.get(index) {
-                    let id = tab.id;
-                    self.after_save = Some(AfterSave::Tab(id));
-                    self.save();
+            ("save", Confirm::CloseTab(id)) => {
+                let Some(index) = self.index_of_tab(id) else {
+                    return;
+                };
+                if index != self.active {
+                    self.activate(index);
                 }
+                self.after_save = Some(AfterSave::Tab(id));
+                self.save();
             }
             ("save", Confirm::CloseAll) => {
                 self.after_save = Some(AfterSave::Window);
@@ -2019,7 +2149,11 @@ impl App {
                 }
             }
             ("discard", Confirm::Close | Confirm::CloseAll) => self.close_allowed = true,
-            ("discard", Confirm::CloseTab(index)) => self.remove_tab(index),
+            ("discard", Confirm::CloseTab(id)) => {
+                if let Some(index) = self.index_of_tab(id) {
+                    self.remove_tab(index);
+                }
+            }
             ("cancel", _) => self.after_save = None,
             _ => {}
         }
@@ -2572,9 +2706,7 @@ impl App {
         // after that, so both panes end the frame on the heading.
         if panes.width() > 1.0 && self.tabs.is_empty() {
             ui.scope_builder(UiBuilder::new().max_rect(panes), |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new("No file open").weak());
-                });
+                self.empty_pane(ui);
             });
         } else if panes.width() > 1.0 {
             let mut tab_events = Vec::new();
@@ -6727,7 +6859,7 @@ mod tests {
         type_into(&mut run.app, "dirty");
         run.key(egui::Key::W, egui::Modifiers::COMMAND);
         assert_eq!(run.app.tabs.len(), 2);
-        assert_eq!(run.app.confirm, Some(Confirm::CloseTab(1)));
+        assert_eq!(run.app.confirm, Some(Confirm::CloseTab(run.app.tabs[1].id)));
         assert!(text(&run.app).ends_with("dirty"));
         run.click_text("Cancel");
         assert!(run.app.confirm.is_none());
@@ -6739,19 +6871,69 @@ mod tests {
         assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
         run.key(egui::Key::W, egui::Modifiers::COMMAND);
         assert_eq!(run.app.tabs.len(), 1);
-        assert_eq!(run.app.confirm, Some(Confirm::CloseTab(0)));
+        assert_eq!(run.app.confirm, Some(Confirm::CloseTab(run.app.tabs[0].id)));
         run.click_text("Discard");
         assert!(run.app.tabs.is_empty());
-        assert_eq!(run.app.recent_list, Some(0));
+        assert!(run.app.recent_list.is_none());
         assert!(!run.sent(&ViewportCommand::Close));
         run.frame(vec![]);
         assert!(run.text_rect("Recent files").is_some());
         run.key(egui::Key::Escape, egui::Modifiers::NONE);
-        assert_eq!(run.app.recent_list, Some(0));
+        assert!(run.app.recent_list.is_none());
+        assert!(run.app.tabs.is_empty());
         assert!(!run.sent(&ViewportCommand::Close));
+        // The list is in the pane, so F1 can open the key list over it.
+        run.key(egui::Key::F1, egui::Modifiers::NONE);
+        assert!(run.app.show_keys);
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!run.app.show_keys);
+        assert!(run.app.recent_list.is_none());
+        run.frame(vec![]);
+        assert!(run.text_rect("Recent files").is_some());
+        run.key(egui::Key::R, egui::Modifiers::COMMAND);
+        assert!(run.app.recent_list.is_none());
         run.click_text("a.md");
         assert_eq!(run.app.tabs.len(), 1);
         assert_eq!(run.app.tab().doc.path(), Some(a.as_path()));
+    }
+
+    #[test]
+    fn closing_the_last_tab_lets_the_sidebar_open_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a));
+        run.app.request_open(b.clone());
+        run.settle();
+        run.app.sidebar.visible = true;
+        run.key(egui::Key::W, egui::Modifiers::COMMAND);
+        run.key(egui::Key::W, egui::Modifiers::COMMAND);
+        assert!(run.app.tabs.is_empty());
+        assert!(run.app.recent_list.is_none());
+        let start = Instant::now();
+        let at = loop {
+            run.frame(vec![]);
+            if let Some(row) = run.app.browser.row_rect(&b) {
+                break row.center();
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "sidebar listing did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        run.frame(vec![egui::Event::PointerMoved(at), press(true)]);
+        run.frame(vec![press(false)]);
+        assert_eq!(run.app.tabs.len(), 1);
+        assert_eq!(run.app.tab().doc.path(), Some(b.as_path()));
     }
 
     #[test]
@@ -6783,7 +6965,7 @@ mod tests {
         type_into(&mut r.app, "B");
         r.frame(vec![]);
         r.key(egui::Key::W, egui::Modifiers::COMMAND);
-        assert_eq!(r.app.confirm, Some(Confirm::CloseTab(1)));
+        assert_eq!(r.app.confirm, Some(Confirm::CloseTab(r.app.tabs[1].id)));
         r.click_text("Save");
         assert_eq!(r.app.tabs.len(), 1);
         assert_eq!(r.app.tab().doc.path(), Some(a.as_path()));
@@ -6926,6 +7108,51 @@ mod tests {
         assert!(
             marks.iter().any(|mark| row.contains(mark.center())),
             "the sidebar marks the dirty file that changed on disk"
+        );
+    }
+
+    #[test]
+    fn a_background_reload_keeps_the_caret_and_scroll_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        let body: String = (0..80).map(|i| format!("line {i} stays\n")).collect();
+        fs::write(&a, &body).unwrap();
+        fs::write(&b, "b\n").unwrap();
+        let mut r = Run::new(dir.path(), Some(a.clone()));
+        let caret = r.app.tab().doc.line_to_byte(40);
+        r.app.jump_to(caret);
+        {
+            let tab = r.app.tab_mut();
+            let pos = inkmark_view::ScrollPos {
+                line: 10,
+                frac: 0.0,
+            };
+            tab.code.set_scroll_pos(pos);
+            let Tab {
+                doc, parse, live, ..
+            } = tab;
+            live.set_scroll_pos(doc, parse.output(), pos);
+        }
+        r.app.request_open(b.clone());
+        r.settle();
+        let mut next = body.clone();
+        next.push_str("extra from disk\n");
+        fs::write(&a, &next).unwrap();
+        r.check_disk_now();
+        assert_eq!(tab_text(&r.app, 0), next);
+        r.click_tab("a.md");
+        r.settle();
+        assert_eq!(r.app.tab().code.selection().head, caret);
+        assert_eq!(r.app.tab().live.selection().head, caret);
+        assert_eq!(r.app.tab().code.scroll_pos().line, 10);
+        assert_eq!(
+            r.app
+                .tab()
+                .live
+                .scroll_pos(&r.app.tab().doc, r.app.tab().parse.output())
+                .line,
+            10
         );
     }
 
