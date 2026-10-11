@@ -22,6 +22,12 @@ impl Folds {
         self.bodies.clear();
     }
 
+    /// Replaces the stored ranges. The caller has already dropped any that
+    /// no longer sit on whole lines.
+    pub(crate) fn replace(&mut self, ranges: Vec<Range<usize>>) {
+        self.bodies = ranges;
+    }
+
     /// Hides `body`, or shows it again when a fold of this heading is
     /// already stored. `child` is a nested heading's body start, when one
     /// sits inside `body`; that nested fold is left alone. An empty range

@@ -1338,19 +1338,27 @@ fn deleting_or_selecting_at_a_long_line_notice_takes_one_step() {
     let before = s.text();
     s.key(Key::Backspace, Modifiers::COMMAND);
     assert!((1..20).contains(&removed(&s, &before)));
-    // Shift+arrow doesn't select the whole block in one step.
+    // Shift+arrow doesn't select the whole block in one step. The word
+    // delete left the line starting with a space. Let the parse land
+    // first: until it does, a rebased block still holds that space, and
+    // the edge the selection stops on moves by one byte once the space
+    // is outside the paragraph.
+    s.settle();
     let line = s.doc.line_range(long_line);
     s.caret(line.start);
     s.key(Key::ArrowRight, Modifiers::SHIFT);
-    assert_eq!(s.live.selection(), Selection::caret(line.start));
+    assert_eq!(
+        s.live.selection(),
+        Selection {
+            anchor: line.start,
+            head: line.start + 1,
+        },
+        "Shift+Right took the notice"
+    );
     s.caret(line.end);
     s.key(Key::ArrowLeft, Modifiers::SHIFT);
     assert_eq!(s.live.selection(), Selection::caret(line.end));
-    // Plain arrows still cross it, to the paragraph's start. The word
-    // delete left the line starting with a space, which the full parse
-    // leaves out of the paragraph (a block still rebased from before the
-    // delete holds it), so let the parse land first.
-    s.settle();
+    // Plain arrows still cross it, to the paragraph's start.
     s.press(Key::ArrowLeft);
     let text = s.text();
     let start = line.start + text[line.start..].len() - text[line.start..].trim_start().len();

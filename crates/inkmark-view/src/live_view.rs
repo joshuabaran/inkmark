@@ -401,6 +401,9 @@ impl LiveView {
         self.remeasure.clear();
         self.selection = Selection::default();
         self.preferred_x = None;
+        // A leftover reveal would scroll the new text to the caret and drop
+        // a scroll position restored after this reset.
+        self.reveal_caret = 0;
     }
 
     /// Gives up keyboard focus (e.g. while a dialog is open).

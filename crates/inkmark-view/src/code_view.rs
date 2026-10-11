@@ -89,6 +89,10 @@ pub struct CodeView {
     /// Heading bodies hidden in this pane. Source ranges, so an edit moves
     /// them and a reparse leaves them where the bytes are.
     folds: Folds,
+    /// Folds from a reload, applied once a settled parse says each range is
+    /// still a heading body. Until then the text stays visible: a range that
+    /// only still covers whole lines may no longer be a fold.
+    pending_folds: Option<Vec<Range<usize>>>,
     /// `set_selection` landed somewhere that may be inside a fold.
     pending_reveal: bool,
     /// Folds changed after this frame's first sync and need heights again.
@@ -202,6 +206,7 @@ impl CodeView {
             line_height: 21.0,
             keys: keys::KeyMap::builtin(),
             folds: Folds::default(),
+            pending_folds: None,
             pending_reveal: false,
             fold_resync: false,
             marker_hits: Vec::new(),
@@ -235,6 +240,20 @@ impl CodeView {
     /// Source ranges the code pane is currently hiding.
     pub fn hidden_ranges(&self) -> &[Range<usize>] {
         self.folds.ranges()
+    }
+
+    /// Puts folds back after a reload. A range that no longer covers whole
+    /// lines is dropped now. One that does is hidden only after a settled
+    /// parse names that exact range as a heading body, so a same-length edit
+    /// that removes the heading cannot leave the body folded with no marker.
+    pub fn restore_hidden_ranges(&mut self, ranges: &[Range<usize>], doc: &Document) {
+        let kept = ranges
+            .iter()
+            .filter(|range| hidden_range_maps(doc, range))
+            .cloned()
+            .collect();
+        self.folds.clear();
+        self.pending_folds = Some(kept);
     }
 
     /// The height currently stored for `line` (0 while that line is folded).
@@ -322,7 +341,11 @@ impl CodeView {
         self.preedit.clear();
         self.drag = None;
         self.folds.clear();
+        self.pending_folds = None;
         self.pending_reveal = false;
+        // A leftover reveal would scroll the new text to the caret and drop
+        // a scroll position restored after this reset.
+        self.reveal_caret = 0;
         self.fold_resync = false;
         self.marker_hits.clear();
         self.regions.clear();
@@ -506,26 +529,52 @@ impl CodeView {
     /// through the edit, so they stay clickable while a full parse runs.
     fn refresh_regions(&mut self, doc: &Document, parse: &ParseState) {
         let revision = parse.revision();
-        if self.region_revision == Some(revision) {
-            return;
+        if self.region_revision != Some(revision) {
+            let output = parse.output();
+            if output.map.len() != doc.len() {
+                return;
+            }
+            // A placeholder parse has no blocks yet. Keep the pending folds
+            // until a real parse can say whether they are still headings.
+            if output.blocks.iter().next().is_none() && !doc.is_empty() {
+                return;
+            }
+            self.regions = inkmark_parse::heading_regions(doc, output)
+                .into_iter()
+                .filter(|region| region.line < doc.line_count())
+                .map(|region| CachedRegion {
+                    at: doc.line_to_byte(region.line),
+                    line: region.line,
+                    body: region.body,
+                })
+                .collect();
+            self.region_revision = Some(revision);
         }
-        let output = parse.output();
-        if output.map.len() != doc.len() {
-            return;
+        if parse.is_settled() && self.pending_folds.is_some() {
+            let bodies: Vec<Range<usize>> = self
+                .regions
+                .iter()
+                .map(|region| region.body.clone())
+                .collect();
+            self.settle_restored_folds(&bodies);
+            self.apply_fold_heights(doc);
         }
-        if output.blocks.iter().next().is_none() && !doc.is_empty() {
+    }
+
+    /// Hides restored ranges that equal a nonempty heading body. Anything
+    /// else is dropped. A second call does nothing until the next restore.
+    fn settle_restored_folds(&mut self, bodies: &[Range<usize>]) {
+        let Some(pending) = self.pending_folds.take() else {
             return;
-        }
-        self.regions = inkmark_parse::heading_regions(doc, output)
+        };
+        let kept = pending
             .into_iter()
-            .filter(|region| region.line < doc.line_count())
-            .map(|region| CachedRegion {
-                at: doc.line_to_byte(region.line),
-                line: region.line,
-                body: region.body,
+            .filter(|range| {
+                !range.is_empty() && bodies.iter().any(|body| body == range && !body.is_empty())
             })
             .collect();
-        self.region_revision = Some(revision);
+        self.folds.replace(kept);
+        self.fold_resync = true;
     }
 
     /// Moves cached markers through `changes`, then onto whole lines.
@@ -1602,6 +1651,20 @@ impl CodeView {
     }
 }
 
+/// A fold still names whole lines. `end` may be the document's end.
+fn hidden_range_maps(doc: &Document, range: &Range<usize>) -> bool {
+    if range.is_empty() || range.end > doc.len() {
+        return false;
+    }
+    if !doc.is_char_boundary(range.start) || !doc.is_char_boundary(range.end) {
+        return false;
+    }
+    if doc.line_to_byte(doc.byte_to_line(range.start)) != range.start {
+        return false;
+    }
+    range.end == doc.len() || doc.line_to_byte(doc.byte_to_line(range.end)) == range.end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1685,5 +1748,54 @@ mod tests {
         view.selection = Selection { anchor: 6, head: 6 };
         view.move_to(&mut doc, 21, true);
         assert!(view.folds.ranges().is_empty(), "{:?}", view.folds.ranges());
+    }
+
+    #[test]
+    fn a_reload_keeps_folds_that_still_cover_whole_lines() {
+        let (mut view, doc) = two_folds();
+        let ranges = view.hidden_ranges().to_vec();
+        view.reset();
+        assert!(view.hidden_ranges().is_empty());
+        view.restore_hidden_ranges(&ranges, &doc);
+        assert!(
+            view.hidden_ranges().is_empty(),
+            "a reload does not hide lines before the parse agrees"
+        );
+        view.settle_restored_folds(&[6..15, 21..30]);
+        assert_eq!(view.hidden_ranges(), ranges.as_slice());
+
+        // The last heading's body now runs through the extra line, so that
+        // fold is no longer the same range. The first heading's body is.
+        let more = Document::from_text(&format!("{}more\n", doc.slice(0..doc.len())));
+        view.restore_hidden_ranges(&ranges, &more);
+        assert!(view.hidden_ranges().is_empty());
+        view.settle_restored_folds(&[6..15, 21..more.len()]);
+        assert_eq!(view.hidden_ranges(), std::slice::from_ref(&(6..15)));
+
+        // An empty body is not a fold, and neither is a range the parse
+        // does not name.
+        view.restore_hidden_ranges(&ranges, &doc);
+        view.settle_restored_folds(&[6..6, 21..21]);
+        assert!(view.hidden_ranges().is_empty());
+
+        let shifted = Document::from_text(&format!("x{}", doc.slice(0..doc.len())));
+        view.restore_hidden_ranges(&ranges, &shifted);
+        assert!(
+            view.hidden_ranges().is_empty(),
+            "a byte inserted above the fold drops it"
+        );
+        view.settle_restored_folds(&[7..16, 22..31]);
+        assert!(
+            view.hidden_ranges().is_empty(),
+            "a range that is not on whole lines is not restored later"
+        );
+
+        view.restore_hidden_ranges(&ranges, &doc);
+        view.reset();
+        view.settle_restored_folds(&[6..15, 21..30]);
+        assert!(
+            view.hidden_ranges().is_empty(),
+            "reset drops a restore that has not been applied"
+        );
     }
 }

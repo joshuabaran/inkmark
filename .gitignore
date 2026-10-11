@@ -3,3 +3,5 @@
 /pack/pkg/
 /pack/inkmark/
 /pack/*.pkg.tar.*
+/AGENTS.md
+/CLAUDE.md
