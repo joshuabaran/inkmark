@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, pos2};
-use inkmark_view::{BrowserOutput, FileBrowser};
+use inkmark_view::{BrowserOutput, FileBrowser, OpenFile};
 
 const SCREEN: Rect = Rect::from_min_max(Pos2::ZERO, pos2(800.0, 600.0));
 
@@ -154,7 +154,13 @@ fn keyboard_expands_collapses_moves_and_opens() {
     h.wait_until(|browser| browser.row_names().len() == 3);
     h.press(Key::ArrowDown);
     let output = h.press(Key::Enter);
-    assert_eq!(output.open_file, Some(sub.join("a.md")));
+    assert_eq!(
+        output.open_file,
+        Some(OpenFile {
+            path: sub.join("a.md"),
+            pin: false,
+        })
+    );
 }
 
 #[test]
@@ -169,7 +175,13 @@ fn clicking_a_file_opens_it_and_a_folder_expands() {
 
     let file = h.browser.row_rect(&dir.path().join("b.md")).unwrap();
     let output = h.click(file.center());
-    assert_eq!(output.open_file, Some(dir.path().join("b.md")));
+    assert_eq!(
+        output.open_file,
+        Some(OpenFile {
+            path: dir.path().join("b.md"),
+            pin: false,
+        })
+    );
 
     let folder = h.browser.row_rect(&sub).unwrap();
     let output = h.click(folder.center());
@@ -179,6 +191,32 @@ fn clicking_a_file_opens_it_and_a_folder_expands() {
     h.click(folder.center());
     h.frame(vec![]);
     assert!(!h.browser.row_names().contains(&"a.md".to_string()));
+}
+
+#[test]
+fn a_double_click_pins_and_a_single_click_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("b.md");
+    fs::write(&file, "b\n").unwrap();
+    let mut h = Harness::new(dir.path());
+    h.wait_until(|browser| browser.row_rect(&file).is_some());
+    let at = h.browser.row_rect(&file).unwrap().center();
+    let first = h.click(at);
+    assert_eq!(
+        first.open_file,
+        Some(OpenFile {
+            path: file.clone(),
+            pin: false,
+        })
+    );
+    let second = h.click(at);
+    assert_eq!(
+        second.open_file,
+        Some(OpenFile {
+            path: file,
+            pin: true
+        })
+    );
 }
 
 #[test]

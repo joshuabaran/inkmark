@@ -16,7 +16,7 @@ pub(crate) struct Item {
     /// The file is gone. Drawn as ✕.
     pub missing: bool,
     pub active: bool,
-    /// Italic title. T3 sets this; until then every tab is pinned.
+    /// Italic title. Set on the one preview tab.
     pub preview: bool,
 }
 

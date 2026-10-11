@@ -21,11 +21,19 @@ use crate::theme::{self, Theme};
 
 const ROW_H: f32 = 22.0;
 
+/// A file the sidebar asked to open. `pin` is a double click; a single
+/// click or Enter leaves it false so the app can use the preview tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenFile {
+    pub path: PathBuf,
+    pub pin: bool,
+}
+
 #[derive(Default)]
 pub struct BrowserOutput {
     /// A Markdown file the user asked to open. The app focuses that file's
     /// tab, or opens a new one.
-    pub open_file: Option<PathBuf>,
+    pub open_file: Option<OpenFile>,
     /// The Open Folder… button. The app shows the portal folder picker.
     pub open_folder: bool,
     /// New file, in the selected folder or the root.
@@ -759,12 +767,15 @@ impl FileBrowser {
             return;
         };
         let row = self.snaps()[pos].clone();
-        self.activate_row(&row, output);
+        self.activate_row(&row, output, false);
     }
 
-    fn activate_row(&mut self, row: &Row, output: &mut BrowserOutput) {
+    fn activate_row(&mut self, row: &Row, output: &mut BrowserOutput, pin: bool) {
         if row.kind.openable() {
-            output.open_file = Some(row.path.clone());
+            output.open_file = Some(OpenFile {
+                path: row.path.clone(),
+                pin,
+            });
         } else if row.kind.is_dir() && !row.kind.looped() {
             self.tree.set_expanded(row.index, !row.expanded);
         }
@@ -778,7 +789,7 @@ impl FileBrowser {
         let mut area = ScrollArea::vertical()
             .auto_shrink([false, false])
             .id_salt(self.id);
-        let mut clicked = None;
+        let mut clicked: Option<(usize, bool)> = None;
         let mut menu = None;
         let mut dropped = None;
         ui.scope(|ui| {
@@ -807,8 +818,15 @@ impl FileBrowser {
                     let row = &rows[index];
                     if let Some(response) = self.paint_row(ui, row) {
                         self.row_rects.insert(row.path.clone(), response.rect);
-                        if response.clicked() {
-                            clicked = Some(index);
+                        // A double click pins. egui reports a triple when another
+                        // row was clicked inside the triple-click window: that
+                        // count only measures the distance to the click just
+                        // before this one, so the press that should pin is a
+                        // triple, and `double_clicked` stays false.
+                        if response.double_clicked() || response.triple_clicked() {
+                            clicked = Some((index, true));
+                        } else if response.clicked() {
+                            clicked = Some((index, false));
                         }
                         response.dnd_set_drag_payload(Dragged(row.path.clone()));
                         let target = Self::drop_dir(row);
@@ -863,11 +881,11 @@ impl FileBrowser {
                 }
             });
         });
-        if let Some(index) = clicked {
+        if let Some((index, pin)) = clicked {
             let row = rows[index].clone();
             self.selected = Some(row.path.clone());
             ui.memory_mut(|m| m.request_focus(self.id));
-            self.activate_row(&row, output);
+            self.activate_row(&row, output, pin);
         }
         output.dropped = output.dropped.take().or(dropped);
         match menu {

@@ -44,9 +44,15 @@ pub(crate) enum SearchOpen {
     },
 }
 
+/// A search row the user asked to open. `pin` is Ctrl+Enter or a middle click.
+pub(crate) struct SearchChoice {
+    pub open: SearchOpen,
+    pub pin: bool,
+}
+
 pub(crate) struct SearchFrame {
     pub body_top: f32,
-    pub open: Option<SearchOpen>,
+    pub open: Option<SearchChoice>,
     pub showing_results: bool,
     pub closed: bool,
 }
@@ -189,10 +195,17 @@ impl FolderSearch {
         self.error.as_deref()
     }
 
-    /// The query is empty, the pattern was rejected, or both passes have landed.
+    /// The query is empty, the pattern was rejected, or both passes for this
+    /// query have landed. A keystroke still inside the debounce, or a worker
+    /// that has not reported yet, is not settled: the rows on screen can
+    /// still belong to the previous query.
     #[cfg(test)]
     pub(crate) fn settled(&self) -> bool {
-        self.query.is_empty() || self.error.is_some() || (self.names_done && self.content_done)
+        !self.dirty
+            && !self.scanning
+            && (self.query.is_empty()
+                || self.error.is_some()
+                || (self.names_done && self.content_done))
     }
 
     /// The field, then the list. `body_top` is where the sidebar's rows go.
@@ -217,7 +230,7 @@ impl FolderSearch {
         let query_id = egui::Id::new(QUERY);
         let query_focused = ui.memory(|m| m.has_focus(query_id));
         let showing = self.showing_results();
-        let (escape, enter, up, down) = ui.input_mut(|input| {
+        let (escape, enter, pin_enter, up, down) = ui.input_mut(|input| {
             let escape = if modal {
                 false
             } else {
@@ -227,6 +240,7 @@ impl FolderSearch {
             (
                 escape,
                 steer && input.consume_key(Modifiers::NONE, Key::Enter),
+                steer && input.consume_key(Modifiers::COMMAND, Key::Enter),
                 steer && input.consume_key(Modifiers::NONE, Key::ArrowUp),
                 steer && input.consume_key(Modifiers::NONE, Key::ArrowDown),
             )
@@ -290,8 +304,11 @@ impl FolderSearch {
             }
             self.scroll_to = self.row_of(self.selected);
         }
-        if enter {
-            open = self.open_hit(self.selected);
+        if pin_enter || enter {
+            open = self.open_hit(self.selected).map(|open| SearchChoice {
+                open,
+                pin: pin_enter,
+            });
         }
         SearchFrame {
             body_top: ui.cursor().min.y,
@@ -301,7 +318,7 @@ impl FolderSearch {
         }
     }
 
-    pub(crate) fn show_results(&mut self, ui: &mut egui::Ui) -> Option<SearchOpen> {
+    pub(crate) fn show_results(&mut self, ui: &mut egui::Ui) -> Option<SearchChoice> {
         let colors = theme::current(ui.ctx());
         if let Some(error) = &self.error {
             ui.label(RichText::new(error).color(colors.error));
@@ -336,7 +353,7 @@ impl FolderSearch {
                         }
                     }
                 }
-                let mut clicked = None;
+                let mut clicked: Option<(usize, bool)> = None;
                 area.show_rows(ui, ROW_H, layout.count, |ui, range| {
                     for index in range {
                         let Some(slot) = slot_at(&layout, index) else {
@@ -375,19 +392,21 @@ impl FolderSearch {
                         let pos =
                             egui::pos2(rect.left() + 8.0, rect.center().y - galley.size().y * 0.5);
                         ui.painter().galley(pos, galley, color);
-                        if response.clicked()
-                            && let Some(hit) = hit
-                        {
-                            clicked = Some(hit);
+                        if let Some(hit) = hit {
+                            if response.middle_clicked() {
+                                clicked = Some((hit, true));
+                            } else if response.clicked() {
+                                clicked = Some((hit, false));
+                            }
                         }
                     }
                 });
                 clicked
             })
             .inner;
-        clicked.and_then(|index| {
+        clicked.and_then(|(index, pin)| {
             self.selected = index;
-            self.open_hit(index)
+            self.open_hit(index).map(|open| SearchChoice { open, pin })
         })
     }
 
