@@ -40,9 +40,11 @@ pub struct FindStep {
     pub closed: bool,
 }
 
+/// The query for one document. Whether the bar is on screen lives on the
+/// shell, so switching documents later can keep the bar up and show that
+/// document's query.
 #[derive(Default)]
-pub struct FindBar {
-    open: bool,
+pub struct FindState {
     query: String,
     replacement: String,
     case_sensitive: bool,
@@ -66,15 +68,7 @@ pub struct FindBar {
     index: Option<usize>,
 }
 
-impl FindBar {
-    pub fn is_open(&self) -> bool {
-        self.open
-    }
-
-    pub fn close(&mut self) {
-        self.open = false;
-    }
-
+impl FindState {
     #[cfg(test)]
     pub fn set_replacement(&mut self, text: impl Into<String>) {
         self.replacement = text.into();
@@ -104,10 +98,20 @@ impl FindBar {
         self.indexed = self.index.is_some().then_some(range);
     }
 
-    /// Opens the bar. A short single-line selection becomes the query when
+    /// Drops the match list when the document is replaced. The query,
+    /// options, and replacement stay, so the next F3 searches the new file.
+    /// A new document starts at epoch 0, the same epoch a search in an
+    /// unedited file recorded, and `refresh` would otherwise keep the old
+    /// ranges and slice them out of the new rope.
+    pub fn reset_matches(&mut self) {
+        self.clear_matches();
+    }
+
+    /// Arms a search. A short single-line selection becomes the query when
     /// the bar was closed. `replace` puts the caret in the replacement.
-    pub fn open(&mut self, origin: usize, seed: Option<String>, replace: bool) {
-        if !self.open {
+    /// `already_open` is the shell's bar, not this document's query.
+    pub fn open(&mut self, origin: usize, seed: Option<String>, replace: bool, already_open: bool) {
+        if !already_open {
             if let Some(seed) = seed {
                 self.query = seed;
                 self.select_query = true;
@@ -115,7 +119,6 @@ impl FindBar {
         } else if !replace {
             self.select_query = true;
         }
-        self.open = true;
         self.origin = origin;
         self.force = true;
         self.pending = Some(if replace {
@@ -170,7 +173,6 @@ impl FindBar {
             (enter, shift_enter, escape)
         });
         if escape {
-            self.open = false;
             return FindStep {
                 selection: None,
                 closed: true,
@@ -577,10 +579,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reset_matches_keeps_the_query_and_drops_the_old_ranges() {
+        let old = Document::from_text("aaaa aaaa cat\n");
+        let mut bar = FindState::default();
+        bar.open(0, Some("cat".into()), false, false);
+        let hit = bar.goto_next(&old, Selection::caret(0)).unwrap();
+        assert_eq!(hit.range(), 10..13);
+        bar.reset_matches();
+        let new = Document::from_text("cat dog\n");
+        let hit = bar.goto_next(&new, Selection::caret(0)).unwrap();
+        assert_eq!(hit.range(), 0..3);
+    }
+
+    #[test]
     fn f3_steps_and_wraps_without_losing_the_index() {
         let doc = Document::from_text("a\na\n");
-        let mut bar = FindBar::default();
-        bar.open(0, Some("a".into()), false);
+        let mut bar = FindState::default();
+        bar.open(0, Some("a".into()), false, false);
         let first = bar.goto_next(&doc, Selection::caret(0)).unwrap();
         assert_eq!(first.range(), 0..1);
         assert_eq!(bar.match_index(), Some(1));
@@ -599,11 +614,11 @@ mod tests {
     #[test]
     fn f3_reaches_the_empty_match_at_the_end_and_wraps() {
         let doc = Document::from_text("ab");
-        let mut bar = FindBar {
+        let mut bar = FindState {
             regex: true,
-            ..FindBar::default()
+            ..FindState::default()
         };
-        bar.open(0, Some("$".into()), false);
+        bar.open(0, Some("$".into()), false, false);
         let end = bar.goto_next(&doc, Selection::caret(0)).unwrap();
         assert_eq!(end.range(), 2..2);
         assert_eq!(bar.match_index(), Some(1));

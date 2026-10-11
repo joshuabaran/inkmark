@@ -16,8 +16,8 @@
 | Parser | `pulldown-cmark` (with `into_offset_iter`) behind `MarkdownParser`; CommonMark only in MVP. **GFM (decided 2026-10-02):** a `GfmParser` behind the same trait, using pulldown-cmark's tables, strikethrough and task-list extensions plus an inkmark pass for autolink literals (bare URLs, `www.`, emails), which pulldown-cmark lacks. Chosen over `comrak` because live editing depends on byte-exact source positions, which pulldown-cmark's offsets give and comrak's line/column positions don't guarantee for inline content. |
 | Parse strategy | Background full reparse is authoritative; synchronous **local reparse** of the edited top-level block for immediate feedback (see §2). Incremental parsing beyond that is a later optimization. |
 | Live editing model | **Reveal-at-cursor** (Typora/Obsidian style). Live is the source with syntax hidden away from the caret; every live edit is a direct source byte-range patch. No AST→Markdown re-emit. |
-| History | One document epoch, one undo stack shared by both panes. |
-| Scope | Single-file open/save, dark theme, keyboard-usable. **Since 2026-10-02:** still one open document at a time; a folder browser picks which one ([file browser](#file-browser-next)). **Since 2026-10-03:** one open document stays the model ([product review](#product-review-2026-10-03)). |
+| History | One undo stack per open document, shared by its two panes. |
+| Scope | Single-file open/save, dark theme, keyboard-usable. **Since 2026-10-02:** a folder browser picks which file is open ([file browser](#file-browser-next)). **Since 2026-10-10:** several documents can be open, each with its own undo stack ([tabs](#tabs-2026-10-10)). |
 | Perf target | Responsive on 5–10 MB CommonMark (~100k+ lines of typical prose). |
 | Platform | Native on the Omarchy host (Arch, Wayland, Hyprland). No Windows/macOS for MVP. |
 
@@ -132,7 +132,7 @@ Three view modes, toggled instantly, with the same document and cursor kept acro
 2. **Code only.**
 3. **Live only.**
 
-Both panes are editable. An edit in the live pane is a direct, minimal patch to the Markdown source. It is never a whole-block rewrite and never a lossy HTML round-trip. There is one undo history for the document, whichever pane made the edit.
+Both panes are editable. An edit in the live pane is a direct, minimal patch to the Markdown source. It is never a whole-block rewrite and never a lossy HTML round-trip. There is one undo history for each open document, whichever pane made the edit.
 
 Each pane can show or hide its own minimap (VS Code style): a narrow overview you can click or drag to navigate, with the viewport highlighted. The code minimap shows the source; the live minimap shows rendered structure. Minimap state is per pane and survives mode switches.
 
@@ -470,13 +470,30 @@ From `~/Projects/inkmark/PRODUCT_REVIEW.md`, outside the repo. This is the order
 
 | Question | Decision |
 |---|---|
-| Live editing | Keep the model: a keystroke is a byte-range patch, both panes share one undo stack, and a typed character inserts that character. No mode that rewrites a block. No new smart rules, column choreography, or Typora parity. Tables, tasks, and Enter-continues-list stay. New live work is rendering and navigation. |
-| One document | Tabs, backlinks, a graph, and tags stay off. One open document keeps a single undo stack and one scroll sync. |
+| Live editing | Keep the model: a keystroke is a byte-range patch, both panes of a document share that document's undo stack, and a typed character inserts that character. No mode that rewrites a block. No new smart rules, column choreography, or Typora parity. Tables, tasks, and Enter-continues-list stay. New live work is rendering and navigation. |
+| Tabs | Several documents can be open. Each has its own undo stack and its own scroll sync between its two panes. A single click opens a preview tab; a double click or an edit pins it. The strip is hidden when one document is open. Background tabs do not parse or paint. The rules are under [Tabs](#tabs-2026-10-10). |
 | Find before folder search | Find and replace in the current file comes before search across the folder. Vim mode, multi-cursor, and an LSP wait until find and the outline have been in daily use for a week. |
 | Math | A live-only overlay from the source span, drawn and never written back, and only once a note you have open uses it. Mermaid and other diagrams wait until a document you have open needs them. |
 | Live line length | The live pane wraps to the width of its panel, as the code pane does (changed by CRO-127, 2026-10-08; it was about 70–80 characters). |
 | Reading scroll | Measure a live block before its height can move the scroll position. Estimate only below the viewport. |
 | Unsaved mark | The open file shows ● on its sidebar row, the same mark the footer puts beside the path. |
+
+### Tabs (2026-10-10)
+
+Joshua approved these on 2026-10-10. They replace the "one document" lock. [CRO-130](https://linear.app/cronch/issue/CRO-130/tabs-multiple-open-documents). T1 (CRO-131) only moves the open document into a `Tab`. One tab, no strip, no new keys.
+
+1. A single click in the sidebar opens a preview tab (italic title). The next single click replaces it. A double click, or any edit, pins it.
+2. A click on a file that is already open focuses that tab. It is never opened twice.
+3. A folder-search result, or a Ctrl+click on a link to another file, opens in the preview tab. Ctrl+Enter or a middle click opens a new pinned tab.
+4. The tab strip sits above both panes. It is hidden when only one tab is open, so one document looks as it does today.
+5. Ctrl+W closes a tab. Ctrl+Tab and Ctrl+Shift+Tab move in most-recently-used order. Ctrl+PgUp and Ctrl+PgDn move left and right. Ctrl+Shift+T reopens a closed tab. A middle click closes a tab. Alt+1 through Alt+9 jump to a tab. All of these go through `keys.rs`.
+6. Closing a dirty tab uses the same Save, Discard, or Cancel prompt as today, for that tab. Closing the window with several dirty tabs asks once, names each file, and offers Save all, Discard all, or Cancel.
+7. Closing the last tab leaves the window open on the recent-files list.
+8. The find query belongs to the tab. Whether the bar is open does not.
+9. An external change on a background tab marks that tab (↻) and shows the banner when the tab is selected. A clean background tab reloads silently. A deleted file keeps its text and shows a missing mark.
+10. Trashing an open file from the sidebar keeps the text in the tab and marks it missing, as today. A rename or move follows the tab.
+11. Launching with no file argument reopens the last session's tabs and which one was active: paths, caret, and scroll anchor. Unsaved text is not restored. A file argument opens beside those tabs.
+12. There is no tab limit. A background tab does not parse or paint.
 
 **Slices, in order**
 
@@ -515,7 +532,7 @@ From `~/Projects/inkmark/PRODUCT_REVIEW.md`, outside the repo. This is the order
 
 **Chrome, as built (0.2.2):** Ctrl+Shift+B shows or hides the outline, and that choice is remembered with the outline's width. « at the left of the status bar shows or hides the file sidebar, and » at the right does the same for the outline. Each tooltip names its chord. The sidebar's header is ↑, ↗, ↻, +, ⊞, and ∗, with tooltips; All files stays words. ∗ searches the open folder. ⊞ asks for a folder name in the selected folder or the open folder, and the right-click menu can create one beside an entry. An empty name asks for a name. A slash, `.`, or `..` is refused on its own. A dot folder is created and left unselected while All files is off. A folder that is gone before its row is listed does not claim a later folder of the same name. F1 lists the keys in effect and closes on Escape or F1. `the_outline_toggle_is_remembered`, `a_new_folder_is_created_beside_the_selection`, `a_hidden_new_folder_stays_unselected`, `a_missing_folder_does_not_keep_the_reveal`, and `f1_lists_the_keys_in_effect` cover it.
 
-**Not this round:** vim mode, multi-cursor, LSP or Marksman-style diagnostics, tabs, backlinks, a graph, tags, Mermaid and other diagrams, images from the network, rewriting links in other notes when one is renamed or moved, screen-reader support (AccessKit). Link rewriting waits on P8 and a change preview. Network images still need a policy: inkmark makes no network requests.
+**Not this round:** vim mode, multi-cursor, LSP or Marksman-style diagnostics, backlinks, a graph, tags, Mermaid and other diagrams, images from the network, rewriting links in other notes when one is renamed or moved, screen-reader support (AccessKit). Link rewriting waits on P8 and a change preview. Network images still need a policy: inkmark makes no network requests. Tabs are decided under [Tabs](#tabs-2026-10-10).
 
 **Crashes.** Issue 35: the window closed during ordinary use and left no core dump and no Omarchy notification. Leaving the 5 MB file idle reproduced `overflow when subtracting durations`, exit 101, no core. The theme settle (150 ms) and the status hint (4 s) each read the clock twice and subtracted. Both now use one `checked_sub`. Fixed in #36. A separate clipboard-thread segfault on shutdown does dump core; those exits did not.
 
@@ -527,4 +544,4 @@ Held until the [product review](#product-review-2026-10-03) says to pick them up
 
 - Images from the network (needs a network policy: inkmark makes no network requests today).
 - Updating links in other notes when a note is renamed or moved (after P8, with a preview).
-- Tabs, backlinks, a graph, tags, Mermaid and other diagrams, vim mode, multi-cursor, an LSP, and AccessKit for the editor panes.
+- Backlinks, a graph, tags, Mermaid and other diagrams, vim mode, multi-cursor, an LSP, and AccessKit for the editor panes. Tabs are decided under [Tabs](#tabs-2026-10-10).

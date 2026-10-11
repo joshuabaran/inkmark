@@ -48,7 +48,7 @@ mod outline;
 mod recent;
 mod session;
 
-use findbar::FindBar;
+use findbar::FindState;
 use folder_search::{FolderSearch, SearchOpen};
 use gotoline::GoToLine;
 pub(crate) use layout::Mode;
@@ -253,15 +253,47 @@ struct NewFilePrompt {
     error: Option<String>,
 }
 
-struct App {
+/// One open document: its text, its undo stack, and the view state that
+/// belongs to it. The window holds a list of these. This slice always
+/// keeps exactly one, so nothing on screen changes.
+///
+/// The two panes use fixed egui ids. A second tab has to give its views
+/// their own ids, or the panes would share scroll and focus memory.
+///
+/// Keys, font size, line height, and the minimap flags are window
+/// settings. `install_keys`, `apply_settings`, and the minimap toggle
+/// write them onto every tab. A tab added later has to be built with
+/// the current ones.
+struct Tab {
     doc: Document,
+    parse: ParseState,
     code: CodeView,
     live: LiveView,
-    parse: ParseState,
-    mode: Mode,
     /// The pane with keyboard focus (or that last had it).
     focus: Pane,
     banner: Option<Banner>,
+    /// Query and matches for this document. The bar's open flag is on `App`.
+    find: FindState,
+    /// A preview tab is replaced by the next single click. T3 sets this.
+    /// Until then every tab is pinned, which is today's one document.
+    /// The tests read it. The bin does not, until T3.
+    #[cfg_attr(not(test), expect(dead_code))]
+    preview: bool,
+}
+
+impl Tab {
+    fn selection(&self) -> inkmark_buffer::Selection {
+        match self.focus {
+            Pane::Code => self.code.selection(),
+            Pane::Live => self.live.selection(),
+        }
+    }
+}
+
+struct App {
+    tabs: Vec<Tab>,
+    active: usize,
+    mode: Mode,
     /// The last thing that failed (open, save, a dialog), until dismissed.
     error: Option<String>,
     /// A pane's explanation for a key that did nothing, shown for a moment.
@@ -273,7 +305,10 @@ struct App {
     /// A history change waiting on a file being opened: committed once that
     /// file is open, undone if the open was cancelled or failed.
     pending_history: Option<(PathBuf, Place, Travel)>,
-    /// Where to put the caret once the file being opened has been parsed.
+    /// A caret placement waiting on that same open. It describes the
+    /// request, not the document on screen, so a cancelled open does not
+    /// land it on the file that is still showing. A later slice that opens
+    /// into another tab puts the jump on the tab the open lands in.
     pending_jump: Option<(PathBuf, Jump)>,
     /// Tests record URLs here instead of starting a browser.
     #[cfg(test)]
@@ -331,9 +366,9 @@ struct App {
     settings: config::Settings,
     /// Shortcuts for the window, the sidebar and both panes.
     keys: keys::KeyMap,
-    /// Find and replace in the open document. Closed, it still remembers
-    /// the query so F3 can repeat it.
-    find: FindBar,
+    /// The find bar is showing. The query itself is on the active tab, so
+    /// F3 still repeats it after the bar closes.
+    find_open: bool,
     /// Ctrl+G. Closed, it keeps nothing: the next open starts empty.
     goto: GoToLine,
     /// Ctrl+Shift+F. File names, then matches inside those files.
@@ -350,6 +385,14 @@ struct App {
 }
 
 impl App {
+    fn tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    fn tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+
     fn new(ctx: &egui::Context, path: Option<PathBuf>) -> Self {
         let mut app = Self::with_recent(ctx, path, recent::Recent::load());
         app.os_theme = os_theme::OsTheme::follow(ctx);
@@ -377,20 +420,23 @@ impl App {
         let code_minimap = layout.code_minimap;
         let live_minimap = layout.live_minimap;
         let search_ctx = ctx.clone();
+        let parse_ctx = ctx.clone();
         let mut app = Self {
-            doc: Document::default(),
-            code: CodeView::with_fonts(fonts.clone(), egui::Id::new("code_view")),
-            live: LiveView::with_fonts(fonts.clone(), egui::Id::new("live_view")),
-            mode,
-            focus: Pane::Code,
-            parse: {
-                let ctx = ctx.clone();
+            tabs: vec![Tab {
+                doc: Document::default(),
+                code: CodeView::with_fonts(fonts.clone(), egui::Id::new("code_view")),
+                live: LiveView::with_fonts(fonts.clone(), egui::Id::new("live_view")),
                 // GitHub Flavored Markdown; PulldownParser is plain CommonMark.
-                ParseState::new(Arc::new(GfmParser), &Document::default(), move || {
-                    ctx.request_repaint()
-                })
-            },
-            banner: None,
+                parse: ParseState::new(Arc::new(GfmParser), &Document::default(), move || {
+                    parse_ctx.request_repaint()
+                }),
+                focus: Pane::Code,
+                banner: None,
+                find: FindState::default(),
+                preview: false,
+            }],
+            active: 0,
+            mode,
             error: None,
             hint: None,
             back: Vec::new(),
@@ -431,7 +477,7 @@ impl App {
             font_stamps: Vec::new(),
             settings: config::Settings::default(),
             keys: keys::KeyMap::builtin(),
-            find: FindBar::default(),
+            find_open: false,
             goto: GoToLine::default(),
             search: FolderSearch::new(root, move || search_ctx.request_repaint()),
             outline: outline::Outline::default(),
@@ -451,29 +497,34 @@ impl App {
                 }
             }
         }
-        app.code.show_minimap = code_minimap;
-        app.live.show_minimap = live_minimap;
+        for tab in &mut app.tabs {
+            tab.code.show_minimap = code_minimap;
+            tab.live.show_minimap = live_minimap;
+        }
         app.install_keys();
         // A live-only window keeps the keyboard on the pane that is showing.
         if app.mode == Mode::Live {
-            app.focus = Pane::Live;
-            app.live.request_focus(ctx);
+            app.tab_mut().focus = Pane::Live;
+            app.tab_mut().live.request_focus(ctx);
         } else {
-            app.code.request_focus(ctx);
+            app.tab_mut().code.request_focus(ctx);
         }
         app
     }
 
-    /// Copies the current shortcuts onto the sidebar and both panes.
+    /// Copies the current shortcuts onto the sidebar and every tab's panes.
     fn install_keys(&mut self) {
-        self.code.set_keys(self.keys.clone());
-        self.live.set_keys(self.keys.clone());
-        self.browser.set_keys(self.keys.clone());
+        let keys = self.keys.clone();
+        for tab in &mut self.tabs {
+            tab.code.set_keys(keys.clone());
+            tab.live.set_keys(keys.clone());
+        }
+        self.browser.set_keys(keys);
     }
 
     /// Opens `path`, asking first if there are unsaved changes.
     fn request_open(&mut self, path: PathBuf) {
-        if self.doc.is_dirty() {
+        if self.tab().doc.is_dirty() {
             self.confirm = Some(Confirm::OpenPath(path));
         } else {
             self.open(path);
@@ -500,24 +551,26 @@ impl App {
     }
 
     fn replace_document(&mut self, doc: Document) {
-        self.doc = doc;
-        self.code.reset();
-        self.live.reset();
-        self.parse.reset(&self.doc);
-        self.banner = None;
+        let tab = self.tab_mut();
+        tab.doc = doc;
+        tab.code.reset();
+        tab.live.reset();
+        tab.parse.reset(&tab.doc);
+        tab.banner = None;
+        tab.find.reset_matches();
         self.error = None;
     }
 
     /// Re-reads the open file. If it's gone, the buffer is kept (it may be
     /// the only copy left) and the missing-file banner says so.
     fn reload(&mut self) {
-        let Some(path) = self.doc.path().map(|p| p.to_path_buf()) else {
+        let Some(path) = self.tab().doc.path().map(|p| p.to_path_buf()) else {
             return;
         };
         match Document::open(&path) {
             Ok(doc) => self.replace_document(doc),
             Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.banner = Some(Banner::DiskMissing);
+                self.tab_mut().banner = Some(Banner::DiskMissing);
             }
             Err(e) => {
                 self.error = Some(format!("Couldn't reload {}: {e}", path.display()));
@@ -526,15 +579,15 @@ impl App {
     }
 
     fn save(&mut self) {
-        if self.doc.path().is_none() {
+        if self.tab().doc.path().is_none() {
             return self.spawn_dialog(DialogKind::SaveAs);
         }
         // Never overwrite someone else's changes without asking.
-        if matches!(self.doc.disk_status(), Ok(DiskStatus::Modified)) {
-            self.banner = Some(Banner::DiskChanged);
+        if matches!(self.tab().doc.disk_status(), Ok(DiskStatus::Modified)) {
+            self.tab_mut().banner = Some(Banner::DiskChanged);
             return;
         }
-        match self.doc.save() {
+        match self.tab_mut().doc.save() {
             Ok(()) => self.saved(),
             Err(e) => self.error = Some(format!("Couldn't save: {e}")),
         }
@@ -544,14 +597,14 @@ impl App {
         // Saving as the open file is a save: don't overwrite changes made
         // by another program without asking.
         let canonical = |p: &std::path::Path| std::fs::canonicalize(p).ok();
-        let same_file = self.doc.path().is_some_and(|open| {
+        let same_file = self.tab().doc.path().is_some_and(|open| {
             open == path || canonical(open).is_some_and(|c| Some(c) == canonical(&path))
         });
-        if same_file && matches!(self.doc.disk_status(), Ok(DiskStatus::Modified)) {
-            self.banner = Some(Banner::DiskChanged);
+        if same_file && matches!(self.tab().doc.disk_status(), Ok(DiskStatus::Modified)) {
+            self.tab_mut().banner = Some(Banner::DiskChanged);
             return;
         }
-        match self.doc.save_as(&path) {
+        match self.tab_mut().doc.save_as(&path) {
             Ok(()) => {
                 self.recent.add(&path);
                 self.saved();
@@ -561,7 +614,7 @@ impl App {
     }
 
     fn saved(&mut self) {
-        self.banner = None;
+        self.tab_mut().banner = None;
         self.error = None;
         if self.close_after_save {
             self.close_allowed = true;
@@ -581,11 +634,12 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let dir = self
+            .tab()
             .doc
             .path()
             .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-            .or_else(|| Some(self.browser.root().to_path_buf()));
+            .map(|p| p.to_path_buf());
+        let dir = dir.or_else(|| Some(self.browser.root().to_path_buf()));
         std::thread::spawn(move || {
             let mut dialog = rfd::FileDialog::new();
             if let Some(dir) = &dir {
@@ -705,10 +759,14 @@ impl App {
         }
         let code_size = settings.code_size.unwrap_or(CODE_SIZE);
         let text_size = settings.text_size.unwrap_or(TEXT_SIZE);
-        self.code.font_size = code_size;
-        self.code.line_height = (code_size * CODE_LINE).round();
-        self.live.font_size = text_size;
-        self.live.line_height = (text_size * TEXT_LINE).round();
+        let code_height = (code_size * CODE_LINE).round();
+        let text_height = (text_size * TEXT_LINE).round();
+        for tab in &mut self.tabs {
+            tab.code.font_size = code_size;
+            tab.code.line_height = code_height;
+            tab.live.font_size = text_size;
+            tab.live.line_height = text_height;
+        }
         // Show what's wrong; once nothing is, take down only our own banner.
         if problems.is_empty() {
             if self.error.is_some() && self.error == self.settings_error {
@@ -729,7 +787,8 @@ impl App {
             if !self.font_files.is_empty() && config::stamps(&self.font_files) != self.font_stamps {
                 self.apply_settings();
             }
-            self.banner = match self.doc.disk_status() {
+            let status = self.tab().doc.disk_status();
+            self.tab_mut().banner = match status {
                 Ok(DiskStatus::Modified) => Some(Banner::DiskChanged),
                 Ok(DiskStatus::Missing) => Some(Banner::DiskMissing),
                 _ => None,
@@ -739,39 +798,41 @@ impl App {
     }
 
     fn selection(&self) -> inkmark_buffer::Selection {
-        match self.focus {
-            Pane::Code => self.code.selection(),
-            Pane::Live => self.live.selection(),
-        }
+        self.tab().selection()
     }
 
     /// Moves keyboard focus (with the caret and scroll position) to `pane`,
     /// switching away from a single-pane mode that hides it.
     fn focus_pane(&mut self, ctx: &egui::Context, pane: Pane) {
-        let selection = self.selection();
-        let parse = self.parse.output();
         let mode_before = self.mode;
-        match pane {
-            Pane::Code => {
-                if self.mode == Mode::Live {
-                    self.code
-                        .set_scroll_pos(self.live.scroll_pos(&self.doc, parse));
-                    self.mode = Mode::Code;
+        let mut mode = self.mode;
+        {
+            let tab = self.tab_mut();
+            let selection = tab.selection();
+            let parse = tab.parse.output();
+            match pane {
+                Pane::Code => {
+                    if mode == Mode::Live {
+                        let pos = tab.live.scroll_pos(&tab.doc, parse);
+                        tab.code.set_scroll_pos(pos);
+                        mode = Mode::Code;
+                    }
+                    tab.code.set_selection(selection);
+                    tab.code.request_focus(ctx);
                 }
-                self.code.set_selection(selection);
-                self.code.request_focus(ctx);
-            }
-            Pane::Live => {
-                if self.mode == Mode::Code {
-                    self.live
-                        .set_scroll_pos(&self.doc, parse, self.code.scroll_pos());
-                    self.mode = Mode::Live;
+                Pane::Live => {
+                    if mode == Mode::Code {
+                        let pos = tab.code.scroll_pos();
+                        tab.live.set_scroll_pos(&tab.doc, parse, pos);
+                        mode = Mode::Live;
+                    }
+                    tab.live.set_selection(selection);
+                    tab.live.request_focus(ctx);
                 }
-                self.live.set_selection(selection);
-                self.live.request_focus(ctx);
             }
+            tab.focus = pane;
         }
-        self.focus = pane;
+        self.mode = mode;
         if self.mode != mode_before {
             self.remember_layout();
         }
@@ -788,8 +849,11 @@ impl App {
             Mode::Code => self.focus_pane(ctx, Pane::Live),
             Mode::Live => {
                 // The code pane was hidden: bring it to where live is.
-                let pos = self.live.scroll_pos(&self.doc, self.parse.output());
-                self.code.set_scroll_pos(pos);
+                let pos = {
+                    let tab = self.tab_mut();
+                    tab.live.scroll_pos(&tab.doc, tab.parse.output())
+                };
+                self.tab_mut().code.set_scroll_pos(pos);
                 self.mode = Mode::Split;
                 self.focus_pane(ctx, Pane::Live);
             }
@@ -800,9 +864,11 @@ impl App {
     /// Writes the mode, both minimaps, and the widths. A resize that only
     /// draws a pane narrower does not call this.
     fn remember_layout(&mut self) {
+        let code_minimap = self.tab().code.show_minimap;
+        let live_minimap = self.tab().live.show_minimap;
         self.layout.mode = self.mode;
-        self.layout.code_minimap = self.code.show_minimap;
-        self.layout.live_minimap = self.live.show_minimap;
+        self.layout.code_minimap = code_minimap;
+        self.layout.live_minimap = live_minimap;
         self.layout.save();
     }
 
@@ -835,10 +901,18 @@ impl App {
                 };
             }
             Action::ToggleMinimap => {
-                // Each pane keeps its own minimap setting.
-                match self.focus {
-                    Pane::Code => self.code.show_minimap ^= true,
-                    Pane::Live => self.live.show_minimap ^= true,
+                // The code pane and the live pane each keep their own
+                // minimap. The choice is the window's, so every tab follows.
+                let focus = self.tab().focus;
+                let on = match focus {
+                    Pane::Code => !self.tab().code.show_minimap,
+                    Pane::Live => !self.tab().live.show_minimap,
+                };
+                for tab in &mut self.tabs {
+                    match focus {
+                        Pane::Code => tab.code.show_minimap = on,
+                        Pane::Live => tab.live.show_minimap = on,
+                    }
                 }
                 self.remember_layout();
             }
@@ -851,7 +925,7 @@ impl App {
             Action::SaveAs => self.spawn_dialog(DialogKind::SaveAs),
             Action::Save => self.save(),
             Action::OpenFile => {
-                if self.doc.is_dirty() {
+                if self.tab().doc.is_dirty() {
                     self.confirm = Some(Confirm::Open);
                 } else {
                     self.spawn_dialog(DialogKind::Open);
@@ -879,11 +953,16 @@ impl App {
         self.search.close();
         let selection = self.selection();
         let range = selection.range();
-        let seed = FindBar::seed(self.doc.slice(range.clone()).as_ref());
-        self.find.open(range.start, seed, replace);
-        // The bar takes the keys; the caret comes back when it closes.
-        self.code.release_focus(ctx);
-        self.live.release_focus(ctx);
+        let already_open = self.find_open;
+        let seed = FindState::seed(self.tab().doc.slice(range.clone()).as_ref());
+        {
+            let tab = self.tab_mut();
+            tab.find.open(range.start, seed, replace, already_open);
+            // The bar takes the keys; the caret comes back when it closes.
+            tab.code.release_focus(ctx);
+            tab.live.release_focus(ctx);
+        }
+        self.find_open = true;
     }
 
     /// Ctrl+G. A dialog already owns the keyboard, so the prompt waits.
@@ -891,11 +970,11 @@ impl App {
         if self.modal_open() {
             return;
         }
-        self.find.close();
+        self.find_open = false;
         self.search.close();
         self.goto.open();
-        self.code.release_focus(ctx);
-        self.live.release_focus(ctx);
+        self.tab_mut().code.release_focus(ctx);
+        self.tab_mut().live.release_focus(ctx);
     }
 
     /// Ctrl+Shift+F. A hidden sidebar is shown, and the query takes the keys.
@@ -903,23 +982,26 @@ impl App {
         if self.modal_open() {
             return;
         }
-        self.find.close();
+        self.find_open = false;
         self.goto.close();
         if !self.sidebar.visible {
             self.sidebar.visible = true;
             self.sidebar.save();
         }
         self.search.open();
-        self.code.release_focus(ctx);
-        self.live.release_focus(ctx);
+        self.tab_mut().code.release_focus(ctx);
+        self.tab_mut().live.release_focus(ctx);
     }
 
     fn find_move(&mut self, next: bool) {
         let selection = self.selection();
-        let moved = if next {
-            self.find.goto_next(&self.doc, selection)
-        } else {
-            self.find.goto_prev(&self.doc, selection)
+        let moved = {
+            let tab = self.tab_mut();
+            if next {
+                tab.find.goto_next(&tab.doc, selection)
+            } else {
+                tab.find.goto_prev(&tab.doc, selection)
+            }
         };
         if let Some(sel) = moved {
             self.show_match(sel);
@@ -932,7 +1014,8 @@ impl App {
         if self.sidebar.visible {
             self.browser.request_focus();
         } else {
-            self.focus_pane(ctx, self.focus);
+            let focus = self.tab().focus;
+            self.focus_pane(ctx, focus);
         }
     }
 
@@ -947,8 +1030,8 @@ impl App {
         }
         self.recent_list = None;
         self.show_keys = true;
-        self.code.release_focus(ctx);
-        self.live.release_focus(ctx);
+        self.tab_mut().code.release_focus(ctx);
+        self.tab_mut().live.release_focus(ctx);
     }
 
     fn modal_open(&self) -> bool {
@@ -965,11 +1048,16 @@ impl App {
     /// Ctrl+Z and Ctrl+Y while the bar holds the keyboard. A field would
     /// undo its own text, and a button click leaves the panes unfocused.
     fn find_history_keys(&mut self, ctx: &egui::Context) {
-        if !self.find.is_open() || self.modal_open() {
+        if !self.find_open || self.modal_open() {
             return;
         }
-        let field = self.find.field_focused(ctx);
-        let pane = self.code.has_focus(ctx) || self.live.has_focus(ctx);
+        let (field, pane) = {
+            let tab = self.tab();
+            (
+                tab.find.field_focused(ctx),
+                tab.code.has_focus(ctx) || tab.live.has_focus(ctx),
+            )
+        };
         if pane && !field {
             return;
         }
@@ -997,27 +1085,29 @@ impl App {
         });
         for action in actions {
             let restored = match action {
-                Action::Undo => self.doc.undo(),
-                Action::Redo => self.doc.redo(),
+                Action::Undo => self.tab_mut().doc.undo(),
+                Action::Redo => self.tab_mut().doc.redo(),
                 _ => None,
             };
             if let Some(selection) = restored {
                 self.show_match(selection);
-                self.find.sync_count(&self.doc, selection);
+                let tab = self.tab_mut();
+                tab.find.sync_count(&tab.doc, selection);
             }
         }
     }
 
     /// Selects `selection` in the focused pane and mirrors it to the other.
     fn show_match(&mut self, selection: Selection) {
-        match self.focus {
+        let tab = self.tab_mut();
+        match tab.focus {
             Pane::Code => {
-                self.code.set_selection(selection);
-                self.live.mirror_selection(selection);
+                tab.code.set_selection(selection);
+                tab.live.mirror_selection(selection);
             }
             Pane::Live => {
-                self.live.set_selection(selection);
-                self.code.mirror_selection(selection);
+                tab.live.set_selection(selection);
+                tab.code.mirror_selection(selection);
             }
         }
     }
@@ -1025,17 +1115,17 @@ impl App {
     fn guard_close(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|i| i.viewport().close_requested());
         if requested && !self.logged_close {
-            let cancel = self.doc.is_dirty() && !self.close_allowed;
+            let cancel = self.tab().doc.is_dirty() && !self.close_allowed;
             session::line(&format!(
                 "close_requested dirty={} cancel={cancel}",
-                self.doc.is_dirty()
+                self.tab().doc.is_dirty()
             ));
             self.logged_close = true;
         }
         if !requested {
             self.logged_close = false;
         }
-        if requested && self.doc.is_dirty() && !self.close_allowed {
+        if requested && self.tab().doc.is_dirty() && !self.close_allowed {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.confirm = Some(Confirm::Close);
         }
@@ -1050,7 +1140,7 @@ impl App {
 
     /// Heartbeat, focus changes, and the e2e harness's timed quit.
     fn note_session(&mut self, ctx: &egui::Context) {
-        let path = self.doc.path().map(|path| path.display().to_string());
+        let path = self.tab().doc.path().map(|path| path.display().to_string());
         let path = path.as_deref().unwrap_or("untitled");
         if self.focused.is_none() {
             session::line(&format!("first_frame path={path}"));
@@ -1064,7 +1154,7 @@ impl App {
             self.last_beat = Instant::now();
             session::line(&format!(
                 "alive focused={focused} dirty={} path={path}",
-                self.doc.is_dirty()
+                self.tab().doc.is_dirty()
             ));
         }
         if let Some(after) = self.quit_after {
@@ -1080,14 +1170,19 @@ impl App {
     }
 
     fn file_name(&self) -> String {
-        self.doc
+        self.tab()
+            .doc
             .path()
             .and_then(|p| p.file_name())
             .map_or_else(|| "untitled".into(), |n| n.to_string_lossy().into_owned())
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
-        let dirty = if self.doc.is_dirty() { "● " } else { "" };
+        let dirty = if self.tab().doc.is_dirty() {
+            "● "
+        } else {
+            ""
+        };
         let title = format!("{dirty}{} — inkmark", self.file_name());
         if title != self.title {
             ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
@@ -1105,7 +1200,7 @@ impl App {
                 }
             });
         }
-        let Some(banner) = &self.banner else {
+        let Some(banner) = &self.tab().banner else {
             if action == Some("dismiss") {
                 self.error = None;
             }
@@ -1132,8 +1227,8 @@ impl App {
             Some("dismiss") => self.error = None,
             Some("reload") => self.reload(),
             Some("keep") => {
-                self.banner = None;
-                if let Err(e) = self.doc.acknowledge_disk_state() {
+                self.tab_mut().banner = None;
+                if let Err(e) = self.tab_mut().doc.acknowledge_disk_state() {
                     self.error = Some(format!("Couldn't check the file: {e}"));
                 }
             }
@@ -1143,14 +1238,15 @@ impl App {
 
     fn status_ui(&mut self, ui: &mut egui::Ui) {
         let head = self.selection().head;
-        let line = self.doc.byte_to_line(head);
-        let column = self
-            .doc
-            .slice(self.doc.line_to_byte(line)..head)
-            .chars()
-            .count()
-            + 1;
-        let encoding = self.doc.encoding();
+        let (line, column, encoding, path, dirty) = {
+            let doc = &self.tab().doc;
+            let line = doc.byte_to_line(head);
+            let column = doc.slice(doc.line_to_byte(line)..head).chars().count() + 1;
+            let path = doc
+                .path()
+                .map_or_else(|| "untitled".into(), |p| p.display().to_string());
+            (line, column, doc.encoding(), path, doc.is_dirty())
+        };
         let files_tip = binding_tip(&self.keys, Action::ToggleSidebar);
         let outline_tip = binding_tip(&self.keys, Action::ToggleOutline);
         let mut toggle_files = false;
@@ -1163,12 +1259,8 @@ impl App {
             if files.clicked() {
                 toggle_files = true;
             }
-            let path = self
-                .doc
-                .path()
-                .map_or_else(|| "untitled".into(), |p| p.display().to_string());
-            ui.label(path);
-            if self.doc.is_dirty() {
+            ui.label(&path);
+            if dirty {
                 ui.label("●");
             }
             if let Some((hint, _)) = &self.hint {
@@ -1210,13 +1302,13 @@ impl App {
             || self.rename.is_some()
             || self.trash_confirm.is_some();
         if open {
-            self.code.release_focus(ctx);
-            self.live.release_focus(ctx);
+            self.tab_mut().code.release_focus(ctx);
+            self.tab_mut().live.release_focus(ctx);
             ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("file_browser")));
         } else if self.modal_was_open {
-            match self.focus {
-                Pane::Code => self.code.request_focus(ctx),
-                Pane::Live => self.live.request_focus(ctx),
+            match self.tab().focus {
+                Pane::Code => self.tab_mut().code.request_focus(ctx),
+                Pane::Live => self.tab_mut().live.request_focus(ctx),
             }
         }
         self.modal_was_open = open;
@@ -1310,13 +1402,13 @@ impl App {
             }
             ("save", Confirm::Open) => {
                 self.save();
-                if !self.doc.is_dirty() {
+                if !self.tab().doc.is_dirty() {
                     self.spawn_dialog(DialogKind::Open);
                 }
             }
             ("save", Confirm::OpenPath(path)) => {
                 self.save();
-                if !self.doc.is_dirty() {
+                if !self.tab().doc.is_dirty() {
                     self.open(path);
                 }
             }
@@ -1614,14 +1706,17 @@ impl App {
     /// disk just now (asked before a rename or move changes its ctime).
     /// `false` when the document isn't affected.
     fn unchanged_if_affected(&self, path: &Path) -> bool {
-        self.doc.path().is_some_and(|open| open.starts_with(path))
-            && matches!(self.doc.disk_status(), Ok(DiskStatus::Unchanged))
+        self.tab()
+            .doc
+            .path()
+            .is_some_and(|open| open.starts_with(path))
+            && matches!(self.tab().doc.disk_status(), Ok(DiskStatus::Unchanged))
     }
 
     /// `old` became `new`: the document, the recent list and the sidebar
     /// follow.
     fn moved(&mut self, old: &Path, new: &Path, was_unchanged: bool) {
-        if let Some(open) = self.doc.path().map(Path::to_path_buf)
+        if let Some(open) = self.tab().doc.path().map(Path::to_path_buf)
             && let Ok(rest) = open.strip_prefix(old)
         {
             let followed = if rest.as_os_str().is_empty() {
@@ -1629,7 +1724,7 @@ impl App {
             } else {
                 new.join(rest)
             };
-            self.doc.moved_to(followed, was_unchanged);
+            self.tab_mut().doc.moved_to(followed, was_unchanged);
         }
         // Places to go back to, and a jump waiting on a file, follow too.
         let follow = |p: &mut PathBuf| {
@@ -1667,7 +1762,11 @@ impl App {
             )
         });
         let (mut confirm, mut cancel) = (confirm_key, cancel_key);
-        let open_inside = self.doc.path().is_some_and(|open| open.starts_with(&path));
+        let open_inside = self
+            .tab()
+            .doc
+            .path()
+            .is_some_and(|open| open.starts_with(&path));
         egui::Modal::new(egui::Id::new("trash")).show(ctx, |ui| {
             ui.set_min_width(420.0);
             ui.heading(format!("Move “{}” to the trash?", display_name(&path)));
@@ -1694,7 +1793,7 @@ impl App {
                         self.browser.refresh_dir(dir);
                     }
                     if open_inside {
-                        self.banner = Some(Banner::DiskMissing);
+                        self.tab_mut().banner = Some(Banner::DiskMissing);
                     }
                 }
                 Err(e) => {
@@ -1712,9 +1811,10 @@ impl App {
     /// Sidebar on the left, heading outline on the right. Each one can be
     /// hidden on its own. Hiding the sidebar leaves the outline up.
     fn editor(&mut self, ui: &mut egui::Ui) {
-        self.browser
-            .set_current(self.doc.path().map(|path| path.to_path_buf()));
-        self.browser.set_dirty(self.doc.is_dirty());
+        let open_path = self.tab().doc.path().map(|path| path.to_path_buf());
+        let dirty = self.tab().doc.is_dirty();
+        self.browser.set_current(open_path);
+        self.browser.set_dirty(dirty);
         if !self.sidebar.visible {
             self.browser.poll_listings(ui.ctx());
         }
@@ -1780,7 +1880,8 @@ impl App {
             }
             if closed {
                 self.search.close();
-                self.focus_pane(ui.ctx(), self.focus);
+                let focus = self.tab().focus;
+                self.focus_pane(ui.ctx(), focus);
             }
             let handle =
                 Rect::from_min_max(pos2(cursor, rect.top()), pos2(cursor + gap, rect.bottom()));
@@ -1854,8 +1955,13 @@ impl App {
                 divider.y_range(),
                 Stroke::new(1.0, colors.divider),
             );
-            self.outline
-                .refresh(self.parse.revision(), &self.doc, self.parse.output());
+            {
+                // Field borrow: `tab()` would take all of `self`, and the
+                // outline is borrowed beside the document.
+                let tab = &self.tabs[self.active];
+                self.outline
+                    .refresh(tab.parse.revision(), &tab.doc, tab.parse.output());
+            }
             let caret = self.selection().head;
             let clicked = ui
                 .scope_builder(UiBuilder::new().max_rect(outline_rect), |ui| {
@@ -1866,7 +1972,8 @@ impl App {
                 let here = self.here();
                 self.jump_to(offset);
                 self.remember(here);
-                self.focus_pane(ui.ctx(), self.focus);
+                let focus = self.tab().focus;
+                self.focus_pane(ui.ctx(), focus);
             }
         }
     }
@@ -1876,13 +1983,18 @@ impl App {
     fn open_search_hit(&mut self, hit: SearchOpen) {
         match hit {
             SearchOpen::File(path) => {
-                if self.doc.path() != Some(path.as_path()) {
+                if self.tab().doc.path() != Some(path.as_path()) {
                     self.request_open(path);
                 }
             }
             SearchOpen::Match { path, range, text } => {
-                if self.doc.path() == Some(path.as_path()) {
-                    let Some(range) = self.search.locate(&self.doc, range, &text) else {
+                let same = self.tab().doc.path() == Some(path.as_path());
+                if same {
+                    // Field borrow, so `search` and the document are borrowed together.
+                    let located = self
+                        .search
+                        .locate(&self.tabs[self.active].doc, range, &text);
+                    let Some(range) = located else {
                         return;
                     };
                     let here = self.here();
@@ -1934,16 +2046,21 @@ impl App {
 
     /// Follows the link at `at` in the open document (Ctrl+click).
     fn follow(&mut self, at: usize) {
-        let Some(link) = inkmark_parse::link_at(&self.doc, self.parse.output(), at) else {
+        let link = {
+            let tab = self.tab();
+            inkmark_parse::link_at(&tab.doc, tab.parse.output(), at)
+        };
+        let Some(link) = link else {
             return;
         };
-        let here = Place {
-            path: self.doc.path().map(Path::to_path_buf),
-            offset: self.selection().head,
-        };
+        let here = self.here();
         let dest = match link {
             inkmark_parse::Link::Footnote(label) => {
-                match inkmark_parse::footnote_offset(&self.doc, self.parse.output(), &label) {
+                let offset = {
+                    let tab = self.tab();
+                    inkmark_parse::footnote_offset(&tab.doc, tab.parse.output(), &label)
+                };
+                match offset {
                     Some(offset) => {
                         self.remember(here);
                         self.jump_to(offset);
@@ -1954,11 +2071,12 @@ impl App {
             }
             inkmark_parse::Link::Dest(dest) => dest,
         };
-        let base = self
-            .doc
-            .path()
+        let open_path = self.tab().doc.path().map(Path::to_path_buf);
+        let parent = open_path
+            .as_deref()
             .and_then(Path::parent)
-            .map_or_else(|| self.browser.root().to_path_buf(), Path::to_path_buf);
+            .map(Path::to_path_buf);
+        let base = parent.unwrap_or_else(|| self.browser.root().to_path_buf());
         match links::resolve(&dest, &base) {
             links::Target::External(url) => self.open_external(url),
             links::Target::Document(path) => {
@@ -1969,7 +2087,9 @@ impl App {
                     self.remember(here);
                 }
             }
-            links::Target::File { path, anchor } if Some(path.as_path()) == self.doc.path() => {
+            links::Target::File { path, anchor }
+                if Some(path.as_path()) == open_path.as_deref() =>
+            {
                 if anchor.is_none_or(|a| self.jump_to_anchor(&a)) {
                     self.remember(here);
                 }
@@ -1988,8 +2108,9 @@ impl App {
 
     /// Where the caret is now, as a place to come back to.
     fn here(&self) -> Place {
+        let path = self.tab().doc.path().map(Path::to_path_buf);
         Place {
-            path: self.doc.path().map(Path::to_path_buf),
+            path,
             offset: self.selection().head,
         }
     }
@@ -2022,21 +2143,23 @@ impl App {
         let (Travel::Back(place) | Travel::Forward(place)) = travel.clone() else {
             return;
         };
+        let open = self.tab().doc.path().map(Path::to_path_buf);
         match &place.path {
             // Gone since (deleted, or moved by another program): say so,
             // and keep the place, rather than open an empty file there.
-            Some(path) if Some(path.as_path()) != self.doc.path() && !path.exists() => {
+            Some(path) if Some(path.as_path()) != open.as_deref() && !path.exists() => {
                 self.show_hint(format!("{} no longer exists", display_name(path)));
                 self.unwind(travel);
             }
-            Some(path) if Some(path.as_path()) != self.doc.path() => {
+            Some(path) if Some(path.as_path()) != open.as_deref() => {
                 self.pending_jump = Some((path.clone(), Jump::Offset(place.offset)));
                 self.pending_history = Some((path.clone(), here, travel));
                 self.request_open(path.clone());
             }
             _ => {
                 self.commit(here, travel);
-                self.jump_to(place.offset.min(self.doc.len()));
+                let len = self.tab().doc.len();
+                self.jump_to(place.offset.min(len));
             }
         }
     }
@@ -2066,7 +2189,7 @@ impl App {
         let Some((path, here, travel)) = self.pending_history.clone() else {
             return;
         };
-        if self.doc.path() == Some(path.as_path()) {
+        if self.tab().doc.path() == Some(path.as_path()) {
             self.pending_history = None;
             self.commit(here, travel);
         } else if self.confirm.is_none() {
@@ -2076,7 +2199,11 @@ impl App {
     }
 
     fn jump_to_anchor(&mut self, anchor: &str) -> bool {
-        match inkmark_parse::heading_offset(&self.doc, self.parse.output(), anchor) {
+        let offset = {
+            let tab = self.tab();
+            inkmark_parse::heading_offset(&tab.doc, tab.parse.output(), anchor)
+        };
+        match offset {
             Some(offset) => {
                 self.jump_to(offset);
                 true
@@ -2093,8 +2220,9 @@ impl App {
     /// pane, whose caret is then mirrored to the other.
     fn jump_to(&mut self, offset: usize) {
         let caret = inkmark_buffer::Selection::caret(offset);
-        self.code.set_selection(caret);
-        self.live.set_selection(caret);
+        let tab = self.tab_mut();
+        tab.code.set_selection(caret);
+        tab.live.set_selection(caret);
     }
 
     /// Applies a jump waiting on a file opened from a link, once that file
@@ -2104,13 +2232,14 @@ impl App {
         let Some((path, jump)) = self.pending_jump.clone() else {
             return;
         };
-        if self.doc.path() != Some(path.as_path()) {
+        let open = self.tab().doc.path().map(Path::to_path_buf);
+        if open.as_deref() != Some(path.as_path()) {
             if self.confirm.is_none() {
                 self.pending_jump = None;
             }
             return;
         }
-        if !self.parse.is_settled() {
+        if !self.tab().parse.is_settled() {
             return;
         }
         self.pending_jump = None;
@@ -2118,9 +2247,16 @@ impl App {
             Jump::Anchor(anchor) => {
                 self.jump_to_anchor(&anchor);
             }
-            Jump::Offset(offset) => self.jump_to(offset.min(self.doc.len())),
+            Jump::Offset(offset) => {
+                let len = self.tab().doc.len();
+                self.jump_to(offset.min(len));
+            }
             Jump::Select { range, text } => {
-                if let Some(range) = self.search.locate(&self.doc, range, &text) {
+                // Field borrow, so `search` and the document are borrowed together.
+                let located = self
+                    .search
+                    .locate(&self.tabs[self.active].doc, range, &text);
+                if let Some(range) = located {
                     self.show_match(Selection {
                         anchor: range.start,
                         head: range.end,
@@ -2148,11 +2284,16 @@ impl App {
 
     fn panes(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        if let Some(hint) = self.live.take_hint() {
+        let hint = self.tab_mut().live.take_hint();
+        if let Some(hint) = hint {
             self.show_hint(hint);
         }
         // Ctrl+clicks from the last frame, now that the click is over.
-        if let Some(at) = self.live.take_follow().or(self.code.take_follow()) {
+        let followed = {
+            let tab = self.tab_mut();
+            tab.live.take_follow().or(tab.code.take_follow())
+        };
+        if let Some(at) = followed {
             self.follow(at);
         }
         self.settle_history();
@@ -2167,10 +2308,12 @@ impl App {
         }
         match self.mode {
             Mode::Code => {
-                self.code.show(ui, &mut self.doc, Some(&mut self.parse));
+                let tab = self.tab_mut();
+                tab.code.show(ui, &mut tab.doc, Some(&mut tab.parse));
             }
             Mode::Live => {
-                self.live.show(ui, &mut self.doc, Some(&mut self.parse));
+                let tab = self.tab_mut();
+                tab.live.show(ui, &mut tab.doc, Some(&mut tab.parse));
             }
             Mode::Split => {
                 let rect = ui.available_rect_before_wrap();
@@ -2180,10 +2323,12 @@ impl App {
                 let left = Rect::from_min_max(rect.min, pos2(mid - half, rect.bottom()));
                 let right = Rect::from_min_max(pos2(mid + half, rect.top()), rect.max);
                 ui.scope_builder(UiBuilder::new().max_rect(left), |ui| {
-                    self.code.show(ui, &mut self.doc, Some(&mut self.parse));
+                    let tab = self.tab_mut();
+                    tab.code.show(ui, &mut tab.doc, Some(&mut tab.parse));
                 });
                 ui.scope_builder(UiBuilder::new().max_rect(right), |ui| {
-                    self.live.show(ui, &mut self.doc, Some(&mut self.parse));
+                    let tab = self.tab_mut();
+                    tab.live.show(ui, &mut tab.doc, Some(&mut tab.parse));
                 });
                 let hit_half = layout::SPLIT_HIT / 2.0;
                 let hit = Rect::from_min_max(
@@ -2221,27 +2366,32 @@ impl App {
         }
 
         // Clicking into a pane moves focus there too.
-        if self.code.has_focus(&ctx) {
-            self.focus = Pane::Code;
-        } else if self.live.has_focus(&ctx) {
-            self.focus = Pane::Live;
-        }
-        // The other pane mirrors the caret and follows the scroll position.
-        let (code_scrolled, live_scrolled) = (self.code.take_scrolled(), self.live.take_scrolled());
-        let parse = self.parse.output();
-        match self.focus {
-            Pane::Code => self.live.mirror_selection(self.code.selection()),
-            Pane::Live => self.code.mirror_selection(self.live.selection()),
-        }
-        if self.mode == Mode::Split && parse.map.len() == self.doc.len() {
-            if code_scrolled {
-                self.live
-                    .set_scroll_pos(&self.doc, parse, self.code.scroll_pos());
-                ctx.request_repaint();
-            } else if live_scrolled {
-                self.code
-                    .set_scroll_pos(self.live.scroll_pos(&self.doc, parse));
-                ctx.request_repaint();
+        let mode = self.mode;
+        {
+            let tab = self.tab_mut();
+            if tab.code.has_focus(&ctx) {
+                tab.focus = Pane::Code;
+            } else if tab.live.has_focus(&ctx) {
+                tab.focus = Pane::Live;
+            }
+            // The other pane mirrors the caret and follows the scroll position.
+            let (code_scrolled, live_scrolled) =
+                (tab.code.take_scrolled(), tab.live.take_scrolled());
+            let parse = tab.parse.output();
+            match tab.focus {
+                Pane::Code => tab.live.mirror_selection(tab.code.selection()),
+                Pane::Live => tab.code.mirror_selection(tab.live.selection()),
+            }
+            if mode == Mode::Split && parse.map.len() == tab.doc.len() {
+                if code_scrolled {
+                    let pos = tab.code.scroll_pos();
+                    tab.live.set_scroll_pos(&tab.doc, parse, pos);
+                    ctx.request_repaint();
+                } else if live_scrolled {
+                    let pos = tab.live.scroll_pos(&tab.doc, parse);
+                    tab.code.set_scroll_pos(pos);
+                    ctx.request_repaint();
+                }
             }
         }
     }
@@ -2275,30 +2425,31 @@ impl App {
         self.keys_ui(&ctx);
         self.hold_focus_for_dialogs(&ctx);
 
-        if self.banner.is_some() || self.error.is_some() {
+        if self.tab().banner.is_some() || self.error.is_some() {
             egui::Panel::top("banner").show(ui, |ui| self.banner_ui(ui));
         }
         egui::Panel::bottom("status").show(ui, |ui| self.status_ui(ui));
-        if self.find.is_open() {
+        if self.find_open {
             self.find_history_keys(&ctx);
             let selection = self.selection();
             let modal = self.modal_open();
             let step = {
-                let find = &mut self.find;
-                let doc = &mut self.doc;
+                let tab = self.tab_mut();
                 egui::Panel::bottom("find")
-                    .show(ui, |ui| find.show(ui, doc, selection, modal))
+                    .show(ui, |ui| tab.find.show(ui, &mut tab.doc, selection, modal))
                     .inner
             };
             if step.closed {
-                self.focus_pane(&ctx, self.focus);
+                self.find_open = false;
+                let focus = self.tab().focus;
+                self.focus_pane(&ctx, focus);
             }
             if let Some(sel) = step.selection {
                 self.show_match(sel);
             }
         }
         if self.goto.is_open() {
-            let line_count = self.doc.line_count();
+            let line_count = self.tab().doc.line_count();
             let modal = self.modal_open();
             let step = {
                 let goto = &mut self.goto;
@@ -2308,12 +2459,14 @@ impl App {
             };
             if let Some(line) = step.line {
                 let here = self.here();
-                let offset = self.doc.line_to_byte(line);
+                let offset = self.tab().doc.line_to_byte(line);
                 self.jump_to(offset);
                 self.remember(here);
-                self.focus_pane(&ctx, self.focus);
+                let focus = self.tab().focus;
+                self.focus_pane(&ctx, focus);
             } else if step.closed {
-                self.focus_pane(&ctx, self.focus);
+                let focus = self.tab().focus;
+                self.focus_pane(&ctx, focus);
             }
         }
         egui::CentralPanel::default()
@@ -2332,14 +2485,19 @@ impl App {
 
 impl App {
     fn measure_step(&mut self, ctx: &egui::Context) {
-        let Some(m) = &mut self.measure else { return };
-        match m.frame(ctx, self.parse.is_settled(), self.doc.line_count()) {
+        let settled = self.tab().parse.is_settled();
+        let lines = self.tab().doc.line_count();
+        let Some(m) = self.measure.as_mut() else {
+            return;
+        };
+        let step = m.frame(ctx, settled, lines);
+        match step {
             measure::Step::Idle => {}
             measure::Step::ScrollTo(line) => {
                 let pos = inkmark_view::ScrollPos { line, frac: 0.0 };
-                self.code.set_scroll_pos(pos);
-                self.live
-                    .set_scroll_pos(&self.doc, self.parse.output(), pos);
+                let tab = self.tab_mut();
+                tab.code.set_scroll_pos(pos);
+                tab.live.set_scroll_pos(&tab.doc, tab.parse.output(), pos);
             }
             measure::Step::Caret(pane) => {
                 let pane = match pane {
@@ -2347,13 +2505,17 @@ impl App {
                     measure::Pane::Live => Pane::Live,
                 };
                 // The middle of a line in the middle of the document.
-                let line = self.doc.line_count() / 2;
-                let range = self.doc.line_range(line);
-                let mut at = (range.start + range.end) / 2;
-                while !self.doc.is_char_boundary(at) {
-                    at += 1;
-                }
-                self.focus = pane;
+                let at = {
+                    let doc = &self.tab().doc;
+                    let line = doc.line_count() / 2;
+                    let range = doc.line_range(line);
+                    let mut at = (range.start + range.end) / 2;
+                    while !doc.is_char_boundary(at) {
+                        at += 1;
+                    }
+                    at
+                };
+                self.tab_mut().focus = pane;
                 self.jump_to(at);
                 self.focus_pane(ctx, pane);
             }
@@ -2469,19 +2631,20 @@ mod tests {
     }
 
     fn text(app: &App) -> String {
-        app.doc.slice(0..app.doc.len()).into_owned()
+        let doc = &app.tab().doc;
+        doc.slice(0..doc.len()).into_owned()
     }
 
     fn type_into(app: &mut App, s: &str) {
-        let end = app.doc.len();
-        app.doc
-            .apply(
-                vec![inkmark_buffer::Edit::insert(end, s)],
-                inkmark_buffer::Selection::caret(end),
-                inkmark_buffer::Selection::caret(end + s.len()),
-                inkmark_buffer::EditKind::Other,
-            )
-            .unwrap();
+        let doc = &mut app.tab_mut().doc;
+        let end = doc.len();
+        doc.apply(
+            vec![inkmark_buffer::Edit::insert(end, s)],
+            inkmark_buffer::Selection::caret(end),
+            inkmark_buffer::Selection::caret(end + s.len()),
+            inkmark_buffer::EditKind::Other,
+        )
+        .unwrap();
     }
 
     /// Advance width and atlas size of one proportional glyph.
@@ -2524,6 +2687,16 @@ mod tests {
     }
 
     #[test]
+    fn the_window_holds_one_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path(), None);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active, 0);
+        assert!(!app.tab().preview);
+        assert!(!app.find_open);
+    }
+
+    #[test]
     fn a_failed_open_is_not_remembered() {
         // Regression for #3.
         let dir = tempfile::tempdir().unwrap();
@@ -2549,8 +2722,8 @@ mod tests {
         fs::remove_file(&path).unwrap();
         app.reload();
         assert_eq!(text(&app), "# notes\nunsaved\n");
-        assert!(app.doc.is_dirty());
-        assert!(matches!(app.banner, Some(Banner::DiskMissing)));
+        assert!(app.tab().doc.is_dirty());
+        assert!(matches!(app.tab().banner, Some(Banner::DiskMissing)));
     }
 
     #[test]
@@ -2567,7 +2740,7 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "someone else's longer text\n"
         );
-        assert!(matches!(app.banner, Some(Banner::DiskChanged)));
+        assert!(matches!(app.tab().banner, Some(Banner::DiskChanged)));
         // Saving somewhere else is fine.
         app.save_as(dir.path().join("copy.md"));
         assert_eq!(
@@ -2604,11 +2777,11 @@ mod tests {
 
         let opened = app(dir.path(), Some(file.clone()));
         assert_eq!(opened.browser.root(), folder);
-        assert_eq!(opened.doc.path(), Some(file.as_path()));
+        assert_eq!(opened.tab().doc.path(), Some(file.as_path()));
 
         let browsed = app(dir.path(), Some(folder.clone()));
         assert_eq!(browsed.browser.root(), folder);
-        assert!(browsed.doc.path().is_none());
+        assert!(browsed.tab().doc.path().is_none());
         assert!(browsed.recent_list.is_none());
         // Browsing a folder does not remember the folder as a file. The
         // shared test store may still hold the file opened above.
@@ -2616,7 +2789,7 @@ mod tests {
 
         let created = app(dir.path(), Some(missing.clone()));
         assert_eq!(created.browser.root(), folder);
-        assert_eq!(created.doc.path(), Some(missing.as_path()));
+        assert_eq!(created.tab().doc.path(), Some(missing.as_path()));
         assert_eq!(text(&created), "");
 
         let cwd = std::env::current_dir().unwrap();
@@ -2627,7 +2800,7 @@ mod tests {
             recent::Recent::from_store(Some(dir.path().join("empty-recent"))),
         );
         assert_eq!(here.browser.root(), cwd);
-        assert!(here.doc.path().is_none());
+        assert!(here.tab().doc.path().is_none());
         assert!(here.recent_list.is_none());
 
         // Recent files are still offered when nothing was passed, and not
@@ -2656,16 +2829,19 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = app(dir.path(), Some(path));
         app.mode = Mode::Live;
-        app.focus = Pane::Live;
+        app.tab_mut().focus = Pane::Live;
         let pos = inkmark_view::ScrollPos {
             line: 120,
             frac: 0.0,
         };
-        let parse = app.parse.output().clone();
-        app.live.set_scroll_pos(&app.doc, &parse, pos);
+        let parse = app.tab().parse.output().clone();
+        {
+            let tab = app.tab_mut();
+            tab.live.set_scroll_pos(&tab.doc, &parse, pos);
+        }
         app.cycle_mode(&ctx);
         assert!(app.mode == Mode::Split);
-        assert_eq!(app.code.scroll_pos(), pos);
+        assert_eq!(app.tab().code.scroll_pos(), pos);
     }
 
     fn drive(ctx: &egui::Context, app: &mut App, time: &mut f64, events: Vec<egui::Event>) {
@@ -2841,7 +3017,7 @@ mod tests {
         drive(&ctx, &mut app, &mut time, vec![]);
         assert!(!layout_path.exists(), "a frame wrote the layout");
         assert!(app.mode == Mode::Split);
-        assert!(app.code.show_minimap && app.live.show_minimap);
+        assert!(app.tab().code.show_minimap && app.tab().live.show_minimap);
 
         drive(
             &ctx,
@@ -2849,23 +3025,23 @@ mod tests {
             &mut time,
             vec![shortcut(egui::Key::E, egui::Modifiers::COMMAND)],
         );
-        assert!(app.mode == Mode::Code && app.focus == Pane::Code);
+        assert!(app.mode == Mode::Code && app.tab().focus == Pane::Code);
         drive(
             &ctx,
             &mut app,
             &mut time,
             vec![shortcut(egui::Key::M, egui::Modifiers::COMMAND)],
         );
-        assert!(!app.code.show_minimap);
-        assert!(app.live.show_minimap);
+        assert!(!app.tab().code.show_minimap);
+        assert!(app.tab().live.show_minimap);
         let stored = fs::read_to_string(&layout_path).unwrap();
         assert!(stored.starts_with("code\n0\n1\n"), "{stored}");
 
         let ctx = egui::Context::default();
         let mut app = App::with_recent(&ctx, None, recent::Recent::from_store(Some(store.clone())));
-        assert!(app.mode == Mode::Code && app.focus == Pane::Code);
-        assert!(!app.code.show_minimap);
-        assert!(app.live.show_minimap);
+        assert!(app.mode == Mode::Code && app.tab().focus == Pane::Code);
+        assert!(!app.tab().code.show_minimap);
+        assert!(app.tab().live.show_minimap);
 
         // Ctrl+2 leaves code-only and shows the live pane.
         drive(
@@ -2874,19 +3050,19 @@ mod tests {
             &mut time,
             vec![shortcut(egui::Key::Num2, egui::Modifiers::COMMAND)],
         );
-        assert!(app.mode == Mode::Live && app.focus == Pane::Live);
+        assert!(app.mode == Mode::Live && app.tab().focus == Pane::Live);
         drive(
             &ctx,
             &mut app,
             &mut time,
             vec![shortcut(egui::Key::M, egui::Modifiers::COMMAND)],
         );
-        assert!(!app.code.show_minimap && !app.live.show_minimap);
+        assert!(!app.tab().code.show_minimap && !app.tab().live.show_minimap);
 
         let ctx = egui::Context::default();
         let app = App::with_recent(&ctx, None, recent::Recent::from_store(Some(store)));
-        assert!(app.mode == Mode::Live && app.focus == Pane::Live);
-        assert!(!app.code.show_minimap && !app.live.show_minimap);
+        assert!(app.mode == Mode::Live && app.tab().focus == Pane::Live);
+        assert!(!app.tab().code.show_minimap && !app.tab().live.show_minimap);
     }
 
     #[test]
@@ -2984,7 +3160,7 @@ mod tests {
         assert_eq!(reloaded.layout.code_fraction, fraction);
         assert_eq!(reloaded.layout.outline_width, outline_width);
         assert!(reloaded.mode == Mode::Split);
-        assert!(reloaded.code.show_minimap && reloaded.live.show_minimap);
+        assert!(reloaded.tab().code.show_minimap && reloaded.tab().live.show_minimap);
     }
 
     #[test]
@@ -3022,7 +3198,7 @@ mod tests {
         tx.send(DialogResult::Folder(Some(other.clone()))).unwrap();
         app.poll_dialog(&ctx);
         assert_eq!(app.browser.root(), other);
-        assert_eq!(app.doc.path(), Some(file.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(file.as_path()));
         assert_eq!(text(&app), "keep\n");
     }
 
@@ -3065,7 +3241,7 @@ mod tests {
         );
         let stored = fs::read_to_string(dir.path().join("sidebar")).unwrap();
         assert!(stored.starts_with("1\n"), "{stored}");
-        assert_eq!(app.doc.path(), Some(file.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(file.as_path()));
         assert_eq!(text(&app), "keep\n");
     }
 
@@ -3094,9 +3270,9 @@ mod tests {
 
         // A clean document opens straight away, through the same path.
         app.confirm = None;
-        app.doc = inkmark_buffer::Document::open(notes.join("a.md")).unwrap();
+        app.tab_mut().doc = inkmark_buffer::Document::open(notes.join("a.md")).unwrap();
         click_at(&ctx, &mut app, &mut time, rect.center());
-        assert_eq!(app.doc.path(), Some(b.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(b.as_path()));
         assert_eq!(text(&app), "b\n");
     }
 
@@ -3161,7 +3337,7 @@ mod tests {
         );
         let created = chapter.join("inside.md");
         assert_eq!(fs::read_to_string(&created).unwrap(), "");
-        assert_eq!(app.doc.path(), Some(created.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(created.as_path()));
         assert_eq!(text(&app), "");
         assert!(app.new_file.is_none());
 
@@ -3187,7 +3363,7 @@ mod tests {
                 .contains("already exists")
         );
         assert_eq!(fs::read_to_string(&created).unwrap(), "");
-        assert_eq!(app.doc.path(), Some(created.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(created.as_path()));
 
         // A name that already has a Markdown extension is not given another.
         app.new_file.as_mut().unwrap().name = "also.md".into();
@@ -3201,7 +3377,7 @@ mod tests {
         let also = chapter.join("also.md");
         assert!(also.is_file());
         assert!(!chapter.join("also.md.md").exists());
-        assert_eq!(app.doc.path(), Some(also.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(also.as_path()));
 
         // Unsaved edits still go through the confirm prompt. The empty file stays.
         type_into(&mut app, "dirty");
@@ -3249,7 +3425,7 @@ mod tests {
         );
         let plain = root_note.join("plain.md");
         assert!(plain.is_file());
-        assert_eq!(app.doc.path(), Some(plain.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(plain.as_path()));
         assert_eq!(text(&app), "");
     }
 
@@ -3289,12 +3465,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(text(&app), "open\n");
-        assert!(app.banner.is_none());
+        assert!(app.tab().banner.is_none());
 
         fs::write(&open, "changed by someone else\n").unwrap();
         app.next_disk_check = std::time::Instant::now();
         app.check_disk(&ctx);
-        assert!(matches!(app.banner, Some(Banner::DiskChanged)));
+        assert!(matches!(app.tab().banner, Some(Banner::DiskChanged)));
         assert_eq!(text(&app), "open\n");
     }
 
@@ -3311,7 +3487,7 @@ mod tests {
         fs::write(&path, "changed elsewhere\n").unwrap();
         app.next_disk_check = Instant::now();
         app.check_disk(&ctx);
-        assert!(matches!(app.banner, Some(Banner::DiskChanged)));
+        assert!(matches!(app.tab().banner, Some(Banner::DiskChanged)));
         assert_eq!(app.error.as_deref(), Some("Couldn't save: disk full"));
     }
 
@@ -3352,13 +3528,13 @@ mod tests {
         );
         let new = dir.path().join("final.md");
         assert!(app.rename.is_none());
-        assert_eq!(app.doc.path(), Some(new.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(new.as_path()));
         assert_eq!(text(&app), "one\nunsaved\n");
-        assert!(app.doc.is_dirty());
+        assert!(app.tab().doc.is_dirty());
         // The rename itself isn't a change on disk.
         app.next_disk_check = Instant::now();
         app.check_disk(&ctx);
-        assert!(app.banner.is_none());
+        assert!(app.tab().banner.is_none());
         assert_eq!(app.recent.entries()[0], new.canonicalize().unwrap());
         // Saving writes to the new name.
         app.save();
@@ -3390,7 +3566,7 @@ mod tests {
             prompt.error
         );
         assert_eq!(fs::read_to_string(dir.path().join("b.md")).unwrap(), "b\n");
-        assert_eq!(app.doc.path(), Some(a.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(a.as_path()));
     }
 
     #[test]
@@ -3419,10 +3595,10 @@ mod tests {
         app.poll_dialog(&ctx);
         let moved = archive.join("notes/a.md");
         assert!(moved.exists());
-        assert_eq!(app.doc.path(), Some(moved.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(moved.as_path()));
         app.next_disk_check = Instant::now();
         app.check_disk(&ctx);
-        assert!(app.banner.is_none());
+        assert!(app.tab().banner.is_none());
 
         // Dropping a row works the same way, and a refusal is an error.
         fs::write(dir.path().join("a.md"), "other\n").unwrap();
@@ -3435,7 +3611,7 @@ mod tests {
             "{:?}",
             app.error
         );
-        assert_eq!(app.doc.path(), Some(moved.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(moved.as_path()));
     }
 
     #[test]
@@ -3473,13 +3649,13 @@ mod tests {
         assert!(!file.exists());
         assert!(bin.path().join("a.md").exists());
         assert_eq!(text(&app), "a\n");
-        assert!(matches!(app.banner, Some(Banner::DiskMissing)));
+        assert!(matches!(app.tab().banner, Some(Banner::DiskMissing)));
     }
 
     /// Frames until the parse is in and any jump from a followed link is done.
     fn settle(ctx: &egui::Context, app: &mut App, time: &mut f64) {
         let start = Instant::now();
-        while !app.parse.is_settled() || app.pending_jump.is_some() {
+        while !app.tab().parse.is_settled() || app.pending_jump.is_some() {
             drive(ctx, app, time, vec![]);
             assert!(start.elapsed() < Duration::from_secs(5), "never settled");
             std::thread::sleep(Duration::from_millis(2));
@@ -3507,7 +3683,7 @@ mod tests {
         drive(&ctx, &mut app, &mut time, vec![]);
         app.follow(offset_of(&app, "second part"));
         settle(&ctx, &mut app, &mut time);
-        assert_eq!(app.doc.path(), Some(b.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(b.as_path()));
         assert_eq!(app.selection().head, offset_of(&app, "Second part"));
         // Alt+Left: back to a.md, where the caret was.
         drive(
@@ -3517,7 +3693,7 @@ mod tests {
             vec![shortcut(egui::Key::ArrowLeft, egui::Modifiers::ALT)],
         );
         settle(&ctx, &mut app, &mut time);
-        assert_eq!(app.doc.path(), Some(a.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(a.as_path()));
         assert_eq!(app.selection().head, clicked_from);
         assert!(app.back.is_empty());
     }
@@ -3539,7 +3715,7 @@ mod tests {
             app.confirm,
             Some(Confirm::OpenPath(dir.path().join("b.md")))
         );
-        assert_eq!(app.doc.path(), Some(a.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(a.as_path()));
         assert!(text(&app).ends_with("draft"));
     }
 
@@ -3572,7 +3748,7 @@ mod tests {
                 .unwrap_or_default();
             assert!(hint.contains(says), "{needle}: {hint:?}");
         }
-        assert_eq!(app.doc.path(), Some(a.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(a.as_path()));
         assert!(
             app.back.is_empty(),
             "nothing followed, nothing to go back to"
@@ -3619,7 +3795,7 @@ mod tests {
         );
         assert!(app.rename.is_none());
         assert!(path.exists());
-        assert_eq!(app.doc.path(), Some(path.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(path.as_path()));
         // Editing the selected stem keeps the extension too.
         app.begin_rename(path.clone());
         drive(&ctx, &mut app, &mut time, vec![]);
@@ -3637,7 +3813,7 @@ mod tests {
         );
         let renamed = dir.path().join("2024.01.03.md");
         assert!(renamed.exists());
-        assert_eq!(app.doc.path(), Some(renamed.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(renamed.as_path()));
     }
 
     #[test]
@@ -3662,14 +3838,14 @@ mod tests {
             &mut time,
             vec![shortcut(egui::Key::Enter, egui::Modifiers::NONE)],
         );
-        assert_eq!(app.doc.path(), Some(b.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(b.as_path()));
         drive(
             &ctx,
             &mut app,
             &mut time,
             vec![shortcut(egui::Key::ArrowLeft, egui::Modifiers::ALT)],
         );
-        assert_eq!(app.doc.path(), Some(b.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(b.as_path()));
         assert_eq!(app.selection().head, 2);
         assert_eq!(text(&app), "Claim[^1].\n\n[^1]: Source.\n");
 
@@ -3680,7 +3856,7 @@ mod tests {
             offset: 0,
         });
         app.go_back();
-        assert_eq!(app.doc.path(), Some(b.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(b.as_path()));
         assert!(app.hint.as_ref().unwrap().0.contains("gone.md"));
         assert!(!gone.exists());
     }
@@ -3695,7 +3871,7 @@ mod tests {
         let mut time = 0.0;
         settle(&ctx, &mut app, &mut time);
         app.follow(1);
-        assert_eq!(app.doc.path(), Some(a.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(a.as_path()));
         assert!(app.hint.as_ref().unwrap().0.contains("later.md"));
         assert!(app.back.is_empty());
     }
@@ -3710,7 +3886,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = app(dir.path(), Some(a));
         app.sidebar.visible = false;
-        assert!(app.mode == Mode::Split && app.focus == Pane::Code);
+        assert!(app.mode == Mode::Split && app.tab().focus == Pane::Code);
         let mut time = 0.0;
         settle(&ctx, &mut app, &mut time);
         drive(
@@ -3769,8 +3945,8 @@ mod tests {
             vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
         );
         let note = offset_of(&app, "The source");
-        assert_eq!(app.live.selection().head, note);
-        assert_eq!(app.code.selection().head, note);
+        assert_eq!(app.tab().live.selection().head, note);
+        assert_eq!(app.tab().code.selection().head, note);
     }
 
     /// Runs whole-app frames (`App::frame`, as the window does) and keeps
@@ -3942,7 +4118,7 @@ mod tests {
 
         fn settle(&mut self) {
             let start = Instant::now();
-            while !self.app.parse.is_settled() {
+            while !self.app.tab().parse.is_settled() {
                 self.frame(vec![]);
                 assert!(start.elapsed() < Duration::from_secs(5));
                 std::thread::sleep(Duration::from_millis(2));
@@ -3980,16 +4156,37 @@ mod tests {
         run.frame(vec![egui::Event::Text("cat".into())]);
         run.frame(vec![]);
         assert_eq!(text(&run.app), "one cat\ntwo cat\n");
-        assert_eq!(run.app.code.selection().range(), 4..7);
-        assert_eq!(run.app.find.match_count(), 2);
-        assert_eq!(run.app.find.match_index(), Some(1));
+        assert_eq!(run.app.tab().code.selection().range(), 4..7);
+        assert_eq!(run.app.tab().find.match_count(), 2);
+        assert_eq!(run.app.tab().find.match_index(), Some(1));
 
-        run.app.find.set_replacement("dog");
+        run.app.tab_mut().find.set_replacement("dog");
         run.click_text("Replace all");
         assert_eq!(text(&run.app), "one dog\ntwo dog\n");
         run.key(egui::Key::Z, egui::Modifiers::COMMAND);
         assert_eq!(text(&run.app), "one cat\ntwo cat\n");
-        assert!(!run.app.doc.can_undo());
+        assert!(!run.app.tab().doc.can_undo());
+    }
+
+    #[test]
+    fn f3_after_opening_another_file_searches_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "aaaa aaaa cat\n").unwrap();
+        fs::write(&b, "cat dog\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a));
+        run.key(egui::Key::F, egui::Modifiers::COMMAND);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("cat".into())]);
+        run.frame(vec![]);
+        assert_eq!(run.app.tab().code.selection().range(), 10..13);
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        run.app.open(b);
+        run.settle();
+        run.key(egui::Key::F3, egui::Modifiers::NONE);
+        assert_eq!(text(&run.app), "cat dog\n");
+        assert_eq!(run.app.tab().code.selection().range(), 0..3);
     }
 
     #[test]
@@ -4009,6 +4206,7 @@ mod tests {
         run.click_text("alpha.md");
         assert_eq!(
             run.app
+                .tab()
                 .doc
                 .path()
                 .and_then(|path| path.file_name().map(|n| n.to_owned())),
@@ -4033,13 +4231,18 @@ mod tests {
         run.settle();
         assert_eq!(
             run.app
+                .tab()
                 .doc
                 .path()
                 .and_then(|path| path.file_name().map(|n| n.to_owned())),
             Some(std::ffi::OsString::from("beta.md"))
         );
         assert_eq!(
-            run.app.doc.slice(run.app.code.selection().range()).as_ref(),
+            run.app
+                .tab()
+                .doc
+                .slice(run.app.tab().code.selection().range())
+                .as_ref(),
             "token"
         );
     }
@@ -4051,6 +4254,7 @@ mod tests {
         fs::write(&beta, "see token here\n").unwrap();
         let mut run = Run::new(dir.path(), Some(beta));
         run.app
+            .tab_mut()
             .doc
             .apply(
                 vec![inkmark_buffer::Edit::insert(0, "xx")],
@@ -4059,7 +4263,7 @@ mod tests {
                 inkmark_buffer::EditKind::Other,
             )
             .unwrap();
-        assert!(run.app.doc.is_dirty());
+        assert!(run.app.tab().doc.is_dirty());
         let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
         run.key(egui::Key::F, shift);
         run.frame(vec![]);
@@ -4067,10 +4271,14 @@ mod tests {
         run.wait_search();
         run.click_text("beta.md  see token here");
         assert_eq!(
-            run.app.doc.slice(run.app.code.selection().range()).as_ref(),
+            run.app
+                .tab()
+                .doc
+                .slice(run.app.tab().code.selection().range())
+                .as_ref(),
             "token"
         );
-        assert_eq!(run.app.code.selection().range(), 6..11);
+        assert_eq!(run.app.tab().code.selection().range(), 6..11);
     }
 
     #[test]
@@ -4090,10 +4298,14 @@ mod tests {
         run.click_text("beta.md  see token here");
         run.settle();
         assert_eq!(
-            run.app.doc.slice(run.app.code.selection().range()).as_ref(),
+            run.app
+                .tab()
+                .doc
+                .slice(run.app.tab().code.selection().range())
+                .as_ref(),
             "token"
         );
-        assert_eq!(run.app.code.selection().range(), 6..11);
+        assert_eq!(run.app.tab().code.selection().range(), 6..11);
     }
 
     #[test]
@@ -4156,8 +4368,8 @@ mod tests {
             button(false),
         ]);
         run.frame(vec![]);
-        assert_eq!(run.app.code.selection().range(), 12..15);
-        assert_eq!(run.app.find.match_index(), Some(2));
+        assert_eq!(run.app.tab().code.selection().range(), 12..15);
+        assert_eq!(run.app.tab().find.match_index(), Some(2));
     }
 
     #[test]
@@ -4245,7 +4457,7 @@ mod tests {
                 saved,
                 "{choice}: saved?"
             );
-            let now = r.app.doc.path().unwrap().to_path_buf();
+            let now = r.app.tab().doc.path().unwrap().to_path_buf();
             assert_eq!(now == b, opened, "{choice}: opened?");
             if !opened {
                 assert_eq!(text(&r.app), "a\nedit\n", "{choice}: edits kept");
@@ -4262,11 +4474,11 @@ mod tests {
         type_into(&mut r.app, "mine\n");
         fs::write(&path, "theirs\n").unwrap();
         r.check_disk_now();
-        assert!(matches!(r.app.banner, Some(Banner::DiskChanged)));
+        assert!(matches!(r.app.tab().banner, Some(Banner::DiskChanged)));
         r.click_text("Keep mine");
-        assert!(r.app.banner.is_none());
+        assert!(r.app.tab().banner.is_none());
         r.check_disk_now();
-        assert!(r.app.banner.is_none(), "their version counts as seen");
+        assert!(r.app.tab().banner.is_none(), "their version counts as seen");
         // Saving now writes ours over theirs, as chosen.
         r.app.save();
         assert_eq!(fs::read_to_string(&path).unwrap(), "one\nmine\n");
@@ -4275,7 +4487,7 @@ mod tests {
         r.check_disk_now();
         r.click_text("Reload");
         assert_eq!(text(&r.app), "theirs again\n");
-        assert!(r.app.banner.is_none());
+        assert!(r.app.tab().banner.is_none());
     }
 
     #[test]
@@ -4286,15 +4498,15 @@ mod tests {
         let mut r = Run::new(dir.path(), Some(path.clone()));
         fs::remove_file(&path).unwrap();
         r.check_disk_now();
-        assert!(matches!(r.app.banner, Some(Banner::DiskMissing)));
+        assert!(matches!(r.app.tab().banner, Some(Banner::DiskMissing)));
         r.click_text("Dismiss");
-        assert!(r.app.banner.is_none());
+        assert!(r.app.tab().banner.is_none());
         r.check_disk_now();
-        assert!(r.app.banner.is_none(), "dismissed stays dismissed");
+        assert!(r.app.tab().banner.is_none(), "dismissed stays dismissed");
         // If a file appears there again, that's a change.
         fs::write(&path, "new\n").unwrap();
         r.check_disk_now();
-        assert!(matches!(r.app.banner, Some(Banner::DiskChanged)));
+        assert!(matches!(r.app.tab().banner, Some(Banner::DiskChanged)));
         assert_eq!(text(&r.app), "one\n");
     }
 
@@ -4319,7 +4531,7 @@ mod tests {
         r.key(egui::Key::ArrowDown, egui::Modifiers::NONE);
         r.key(egui::Key::Enter, egui::Modifiers::NONE);
         assert!(r.app.recent_list.is_none());
-        assert_eq!(r.app.doc.path(), Some(b.as_path()));
+        assert_eq!(r.app.tab().doc.path(), Some(b.as_path()));
         // Escape closes it; a click on a row opens that file.
         r.key(egui::Key::R, egui::Modifiers::COMMAND);
         r.key(egui::Key::Escape, egui::Modifiers::NONE);
@@ -4327,7 +4539,7 @@ mod tests {
         r.key(egui::Key::R, egui::Modifiers::COMMAND);
         r.frame(vec![]);
         r.click_text("c.md");
-        assert_eq!(r.app.doc.path(), Some(c.as_path()));
+        assert_eq!(r.app.tab().doc.path(), Some(c.as_path()));
     }
 
     #[test]
@@ -4372,8 +4584,8 @@ mod tests {
             asked.borrow_mut().push(alias.to_owned());
             None
         });
-        assert_eq!(app.live.font_size, 20.0);
-        assert_eq!(app.code.font_size, CODE_SIZE);
+        assert_eq!(app.tab().live.font_size, 20.0);
+        assert_eq!(app.tab().code.font_size, CODE_SIZE);
         assert!(
             app.error.as_deref().unwrap().contains("No Such Mono 123"),
             "{:?}",
@@ -4391,7 +4603,8 @@ mod tests {
         app.apply_settings_from(Some(&config), |_| None);
         assert!(app.error.as_deref().unwrap().contains("code_size"));
         assert_eq!(
-            app.live.font_size, 20.0,
+            app.tab().live.font_size,
+            20.0,
             "a bad file keeps the last good settings"
         );
     }
@@ -4425,8 +4638,8 @@ mod tests {
                 .contains("using the system font")
         );
         // Line height follows the size.
-        assert_eq!(app.live.line_height, (24.0 * TEXT_LINE).round());
-        assert_eq!(app.code.line_height, 21.0);
+        assert_eq!(app.tab().live.line_height, (24.0 * TEXT_LINE).round());
+        assert_eq!(app.tab().code.line_height, 21.0);
 
         // Fixed: the settings' own error goes away.
         fs::write(&config, "[font]\ntext_size = 24\n").unwrap();
@@ -4452,12 +4665,12 @@ mod tests {
                     .unwrap()
                     .contains("keeping the previous")
             );
-            assert_eq!(app.live.font_size, 24.0);
+            assert_eq!(app.tab().live.font_size, 24.0);
         }
         // A deleted file means defaults.
         fs::remove_file(&config).unwrap();
         app.apply_settings_from(Some(&config), system);
-        assert_eq!(app.live.font_size, TEXT_SIZE);
+        assert_eq!(app.tab().live.font_size, TEXT_SIZE);
         assert!(app.error.is_none());
     }
 
@@ -4469,23 +4682,23 @@ mod tests {
         let path = dir.path().join("a.md");
         fs::write(&path, "word\n").unwrap();
         let mut r = Run::new(dir.path(), Some(path));
-        assert!(r.app.code.show_minimap);
+        assert!(r.app.tab().code.show_minimap);
         r.key(
             egui::Key::M,
             egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
         );
-        assert!(r.app.code.show_minimap);
+        assert!(r.app.tab().code.show_minimap);
         r.key(egui::Key::M, egui::Modifiers::COMMAND);
-        assert!(!r.app.code.show_minimap);
+        assert!(!r.app.tab().code.show_minimap);
 
         r.app.focus_pane(&r.ctx, Pane::Live);
         r.key(
             egui::Key::Num1,
             egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
         );
-        assert!(r.app.focus == Pane::Live);
+        assert!(r.app.tab().focus == Pane::Live);
         r.key(egui::Key::Num1, egui::Modifiers::COMMAND);
-        assert!(r.app.focus == Pane::Code);
+        assert!(r.app.tab().focus == Pane::Code);
     }
 
     #[test]
@@ -4500,9 +4713,10 @@ mod tests {
         r.app.keys = keys;
         r.app.install_keys();
         r.app
+            .tab_mut()
             .code
             .set_selection(inkmark_buffer::Selection { anchor: 0, head: 4 });
-        r.app.code.request_focus(&r.ctx);
+        r.app.tab_mut().code.request_focus(&r.ctx);
         r.key(egui::Key::E, egui::Modifiers::COMMAND);
         assert!(r.app.mode == Mode::Split, "cycle_mode was unbound");
         assert_eq!(text(&r.app), "**word**\n");
@@ -4510,11 +4724,14 @@ mod tests {
 
     fn select_word(r: &mut Run) {
         let start = text(&r.app).find("word").unwrap();
-        r.app.code.set_selection(inkmark_buffer::Selection {
-            anchor: start,
-            head: start + 4,
-        });
-        r.app.code.request_focus(&r.ctx);
+        r.app
+            .tab_mut()
+            .code
+            .set_selection(inkmark_buffer::Selection {
+                anchor: start,
+                head: start + 4,
+            });
+        r.app.tab_mut().code.request_focus(&r.ctx);
     }
 
     #[test]
@@ -4529,7 +4746,7 @@ mod tests {
         // and bold stays on Ctrl+B.
         fs::write(&config, "[font]\ntext_size = 20\n[keys]\nbold = \"nope\"\n").unwrap();
         r.app.apply_settings_from(Some(&config), |_| None);
-        assert_eq!(r.app.live.font_size, 20.0);
+        assert_eq!(r.app.tab().live.font_size, 20.0);
         assert!(
             r.app.error.as_deref().unwrap().contains("keys.bold"),
             "{:?}",
@@ -4609,8 +4826,8 @@ mod tests {
             path: None,
             offset: 0,
         });
-        r.app.focus = Pane::Live;
-        r.app.live.request_focus(&r.ctx);
+        r.app.tab_mut().focus = Pane::Live;
+        r.app.tab_mut().live.request_focus(&r.ctx);
         r.app.jump_to(text(&r.app).find('d').unwrap());
         r.frame(vec![]);
         r.key(
@@ -4666,7 +4883,7 @@ mod tests {
         app.follow(offset_of(&app, "tool"));
         assert_eq!(app.opened_urls.len(), 1, "a script isn't opened");
         assert!(app.hint.as_ref().unwrap().0.contains("tool.sh"));
-        assert_eq!(app.doc.path(), Some(a.as_path()));
+        assert_eq!(app.tab().doc.path(), Some(a.as_path()));
     }
 
     #[test]
@@ -4715,19 +4932,19 @@ mod tests {
         );
 
         run.click_text("Beta");
-        assert_eq!(run.app.code.selection(), Selection::caret(beta));
-        assert_eq!(run.app.live.selection(), Selection::caret(beta));
+        assert_eq!(run.app.tab().code.selection(), Selection::caret(beta));
+        assert_eq!(run.app.tab().live.selection(), Selection::caret(beta));
 
         run.click_text("Alpha");
-        assert_eq!(run.app.code.selection(), Selection::caret(alpha));
-        assert_eq!(run.app.live.selection(), Selection::caret(alpha));
+        assert_eq!(run.app.tab().code.selection(), Selection::caret(alpha));
+        assert_eq!(run.app.tab().live.selection(), Selection::caret(alpha));
 
         run.key(egui::Key::ArrowLeft, egui::Modifiers::ALT);
-        assert_eq!(run.app.code.selection(), Selection::caret(beta));
-        assert_eq!(run.app.live.selection(), Selection::caret(beta));
+        assert_eq!(run.app.tab().code.selection(), Selection::caret(beta));
+        assert_eq!(run.app.tab().live.selection(), Selection::caret(beta));
         run.key(egui::Key::ArrowLeft, egui::Modifiers::ALT);
-        assert_eq!(run.app.code.selection(), Selection::caret(start));
-        assert_eq!(run.app.live.selection(), Selection::caret(start));
+        assert_eq!(run.app.tab().code.selection(), Selection::caret(start));
+        assert_eq!(run.app.tab().live.selection(), Selection::caret(start));
 
         run.click_text("Beta");
         run.frame(vec![egui::Event::Text("Q".into())]);
@@ -4933,11 +5150,17 @@ mod tests {
         let path = dir.path().join("notes.md");
         fs::write(&path, "intro\n\n#\n\nbody\n").unwrap();
         let mut run = Run::new(dir.path(), Some(path));
-        let found = inkmark_parse::headings(&run.app.doc, run.app.parse.output());
+        let found = inkmark_parse::headings(&run.app.tab().doc, run.app.tab().parse.output());
         assert_eq!(found[0].text, "");
         run.click_text("Empty heading");
-        assert_eq!(run.app.code.selection(), Selection::caret(found[0].offset));
-        assert_eq!(run.app.live.selection(), Selection::caret(found[0].offset));
+        assert_eq!(
+            run.app.tab().code.selection(),
+            Selection::caret(found[0].offset)
+        );
+        assert_eq!(
+            run.app.tab().live.selection(),
+            Selection::caret(found[0].offset)
+        );
     }
 
     #[test]
@@ -4989,13 +5212,13 @@ mod tests {
         run.frame(vec![]);
         run.key(egui::Key::Enter, egui::Modifiers::NONE);
         run.frame(vec![]);
-        assert_eq!(run.app.code.selection(), Selection::caret(two));
-        assert_eq!(run.app.live.selection(), Selection::caret(two));
+        assert_eq!(run.app.tab().code.selection(), Selection::caret(two));
+        assert_eq!(run.app.tab().live.selection(), Selection::caret(two));
         assert!(run.text_rect("Go to line").is_none());
 
         run.key(egui::Key::ArrowLeft, egui::Modifiers::ALT);
-        assert_eq!(run.app.code.selection(), Selection::caret(0));
-        assert_eq!(run.app.live.selection(), Selection::caret(0));
+        assert_eq!(run.app.tab().code.selection(), Selection::caret(0));
+        assert_eq!(run.app.tab().live.selection(), Selection::caret(0));
 
         run.key(egui::Key::G, egui::Modifiers::COMMAND);
         run.frame(vec![]);
@@ -5003,8 +5226,8 @@ mod tests {
         run.frame(vec![]);
         run.click_text("Go");
         run.frame(vec![]);
-        assert_eq!(run.app.code.selection(), Selection::caret(three));
-        assert_eq!(run.app.live.selection(), Selection::caret(three));
+        assert_eq!(run.app.tab().code.selection(), Selection::caret(three));
+        assert_eq!(run.app.tab().live.selection(), Selection::caret(three));
     }
 
     #[test]
@@ -5019,12 +5242,12 @@ mod tests {
         run.frame(vec![]);
         run.key(egui::Key::Enter, egui::Modifiers::NONE);
         run.frame(vec![]);
-        assert_eq!(run.app.code.selection().head, 0);
+        assert_eq!(run.app.tab().code.selection().head, 0);
         assert!(run.text_rect("Go to line").is_some());
         run.key(egui::Key::Escape, egui::Modifiers::NONE);
         run.frame(vec![]);
         assert!(run.text_rect("Go to line").is_none());
-        assert_eq!(run.app.code.selection().head, 0);
+        assert_eq!(run.app.tab().code.selection().head, 0);
         assert_eq!(text(&run.app), "one\ntwo\n");
     }
 
@@ -5035,60 +5258,61 @@ mod tests {
         let src = "# Alpha\nvisible body\n## Beta\ninner body\n# Gamma\ntail\n";
         fs::write(&path, src).unwrap();
         let mut run = Run::new(dir.path(), Some(path));
-        assert!(run.app.code.measured_height(1) > 0.0);
-        assert!(run.app.live.measured_height(1) > 0.0);
+        assert!(run.app.tab().code.measured_height(1) > 0.0);
+        assert!(run.app.tab().live.measured_height(1) > 0.0);
 
         run.click_code_mark("▾");
-        let hidden = run.app.code.hidden_ranges().to_vec();
+        let hidden = run.app.tab().code.hidden_ranges().to_vec();
         assert_eq!(hidden.len(), 1, "{hidden:?}");
         let body = text(&run.app).find("visible body").unwrap();
         let inner = text(&run.app).find("inner body").unwrap();
         let gamma = text(&run.app).find("# Gamma").unwrap();
         assert!(hidden[0].start <= body && inner < hidden[0].end);
         assert_eq!(hidden[0].end, gamma);
-        assert_eq!(run.app.code.measured_height(1), 0.0);
-        assert!(run.app.live.measured_height(1) > 0.0);
+        assert_eq!(run.app.tab().code.measured_height(1), 0.0);
+        assert!(run.app.tab().live.measured_height(1) > 0.0);
         assert_eq!(text(&run.app), src);
 
-        run.app.code.request_focus(&run.ctx);
+        run.app.tab().code.request_focus(&run.ctx);
         run.frame(vec![]);
         run.frame(vec![egui::Event::Text("\n".into())]);
         run.frame(vec![]);
-        let shifted = run.app.code.hidden_ranges().to_vec();
+        let shifted = run.app.tab().code.hidden_ranges().to_vec();
         assert_eq!(shifted.len(), 1, "{shifted:?}");
         assert_eq!(shifted[0].start, hidden[0].start + 1);
         assert_eq!(shifted[0].end, hidden[0].end + 1);
 
         let inner = text(&run.app).find("inner body").unwrap();
-        let line = run.app.doc.byte_to_line(inner) + 1;
+        let line = run.app.tab().doc.byte_to_line(inner) + 1;
         run.key(egui::Key::G, egui::Modifiers::COMMAND);
         run.frame(vec![]);
         run.frame(vec![egui::Event::Text(line.to_string())]);
         run.frame(vec![]);
         run.key(egui::Key::Enter, egui::Modifiers::NONE);
         run.frame(vec![]);
-        assert_eq!(run.app.code.selection(), Selection::caret(inner));
-        assert_eq!(run.app.live.selection(), Selection::caret(inner));
+        assert_eq!(run.app.tab().code.selection(), Selection::caret(inner));
+        assert_eq!(run.app.tab().live.selection(), Selection::caret(inner));
         assert!(
             run.app
+                .tab()
                 .code
                 .hidden_ranges()
                 .iter()
                 .all(|range| inner < range.start || inner >= range.end),
             "{:?}",
-            run.app.code.hidden_ranges()
+            run.app.tab().code.hidden_ranges()
         );
-        let shown = run.app.doc.byte_to_line(inner);
-        assert!(run.app.code.measured_height(shown) > 0.0);
-        assert!(run.app.live.measured_height(shown) > 0.0);
+        let shown = run.app.tab().doc.byte_to_line(inner);
+        assert!(run.app.tab().code.measured_height(shown) > 0.0);
+        assert!(run.app.tab().live.measured_height(shown) > 0.0);
 
         run.click_code_mark("▾");
-        assert!(!run.app.code.hidden_ranges().is_empty());
+        assert!(!run.app.tab().code.hidden_ranges().is_empty());
         let other = dir.path().join("other.md");
         fs::write(&other, "plain\n").unwrap();
         run.app.open(other);
         run.frame(vec![]);
-        assert!(run.app.code.hidden_ranges().is_empty());
+        assert!(run.app.tab().code.hidden_ranges().is_empty());
     }
 
     #[test]
@@ -5098,26 +5322,26 @@ mod tests {
         fs::write(&path, "# Alpha\nbody line\n").unwrap();
         let mut run = Run::new(dir.path(), Some(path));
         run.click_code_mark("▾");
-        run.app.code.request_focus(&run.ctx);
+        run.app.tab().code.request_focus(&run.ctx);
         run.frame(vec![]);
         run.key(egui::Key::End, egui::Modifiers::NONE);
         run.key(egui::Key::Enter, egui::Modifiers::NONE);
         run.frame(vec![]);
         assert_eq!(text(&run.app), "# Alpha\n\nbody line\n");
-        let hidden = run.app.code.hidden_ranges().to_vec();
+        let hidden = run.app.tab().code.hidden_ranges().to_vec();
         assert_eq!(hidden.len(), 1, "{hidden:?}");
         assert!(
-            run.app.code.measured_height(1) > 0.0,
+            run.app.tab().code.measured_height(1) > 0.0,
             "the new line is drawn"
         );
-        assert_eq!(run.app.code.measured_height(2), 0.0);
+        assert_eq!(run.app.tab().code.measured_height(2), 0.0);
         let in_code = |rect: &egui::Rect| rect.left() > 220.0 && rect.left() < 520.0;
         assert!(
             run.text_rects("▸").iter().any(in_code),
             "the heading still shows the fold"
         );
         run.click_code_mark("▸");
-        assert!(run.app.code.hidden_ranges().is_empty());
+        assert!(run.app.tab().code.hidden_ranges().is_empty());
     }
 
     #[test]
@@ -5127,15 +5351,15 @@ mod tests {
         fs::write(&path, "# Last\nhidden body").unwrap();
         let mut run = Run::new(dir.path(), Some(path));
         run.click_code_mark("▾");
-        let hidden = run.app.code.hidden_ranges().to_vec();
+        let hidden = run.app.tab().code.hidden_ranges().to_vec();
         assert_eq!(hidden.len(), 1, "{hidden:?}");
-        run.app.code.request_focus(&run.ctx);
+        run.app.tab().code.request_focus(&run.ctx);
         run.frame(vec![]);
         run.key(egui::Key::ArrowDown, egui::Modifiers::NONE);
         run.frame(vec![]);
-        assert_eq!(run.app.code.selection().head, 0);
-        assert_eq!(run.app.code.hidden_ranges(), hidden.as_slice());
-        assert_eq!(run.app.code.measured_height(1), 0.0);
+        assert_eq!(run.app.tab().code.selection().head, 0);
+        assert_eq!(run.app.tab().code.hidden_ranges(), hidden.as_slice());
+        assert_eq!(run.app.tab().code.measured_height(1), 0.0);
         assert_eq!(text(&run.app), "# Last\nhidden body");
     }
 
@@ -5146,12 +5370,13 @@ mod tests {
         fs::write(&path, "# Alpha\nbody line\n# Gamma\ntail\n").unwrap();
         let mut run = Run::new(dir.path(), Some(path));
         run.click_code_mark("▾");
-        let start = run.app.code.hidden_ranges()[0].start;
-        let end = run.app.code.hidden_ranges()[0].end;
+        let start = run.app.tab().code.hidden_ranges()[0].start;
+        let end = run.app.tab().code.hidden_ranges()[0].end;
         // The code pane is not on screen, so it has not shifted the fold.
         run.app.mode = Mode::Live;
         let inserted = "xxxxxxxxxxxxxxxxxxxxxxxx";
         run.app
+            .tab_mut()
             .doc
             .apply(
                 vec![inkmark_buffer::Edit::insert(0, inserted)],
@@ -5161,10 +5386,13 @@ mod tests {
             )
             .unwrap();
         // Inside the old fold range, outside the range once it shifts.
-        run.app.code.set_selection(Selection::caret(start));
+        run.app
+            .tab_mut()
+            .code
+            .set_selection(Selection::caret(start));
         run.app.mode = Mode::Code;
         run.frame(vec![]);
-        let hidden = run.app.code.hidden_ranges().to_vec();
+        let hidden = run.app.tab().code.hidden_ranges().to_vec();
         assert_eq!(hidden.len(), 1, "{hidden:?}");
         assert_eq!(hidden[0].start, start + inserted.len());
         assert_eq!(hidden[0].end, end + inserted.len());
@@ -5180,33 +5408,33 @@ mod tests {
         let mut run = Run::new(dir.path(), Some(path));
 
         run.key(egui::Key::D, egui::Modifiers::COMMAND);
-        let word = run.app.code.selection().range();
+        let word = run.app.tab().code.selection().range();
         assert_eq!(&text(&run.app)[word.clone()], "one");
-        assert_eq!(run.app.live.selection().range(), word);
+        assert_eq!(run.app.tab().live.selection().range(), word);
 
         run.key(
             egui::Key::P,
             egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
         );
-        let para = run.app.code.selection().range();
+        let para = run.app.tab().code.selection().range();
         assert_eq!(&text(&run.app)[para.clone()], "one two\n");
-        assert_eq!(run.app.live.selection().range(), para);
+        assert_eq!(run.app.tab().live.selection().range(), para);
 
         let open = text(&run.app).find('[').unwrap();
         let close = text(&run.app).find(']').unwrap();
-        run.app.code.set_selection(Selection::caret(open));
+        run.app.tab_mut().code.set_selection(Selection::caret(open));
         run.frame(vec![]);
         run.key(
             egui::Key::Backslash,
             egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
         );
-        assert_eq!(run.app.code.selection(), Selection::caret(close));
-        assert_eq!(run.app.live.selection(), Selection::caret(close));
+        assert_eq!(run.app.tab().code.selection(), Selection::caret(close));
+        assert_eq!(run.app.tab().live.selection(), Selection::caret(close));
         run.key(
             egui::Key::Backslash,
             egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
         );
-        assert_eq!(run.app.code.selection(), Selection::caret(open));
+        assert_eq!(run.app.tab().code.selection(), Selection::caret(open));
 
         // The live pane swallows the chord and leaves the caret where it is.
         run.app.focus_pane(&run.ctx, Pane::Live);
@@ -5217,8 +5445,8 @@ mod tests {
             egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
         );
         assert_eq!(text(&run.app), src);
-        assert_eq!(run.app.live.selection(), Selection::caret(open));
-        assert_eq!(run.app.code.selection(), Selection::caret(open));
+        assert_eq!(run.app.tab().live.selection(), Selection::caret(open));
+        assert_eq!(run.app.tab().code.selection(), Selection::caret(open));
     }
 
     #[test]
@@ -5233,34 +5461,39 @@ mod tests {
         let close = text(&run.app).rfind("```").unwrap();
         assert!(
             run.app
+                .tab()
                 .code
                 .hidden_ranges()
                 .iter()
                 .any(|range| range.start <= open && close < range.end),
             "{:?}",
-            run.app.code.hidden_ranges()
+            run.app.tab().code.hidden_ranges()
         );
 
-        run.app.code.request_focus(&run.ctx);
-        run.app.code.mirror_selection(Selection::caret(open));
+        run.app.tab().code.request_focus(&run.ctx);
+        run.app
+            .tab_mut()
+            .code
+            .mirror_selection(Selection::caret(open));
         run.key(
             egui::Key::Backslash,
             egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
         );
         run.frame(vec![]);
-        assert_eq!(run.app.code.selection(), Selection::caret(close));
-        assert_eq!(run.app.live.selection(), Selection::caret(close));
+        assert_eq!(run.app.tab().code.selection(), Selection::caret(close));
+        assert_eq!(run.app.tab().live.selection(), Selection::caret(close));
         assert!(
             run.app
+                .tab()
                 .code
                 .hidden_ranges()
                 .iter()
                 .all(|range| close < range.start || close >= range.end),
             "{:?}",
-            run.app.code.hidden_ranges()
+            run.app.tab().code.hidden_ranges()
         );
-        let line = run.app.doc.byte_to_line(close);
-        assert!(run.app.code.measured_height(line) > 0.0);
+        let line = run.app.tab().doc.byte_to_line(close);
+        assert!(run.app.tab().code.measured_height(line) > 0.0);
         assert_eq!(text(&run.app), src);
     }
 }
