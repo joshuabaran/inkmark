@@ -30,7 +30,7 @@ pub enum Group {
     Edit,
     /// Find, replace, and folder search.
     Find,
-    /// Panes, the sidebar, the outline, and this overlay.
+    /// Panes, the sidebar, the outline, the key overlay, and the syntax cheatsheet.
     View,
     /// Moving through the note and through followed links.
     Navigation,
@@ -288,9 +288,12 @@ pub enum Action {
     Tab8 = 74,
     Tab9 = 75,
     ReopenTab = 76,
+    /// Markdown syntax cheatsheet. Ctrl+Shift+/ so it does not take Ctrl+/,
+    /// which shows this table.
+    ShowSyntax = 77,
 }
 
-const COUNT: usize = 77;
+const COUNT: usize = 78;
 
 impl Action {
     pub const ALL: [Action; COUNT] = [
@@ -371,6 +374,7 @@ impl Action {
         Action::Tab8,
         Action::Tab9,
         Action::ReopenTab,
+        Action::ShowSyntax,
     ];
 
     pub const fn index(self) -> usize {
@@ -1740,6 +1744,14 @@ const TABLE: &[Builtin] = &[
         description: "Reopen the closed tab",
         chords: &[chord(CTRL_SHIFT, Key::T)],
     },
+    Builtin {
+        action: Action::ShowSyntax,
+        id: "show_syntax",
+        group: Group::View,
+        scope: Scope::App,
+        description: "Show or hide the Markdown syntax cheatsheet",
+        chords: &[chord(CTRL_SHIFT, Key::Slash)],
+    },
 ];
 
 impl Listed {
@@ -1849,6 +1861,7 @@ mod tests {
         assert_eq!(map.shortcut_text(Action::ToggleOutline), "Ctrl+Shift+B");
         assert_eq!(map.shortcut_text(Action::NewFolder), "Ctrl+Shift+N");
         assert_eq!(map.shortcut_text(Action::ShowKeys), "Ctrl+/, F1");
+        assert_eq!(map.shortcut_text(Action::ShowSyntax), "Ctrl+Shift+/");
         assert_eq!(map.shortcut_text(Action::PinSearchResult), "Ctrl+Enter");
         assert_eq!(map.shortcut_text(Action::CloseTab), "Ctrl+W");
         assert_eq!(map.shortcut_text(Action::ReopenTab), "Ctrl+Shift+T");
@@ -2332,6 +2345,11 @@ mod tests {
         assert!(hit("show_keys", Action::ShowKeys));
         assert!(hit("ctrl+/", Action::ShowKeys));
         assert!(hit("f1", Action::ShowKeys));
+        assert!(hit("cheatsheet", Action::ShowSyntax));
+        assert!(hit("show_syntax", Action::ShowSyntax));
+        assert!(hit("ctrl+shift+/", Action::ShowSyntax));
+        assert!(!hit("cheatsheet", Action::ShowKeys));
+        assert!(!hit("ctrl+/", Action::ShowSyntax));
         assert!(hit("", Action::Bold));
         assert!(hit("   ", Action::Save));
         assert!(
@@ -2351,6 +2369,7 @@ mod tests {
         assert_eq!(map.platform_text(linux, Action::Bold), "Ctrl+B");
         assert_eq!(map.platform_text(linux, Action::ReopenTab), "Ctrl+Shift+T");
         assert_eq!(map.platform_text(linux, Action::ShowKeys), "Ctrl+/, F1");
+        assert_eq!(map.platform_text(linux, Action::ShowSyntax), "Ctrl+Shift+/");
         assert_eq!(map.platform_text(linux, Action::Back), "Alt+Left");
         assert_eq!(map.shortcut_text(Action::Bold), "Ctrl+B");
         assert_eq!(map.platform_text(mac, Action::Bold), "Cmd+B");

@@ -2529,7 +2529,17 @@ impl LiveView {
             let p = self.place(doc, parse, leaf, frame.width);
             // A second leaf on this line stacks under the height already there.
             self.record_block(line, p.first_line, p.last_line, p.height);
-            self.draw_leaf(painter, &mut meshes, doc, parse, &p, frame, y, &selection);
+            self.draw_leaf(
+                painter,
+                &mut meshes,
+                doc,
+                parse,
+                &p,
+                frame,
+                y,
+                &selection,
+                true,
+            );
             if (p.first_line..=p.last_line).contains(&caret_line) {
                 let r = p.caret_rect(self.selection.head, self.upstream());
                 caret = Some(r.translate(vec2(frame.left + p.indent, y)));
@@ -2760,6 +2770,7 @@ impl LiveView {
         frame: Frame,
         top: f32,
         selection: &Range<usize>,
+        record_hits: bool,
     ) {
         let right = frame.left + frame.width;
         // Container decorations: quote bars and the item's bullet or number.
@@ -2802,7 +2813,14 @@ impl LiveView {
                                     StrokeKind::Inside,
                                 );
                             }
-                            self.checkboxes.push((b.expand(3.0), at, checked));
+                            // The cheatsheet paints through this path and never
+                            // calls `paint`, which is what clears `checkboxes`.
+                            // Recording those hits would grow the list on every
+                            // repaint, and the list would stay after the panel
+                            // closed. A snippet is not a document to toggle.
+                            if record_hits {
+                                self.checkboxes.push((b.expand(3.0), at, checked));
+                            }
                         }
                         None => {
                             let marker = list_marker(doc, parse, c, &p.leaf.containers);
@@ -2904,6 +2922,175 @@ impl LiveView {
             let label_pos = pos2(r.left() + 10.0, r.center().y - self.text.row_height() / 2.0);
             self.text
                 .draw_line(meshes, &label, label_pos, self.theme.markup);
+        }
+    }
+
+    /// Paints `doc` the way the live pane would, with syntax hidden and no
+    /// caret or scrollbar. The syntax cheatsheet uses this so a row matches
+    /// the note beside it. The returned response does not take keyboard focus.
+    pub(crate) fn show_snippet(
+        &mut self,
+        ui: &mut Ui,
+        doc: &Document,
+        parse: &ParseOutput,
+    ) -> Response {
+        self.theme = theme::current(ui.ctx());
+        self.focused = false;
+        self.preedit.clear();
+        self.ctx = Some(ui.ctx().clone());
+        self.math.begin_frame();
+        let shows_image = parse
+            .map
+            .iter()
+            .any(|span| span.style.contains(Style::IMAGE));
+        if shows_image && self.images.is_none() {
+            self.images = Some(ImageCache::new(ui.ctx()));
+        }
+        let width = ui.available_width().max(40.0);
+        let rewrapped = self.text.begin_frame(
+            TextConfig {
+                monospace: false,
+                font_size: self.font_size,
+                line_height: self.line_height,
+                wrap_width: Some(width),
+            },
+            ui.ctx().pixels_per_point(),
+        );
+        if rewrapped {
+            self.lines.invalidate();
+        }
+        if parse.map.len() != doc.len() {
+            let (rect, response) =
+                ui.allocate_exact_size(vec2(width, self.line_height), Sense::hover());
+            let painter = ui.painter_at(rect);
+            self.fill_snippet(&painter, rect);
+            self.text.end_frame(GlyphMeshes::default(), &painter);
+            return response;
+        }
+        let pieces = self.layout_snippet(doc, parse, width);
+        let height = pieces
+            .iter()
+            .map(SnippetPiece::bottom)
+            .fold(self.text.row_height(), f32::max)
+            + 2.0;
+        let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+        let painter = ui.painter_at(rect);
+        // The modal fills with `code_background` (see `Theme::visuals`). The
+        // live pane fills `background` first, which is what separates a code
+        // block and a table header from the surface they sit on.
+        self.fill_snippet(&painter, rect);
+        let mut meshes = GlyphMeshes::default();
+        let selection = 0..0;
+        let frame = Frame {
+            rect,
+            left: rect.left(),
+            width: rect.width(),
+        };
+        for piece in &pieces {
+            match piece {
+                SnippetPiece::Raw {
+                    top, text, blank, ..
+                } => {
+                    if *blank {
+                        continue;
+                    }
+                    self.text.draw_line(
+                        &mut meshes,
+                        text,
+                        pos2(rect.left(), rect.top() + *top),
+                        self.theme.markup,
+                    );
+                }
+                SnippetPiece::Leaf { top, placed } => {
+                    self.draw_leaf(
+                        &painter,
+                        &mut meshes,
+                        doc,
+                        parse,
+                        placed,
+                        frame,
+                        rect.top() + *top,
+                        &selection,
+                        false,
+                    );
+                }
+            }
+        }
+        self.text.end_frame(meshes, &painter);
+        response
+    }
+
+    /// The live pane's background, so a snippet matches the note beside it.
+    fn fill_snippet(&self, painter: &egui::Painter, rect: Rect) {
+        painter.rect_filled(rect, 0.0, self.theme.background);
+    }
+
+    /// The live pane's block walk, without scrolling: raw lines (link
+    /// definitions) and leaves, stacked from the top of the sample.
+    fn layout_snippet(
+        &mut self,
+        doc: &Document,
+        parse: &ParseOutput,
+        width: f32,
+    ) -> Vec<SnippetPiece> {
+        let mut pieces = Vec::new();
+        let mut line = 0;
+        let mut y = 0.0;
+        let mut leaves = parse.blocks.leaves_from(0).peekable();
+        while line < doc.line_count() {
+            let next_first = leaves
+                .peek()
+                .map(|leaf| doc.byte_to_line(leaf.block.range.start));
+            if next_first.is_none_or(|first| first > line) {
+                let text = Self::raw_line_text(doc, line);
+                let blank = text
+                    .trim_start_matches(|c: char| c.is_whitespace() || c == '>')
+                    .is_empty();
+                let height = self.raw_line_height(&text);
+                pieces.push(SnippetPiece::Raw {
+                    top: y,
+                    height,
+                    text: text.into_owned(),
+                    blank,
+                });
+                y += height;
+                line += 1;
+                continue;
+            }
+            let leaf = leaves.next().expect("peeked");
+            let placed = self.place(doc, parse, leaf, width);
+            let height = placed.height;
+            let last = placed.last_line;
+            pieces.push(SnippetPiece::Leaf {
+                top: y,
+                placed: Box::new(placed),
+            });
+            y += height;
+            line = last + 1;
+        }
+        pieces
+    }
+}
+
+/// One piece of a cheatsheet preview, measured from the top of the sample.
+enum SnippetPiece {
+    Raw {
+        top: f32,
+        height: f32,
+        text: String,
+        blank: bool,
+    },
+    Leaf {
+        top: f32,
+        placed: Box<Placed>,
+    },
+}
+
+impl SnippetPiece {
+    fn bottom(&self) -> f32 {
+        match self {
+            Self::Raw { top, height, .. } => top + height,
+            Self::Leaf { top, placed } => top + placed.height,
         }
     }
 }
@@ -3357,5 +3544,42 @@ mod tests {
             placed.body.width()
         );
         assert_eq!(doc.slice(0..doc.len()).as_ref(), src);
+    }
+
+    /// Task rows go through `draw_leaf`, which records checkbox hits for the
+    /// live pane. A snippet is painted by a view that never calls `paint`,
+    /// so those hits must not accumulate across repaints.
+    #[test]
+    fn a_snippet_does_not_collect_checkbox_hits() {
+        use inkmark_parse::GfmParser;
+
+        let ctx = egui::Context::default();
+        let mut view = LiveView::with_fonts(inkmark_text::Fonts::shared(&ctx), Id::new("hits"));
+        let src = "- [ ] open\n- [x] done\n";
+        let doc = Document::from_text(src);
+        let parse = GfmParser.parse(src);
+        let mut time = 0.0;
+        let mut saw_mark = false;
+        for _ in 0..4 {
+            time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_max(Pos2::ZERO, pos2(800.0, 600.0))),
+                time: Some(time),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                view.show_snippet(ui, &doc, &parse);
+            });
+            out.textures_delta.clear();
+            saw_mark |= out.shapes.iter().any(|clipped| match &clipped.shape {
+                egui::Shape::Mesh(mesh) => !mesh.vertices.is_empty(),
+                egui::Shape::Vec(shapes) => shapes.iter().any(
+                    |shape| matches!(shape, egui::Shape::Mesh(mesh) if !mesh.vertices.is_empty()),
+                ),
+                _ => false,
+            });
+            assert_eq!(view.checkboxes.len(), 0);
+        }
+        assert!(saw_mark, "the task sample did not paint");
     }
 }
