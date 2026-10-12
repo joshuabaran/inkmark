@@ -4,7 +4,8 @@
 //! A plain query is counted on the UI thread. A regex query is counted
 //! on a worker: the first match at the caret is selected when the walk
 //! reaches it, and the count follows. The rope the worker sees is a
-//! snapshot, so a newer query or a document edit drops that walk.
+//! snapshot, so a newer query or a document edit drops that walk. The
+//! edit is counted on the next poll.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -750,6 +751,13 @@ impl FindState {
     /// Applies a finished regex walk. The selection is the probed match
     /// when this frame is the one that found it.
     fn poll(&mut self, doc: &Document) -> Option<Selection> {
+        // Typing does not refresh find. The in-flight walk is a snapshot
+        // of the previous text, so count the document as it is now instead
+        // of waiting for that walk to finish.
+        if self.scanning && self.scan_epoch != doc.epoch() {
+            self.scanning = false;
+            self.refresh(doc);
+        }
         let Some(worker) = &self.worker else {
             return None;
         };
@@ -775,6 +783,10 @@ impl FindState {
                 generation, epoch, ..
             } => (*generation, *epoch),
         };
+        // A text edit is handled above: `poll` starts a new walk before
+        // reading events, so this snapshot's generation no longer matches.
+        // Publishing it, or leaving `scanning` set after dropping it, kept
+        // the bar on Searching.
         if generation != self.generation || epoch != doc.epoch() {
             return None;
         }
@@ -990,6 +1002,30 @@ mod tests {
         assert!(bar.poll(&doc).is_none());
         assert_eq!(bar.match_count(), 1);
         assert_eq!(bar.match_index(), Some(1));
+    }
+
+    #[test]
+    fn an_edit_during_a_regex_walk_is_counted_again() {
+        let mut doc = Document::from_text("quickly\n");
+        let mut bar = FindState {
+            regex: true,
+            ..FindState::default()
+        };
+        bar.open(0, Some(r"\w+ly".into()), false, false);
+        assert!(bar.research(&doc).is_none());
+        assert!(bar.scanning());
+        // The editor does not refresh find on a text edit, and nothing
+        // polls between the walk starting and this change.
+        doc.apply(
+            vec![inkmark_buffer::Edit::insert(0, "slowly ")],
+            Selection::caret(0),
+            Selection::caret(0),
+            inkmark_buffer::EditKind::Other,
+        )
+        .unwrap();
+        bar.settle(&doc);
+        assert!(!bar.scanning());
+        assert_eq!(bar.match_count(), 2);
     }
 
     #[test]
