@@ -1,11 +1,13 @@
 //! Every configurable shortcut, and the chord it uses unless config says
-//! otherwise. The app shell, the file browser and both editor panes read
-//! this one table.
+//! otherwise. One builtin table is the only list of action, chord, group,
+//! and description. [`KeyMap`] copies those rows so config can rebind a chord,
+//! input handling reads the rows, and the shortcut overlay draws them.
 //!
 //! Plain editing keys are not actions: arrows, Backspace, Delete, Enter,
 //! Tab, Home, End, Page Up/Down, and Shift held to extend a selection.
 //! Their Ctrl and Alt chords are actions, so they can be rebound. Mouse
-//! gestures (Ctrl+click) and IME are not actions either.
+//! gestures (Ctrl+click) and IME are not actions either. The overlay still
+//! lists those gestures, beside the group they belong to.
 //!
 //! Matching requires Shift and Alt to be exactly the ones named. egui's
 //! `consume_shortcut` uses `matches_logically`, which treats extra Shift
@@ -17,8 +19,175 @@
 
 use egui::{Key, Modifiers};
 
-/// Where an action is handled. A chord belongs to one action everywhere;
-/// two actions never share one, even across these.
+/// Where a shortcut is listed in the overlay. The order is the overlay's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    /// Opening, saving, and the sidebar's file commands.
+    File,
+    /// Switching, closing, and reopening tabs.
+    Tabs,
+    /// Editing text, formatting, and tables.
+    Edit,
+    /// Find, replace, and folder search.
+    Find,
+    /// Panes, the sidebar, the outline, and this overlay.
+    View,
+    /// Moving through the note and through followed links.
+    Navigation,
+    /// The minimap, and pointer gestures that follow a link.
+    Minimap,
+}
+
+impl Group {
+    pub const ALL: [Group; 7] = [
+        Group::File,
+        Group::Tabs,
+        Group::Edit,
+        Group::Find,
+        Group::View,
+        Group::Navigation,
+        Group::Minimap,
+    ];
+
+    /// The heading drawn above this group's rows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Group::File => "File",
+            Group::Tabs => "Tabs",
+            Group::Edit => "Edit",
+            Group::Find => "Find",
+            Group::View => "View/Layout",
+            Group::Navigation => "Navigation",
+            Group::Minimap => "Minimap/Mouse",
+        }
+    }
+}
+
+/// A pointer gesture. It is not a chord, so config cannot rebind it and
+/// key handling does not read it. The overlay lists it with the chords.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gesture {
+    pub group: Group,
+    pub keys: &'static str,
+    pub description: &'static str,
+}
+
+impl Gesture {
+    /// Whether the overlay keeps this gesture for `query`.
+    ///
+    /// `Ctrl+click` also matches `Cmd+click`, the name macOS shows.
+    pub fn matches_query(self, query: &str) -> bool {
+        self.matches_lower(&query.trim().to_lowercase())
+    }
+
+    /// `query_lower` is already trimmed and lowercased. An empty query keeps
+    /// every gesture. The haystack is built once, not per frame.
+    pub fn matches_lower(self, query_lower: &str) -> bool {
+        if query_lower.is_empty() {
+            return true;
+        }
+        gesture_row(self).haystack.contains(query_lower)
+    }
+
+    /// How this machine names the gesture. Linux and Windows keep Ctrl.
+    /// macOS says Cmd. A gesture with no Ctrl is unchanged.
+    pub fn platform_keys(self, os: egui::os::OperatingSystem) -> String {
+        let row = gesture_row(self);
+        if os.is_mac() {
+            row.mac.clone()
+        } else {
+            row.other.clone()
+        }
+    }
+}
+
+struct CachedGesture {
+    gesture: Gesture,
+    haystack: String,
+    mac: String,
+    other: String,
+}
+
+fn gesture_row(gesture: Gesture) -> &'static CachedGesture {
+    cached_gestures()
+        .iter()
+        .find(|row| row.gesture == gesture)
+        .expect("gesture missing from the overlay list")
+}
+
+fn cached_gestures() -> &'static [CachedGesture] {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<CachedGesture>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        GESTURES
+            .iter()
+            .copied()
+            .map(|gesture| {
+                let mac = gesture.keys.replace("Ctrl", "Cmd");
+                let other = gesture.keys.to_owned();
+                let haystack =
+                    format!("{} {mac} {}", gesture.keys, gesture.description).to_lowercase();
+                CachedGesture {
+                    gesture,
+                    haystack,
+                    mac,
+                    other,
+                }
+            })
+            .collect()
+    })
+}
+
+/// One action in the shortcut table. `chords` is empty when it is unbound.
+///
+/// Input handling and the overlay both read these rows from [`KeyMap`].
+/// The rows are copied from the builtin table; config replaces `chords` and
+/// leaves the group, scope, and description as that table wrote them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Binding {
+    pub action: Action,
+    pub group: Group,
+    pub scope: Scope,
+    pub description: &'static str,
+    pub chords: Vec<Chord>,
+}
+
+/// Pointer gestures, in overlay order within their groups.
+///
+/// A gesture is not a chord, so config cannot rebind it and key handling
+/// does not match it. The overlay lists it beside the chords in its group.
+/// Folder search's middle click is the pointer equivalent of
+/// [`Action::PinSearchResult`].
+pub const GESTURES: &[Gesture] = &[
+    Gesture {
+        group: Group::Tabs,
+        keys: "Middle click a tab",
+        description: "Close the tab",
+    },
+    Gesture {
+        group: Group::Find,
+        keys: "Middle click a search result",
+        description: "Open the search result in a pinned tab",
+    },
+    Gesture {
+        group: Group::Minimap,
+        keys: "Ctrl+click",
+        description: "Follow a link, in a preview tab",
+    },
+    Gesture {
+        group: Group::Minimap,
+        keys: "Middle click a link",
+        description: "Follow a link, in a pinned tab",
+    },
+];
+
+/// Where an action is handled.
+///
+/// A chord belongs to one action among the scopes that can see the key at
+/// the same time. [`Scope::Search`] runs only while the folder-search field
+/// is focused, so it may share a chord with an editor or table action.
+/// An app chord is taken before any of those, and the sidebar can be
+/// focused while a pane is not, so those stay exclusive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     /// The window: consumed before a pane sees the key.
@@ -31,6 +200,8 @@ pub enum Scope {
     /// does what it otherwise would (Alt+Shift+Left still extends a
     /// selection).
     Table,
+    /// The folder-search field, and only while that field is focused.
+    Search,
 }
 
 /// One thing a chord can do. The order here is the order of `--list-keys`
@@ -96,27 +267,30 @@ pub enum Action {
     SelectParagraph = 55,
     MatchBracket = 56,
     SearchFolder = 57,
-    ToggleOutline = 58,
-    NewFolder = 59,
-    ShowKeys = 60,
-    CloseTab = 61,
-    TabNext = 62,
-    TabPrevious = 63,
-    TabLeft = 64,
-    TabRight = 65,
-    Tab1 = 66,
-    Tab2 = 67,
-    Tab3 = 68,
-    Tab4 = 69,
-    Tab5 = 70,
-    Tab6 = 71,
-    Tab7 = 72,
-    Tab8 = 73,
-    Tab9 = 74,
-    ReopenTab = 75,
+    /// Ctrl+Enter in the folder-search field. The same chord toggles a task
+    /// in the editor; this scope is the search field, so the two coexist.
+    PinSearchResult = 58,
+    ToggleOutline = 59,
+    NewFolder = 60,
+    ShowKeys = 61,
+    CloseTab = 62,
+    TabNext = 63,
+    TabPrevious = 64,
+    TabLeft = 65,
+    TabRight = 66,
+    Tab1 = 67,
+    Tab2 = 68,
+    Tab3 = 69,
+    Tab4 = 70,
+    Tab5 = 71,
+    Tab6 = 72,
+    Tab7 = 73,
+    Tab8 = 74,
+    Tab9 = 75,
+    ReopenTab = 76,
 }
 
-const COUNT: usize = 76;
+const COUNT: usize = 77;
 
 impl Action {
     pub const ALL: [Action; COUNT] = [
@@ -178,6 +352,7 @@ impl Action {
         Action::SelectParagraph,
         Action::MatchBracket,
         Action::SearchFolder,
+        Action::PinSearchResult,
         Action::ToggleOutline,
         Action::NewFolder,
         Action::ShowKeys,
@@ -202,186 +377,29 @@ impl Action {
         self as usize
     }
 
-    /// The `[keys]` name.
+    /// The `[keys]` name. The builtin table is the only place it is written.
     pub fn id(self) -> &'static str {
-        use Action::*;
-        match self {
-            CycleMode => "cycle_mode",
-            FocusCode => "focus_code",
-            FocusLive => "focus_live",
-            ToggleMinimap => "toggle_minimap",
-            OpenFile => "open_file",
-            Save => "save",
-            SaveAs => "save_as",
-            OpenFolder => "open_folder",
-            ToggleSidebar => "toggle_sidebar",
-            NewFile => "new_file",
-            RecentFiles => "recent_files",
-            Back => "back",
-            Forward => "forward",
-            Rename => "rename",
-            MoveToTrash => "move_to_trash",
-            Undo => "undo",
-            Redo => "redo",
-            Bold => "bold",
-            Italic => "italic",
-            Code => "code",
-            Strikethrough => "strikethrough",
-            Link => "link",
-            ToggleTask => "toggle_task",
-            Heading0 => "heading_0",
-            Heading1 => "heading_1",
-            Heading2 => "heading_2",
-            Heading3 => "heading_3",
-            Heading4 => "heading_4",
-            Heading5 => "heading_5",
-            Heading6 => "heading_6",
-            SelectAll => "select_all",
-            WordLeft => "word_left",
-            WordRight => "word_right",
-            DeleteWordLeft => "delete_word_left",
-            DeleteWordRight => "delete_word_right",
-            DocumentStart => "document_start",
-            DocumentEnd => "document_end",
-            InsertRowAbove => "insert_row_above",
-            InsertRowBelow => "insert_row_below",
-            InsertColumnLeft => "insert_column_left",
-            InsertColumnRight => "insert_column_right",
-            DeleteRow => "delete_row",
-            DeleteColumn => "delete_column",
-            MoveRowUp => "move_row_up",
-            MoveRowDown => "move_row_down",
-            MoveColumnLeft => "move_column_left",
-            MoveColumnRight => "move_column_right",
-            FormatTable => "format_table",
-            InsertTable => "insert_table",
-            Find => "find",
-            Replace => "replace",
-            FindNext => "find_next",
-            FindPrevious => "find_previous",
-            GoToLine => "go_to_line",
-            SelectWord => "select_word",
-            SelectParagraph => "select_paragraph",
-            MatchBracket => "match_bracket",
-            SearchFolder => "search_folder",
-            ToggleOutline => "toggle_outline",
-            NewFolder => "new_folder",
-            ShowKeys => "show_keys",
-            CloseTab => "close_tab",
-            TabNext => "tab_next",
-            TabPrevious => "tab_previous",
-            TabLeft => "tab_left",
-            TabRight => "tab_right",
-            Tab1 => "tab_1",
-            Tab2 => "tab_2",
-            Tab3 => "tab_3",
-            Tab4 => "tab_4",
-            Tab5 => "tab_5",
-            Tab6 => "tab_6",
-            Tab7 => "tab_7",
-            Tab8 => "tab_8",
-            Tab9 => "tab_9",
-            ReopenTab => "reopen_tab",
-        }
+        self.spec().id
     }
 
     /// One line for the README and for `--list-keys`.
     pub fn description(self) -> &'static str {
-        use Action::*;
-        match self {
-            CycleMode => "Cycle split, code, and live",
-            FocusCode => "Focus the code pane (switching to it when only live shows)",
-            FocusLive => "Focus the live pane (switching to it when only code shows)",
-            ToggleMinimap => "Toggle the focused pane's minimap",
-            OpenFile => "Open a file",
-            Save => "Save",
-            SaveAs => "Save as",
-            OpenFolder => "Open a folder in the sidebar",
-            ToggleSidebar => "Show or hide the sidebar",
-            NewFile => "New Markdown file in the selected folder, or the open folder",
-            RecentFiles => "Recent files",
-            Back => "Back to where you followed the last link from",
-            Forward => "Forward again",
-            Rename => "Rename the selected file or folder",
-            MoveToTrash => "Move the selected file or folder to the trash",
-            Undo => "Undo",
-            Redo => "Redo",
-            Bold => "Toggle bold",
-            Italic => "Toggle italic",
-            Code => "Toggle code",
-            Strikethrough => "Toggle strikethrough",
-            Link => "Insert a link",
-            ToggleTask => "Toggle the line's task checkbox",
-            Heading0 => "Turn the line into a paragraph",
-            Heading1 => "Set heading level 1",
-            Heading2 => "Set heading level 2",
-            Heading3 => "Set heading level 3",
-            Heading4 => "Set heading level 4",
-            Heading5 => "Set heading level 5",
-            Heading6 => "Set heading level 6",
-            SelectAll => "Select all",
-            WordLeft => "Move to the previous word",
-            WordRight => "Move to the next word",
-            DeleteWordLeft => "Delete the previous word",
-            DeleteWordRight => "Delete the next word",
-            DocumentStart => "Move to the start of the document",
-            DocumentEnd => "Move to the end of the document",
-            InsertRowAbove => "Insert a table row above",
-            InsertRowBelow => "Insert a table row below",
-            InsertColumnLeft => "Insert a table column to the left",
-            InsertColumnRight => "Insert a table column to the right",
-            DeleteRow => "Delete the table row",
-            DeleteColumn => "Delete the table column",
-            MoveRowUp => "Move the table row up",
-            MoveRowDown => "Move the table row down",
-            MoveColumnLeft => "Move the table column left",
-            MoveColumnRight => "Move the table column right",
-            FormatTable => "Line up the table's pipes",
-            InsertTable => "Insert a 3×3 table",
-            Find => "Find in this file",
-            Replace => "Replace in this file",
-            FindNext => "Find the next match",
-            FindPrevious => "Find the previous match",
-            GoToLine => "Go to line",
-            SelectWord => "Select word",
-            SelectParagraph => "Select paragraph",
-            MatchBracket => "Jump to the matching fence or brackets",
-            SearchFolder => "Search the open folder",
-            ToggleOutline => "Show or hide the outline",
-            NewFolder => "New folder in the selected folder, or the open folder",
-            ShowKeys => "Show or hide the key bindings",
-            CloseTab => "Close the tab",
-            TabNext => "Switch to the next most recently used tab",
-            TabPrevious => "Switch to the previous most recently used tab",
-            TabLeft => "Switch to the tab on the left",
-            TabRight => "Switch to the tab on the right",
-            Tab1 => "Switch to tab 1",
-            Tab2 => "Switch to tab 2",
-            Tab3 => "Switch to tab 3",
-            Tab4 => "Switch to tab 4",
-            Tab5 => "Switch to tab 5",
-            Tab6 => "Switch to tab 6",
-            Tab7 => "Switch to tab 7",
-            Tab8 => "Switch to tab 8",
-            Tab9 => "Switch to tab 9",
-            ReopenTab => "Reopen the closed tab",
-        }
+        self.spec().description
     }
 
     pub fn scope(self) -> Scope {
-        use Action::*;
-        match self {
-            CycleMode | FocusCode | FocusLive | ToggleMinimap | OpenFile | Save | SaveAs
-            | OpenFolder | ToggleSidebar | NewFile | RecentFiles | Back | Forward | Find
-            | Replace | FindNext | FindPrevious | GoToLine | SearchFolder | ToggleOutline
-            | NewFolder | ShowKeys | CloseTab | ReopenTab | TabNext | TabPrevious | TabLeft
-            | TabRight | Tab1 | Tab2 | Tab3 | Tab4 | Tab5 | Tab6 | Tab7 | Tab8 | Tab9 => Scope::App,
-            Rename | MoveToTrash => Scope::Browser,
-            InsertRowAbove | InsertRowBelow | InsertColumnLeft | InsertColumnRight | DeleteRow
-            | DeleteColumn | MoveRowUp | MoveRowDown | MoveColumnLeft | MoveColumnRight
-            | FormatTable | InsertTable => Scope::Table,
-            _ => Scope::Editor,
-        }
+        self.spec().scope
+    }
+
+    /// The overlay section this action is listed under.
+    pub fn group(self) -> Group {
+        self.spec().group
+    }
+
+    fn spec(self) -> &'static Builtin {
+        let row = &TABLE[self.index()];
+        assert_eq!(row.action, self, "binding table is out of order");
+        row
     }
 
     /// Heading actions carry the level (0 is a paragraph).
@@ -431,24 +449,60 @@ impl Chord {
         self.key == key && modifiers.matches_exact(self.modifiers)
     }
 
+    /// Removes every press of one of `chords`. Matching is exact, the same
+    /// rule as [`KeyMap::find`], so an extra Shift or Alt does not count.
+    /// `true` when at least one press was removed.
+    pub fn consume(input: &mut egui::InputState, chords: &[Self]) -> bool {
+        let mut hit = false;
+        input.events.retain(|event| {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            if chords.iter().any(|chord| chord.matches(*key, *modifiers)) {
+                hit = true;
+                false
+            } else {
+                true
+            }
+        });
+        hit
+    }
+
     /// `Ctrl+Shift+S`, `Alt+Left`, `F2`. Modifier order is fixed so the
-    /// same chord always prints the same way.
+    /// same chord always prints the same way. Config and the README use
+    /// this, which always says Ctrl, so a file written on one machine
+    /// applies on another. Slash is `/`, the key a person presses.
     pub fn display(&self) -> String {
-        let mut parts = Vec::new();
-        if self.modifiers.command || self.modifiers.ctrl {
-            parts.push("Ctrl");
+        self.platform_label(egui::os::OperatingSystem::Nix)
+    }
+
+    /// How this machine names the chord. Linux and Windows say Ctrl.
+    /// macOS says Cmd for the command bit and Option for Alt. Super stays
+    /// Super off macOS; egui's own names omit that bit there.
+    pub fn platform_label(self, os: egui::os::OperatingSystem) -> String {
+        let mac = os.is_mac();
+        let mut mods = egui::ModifierNames::NAMES.format(&self.modifiers, mac);
+        if !mac && self.modifiers.mac_cmd {
+            if !mods.is_empty() {
+                mods.push('+');
+            }
+            mods.push_str("Super");
         }
-        if self.modifiers.alt {
-            parts.push("Alt");
+        let key = match self.key {
+            Key::Slash => "/",
+            other => other.name(),
+        };
+        if mods.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{mods}+{key}")
         }
-        if self.modifiers.shift {
-            parts.push("Shift");
-        }
-        if self.modifiers.mac_cmd {
-            parts.push("Super");
-        }
-        parts.push(self.key.name());
-        parts.join("+")
     }
 
     /// Why the desktop will take this chord before inkmark sees it, if it will.
@@ -627,9 +681,27 @@ pub struct Applied {
 }
 
 /// The chords each action currently uses. Empty means the action is unbound.
+///
+/// `rows` is the builtin table with config's chords applied. `listed` is the overlay
+/// text for those rows, rebuilt when a chord changes so a frame does not
+/// format and lowercase the whole list again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyMap {
-    chords: Vec<Vec<Chord>>,
+    rows: Vec<Binding>,
+    listed: Vec<Listed>,
+}
+
+/// Cached overlay text for one [`Binding`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Listed {
+    /// Lowercased description, config name, Ctrl-form chords, and key names.
+    haystack: String,
+    /// Lowercased macOS chord text. Searched only on macOS.
+    mac_lower: String,
+    /// Chord text with Ctrl, for menus, config, and Linux/Windows.
+    other: String,
+    /// Chord text the way macOS names modifiers.
+    mac: String,
 }
 
 impl Default for KeyMap {
@@ -640,51 +712,101 @@ impl Default for KeyMap {
 
 impl KeyMap {
     pub fn builtin() -> Self {
-        let chords = Action::ALL.into_iter().map(default_chords).collect();
-        Self { chords }
+        assert_eq!(TABLE.len(), COUNT, "the binding table is missing an action");
+        let rows: Vec<Binding> = TABLE
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| {
+                assert_eq!(spec.action.index(), i, "binding table is out of order");
+                Binding {
+                    action: spec.action,
+                    group: spec.group,
+                    scope: spec.scope,
+                    description: spec.description,
+                    chords: spec.chords.to_vec(),
+                }
+            })
+            .collect();
+        let listed = rows.iter().map(Listed::from_binding).collect();
+        Self { rows, listed }
     }
 
     pub fn chords(&self, action: Action) -> &[Chord] {
-        &self.chords[action.index()]
+        &self.rows[action.index()].chords
     }
 
     pub fn set(&mut self, action: Action, chords: Vec<Chord>) {
-        self.chords[action.index()] = chords;
+        let i = action.index();
+        self.rows[i].chords = chords;
+        self.listed[i] = Listed::from_binding(&self.rows[i]);
     }
 
     /// The label drawn next to a menu item. Every chord, so a rebound
-    /// action doesn't keep advertising the old key.
+    /// action doesn't keep advertising the old key. Always the Ctrl form
+    /// (`display`), so a menu and config.toml agree.
     pub fn shortcut_text(&self, action: Action) -> String {
-        self.chords(action)
-            .iter()
-            .map(Chord::display)
-            .collect::<Vec<_>>()
-            .join(", ")
+        self.listed[action.index()].other.clone()
     }
 
+    /// The same chords, named the way `os` names modifiers.
+    pub fn platform_text(&self, os: egui::os::OperatingSystem, action: Action) -> String {
+        let listed = &self.listed[action.index()];
+        if os.is_mac() {
+            listed.mac.clone()
+        } else {
+            listed.other.clone()
+        }
+    }
+
+    /// The shortcut rows, in [`Action::ALL`] order. Empty `chords` means
+    /// the action is unbound. The overlay and `--list-keys` read this, and
+    /// [`Self::find`] reads the same rows.
+    pub fn bindings(&self) -> &[Binding] {
+        &self.rows
+    }
+
+    /// Whether the overlay keeps this row for `query`. An empty query keeps
+    /// every row. Matching is case-insensitive, against the description, the
+    /// config name, and the chord text (Ctrl form and this machine's names).
+    pub fn matches_query(
+        &self,
+        action: Action,
+        os: egui::os::OperatingSystem,
+        query: &str,
+    ) -> bool {
+        self.matches_lower(action, os, &query.trim().to_lowercase())
+    }
+
+    /// `query_lower` is already trimmed and lowercased, so a frame can
+    /// prepare it once and test every row.
+    pub fn matches_lower(
+        &self,
+        action: Action,
+        os: egui::os::OperatingSystem,
+        query_lower: &str,
+    ) -> bool {
+        if query_lower.is_empty() {
+            return true;
+        }
+        let listed = &self.listed[action.index()];
+        listed.haystack.contains(query_lower)
+            || (os.is_mac() && listed.mac_lower.contains(query_lower))
+    }
+
+    /// The action whose row in `scope` names this chord. Reads [`Self::bindings`].
     pub fn find(&self, key: Key, modifiers: Modifiers, scope: Scope) -> Option<Action> {
-        self.find_where(key, modifiers, |action| action.scope() == scope)
+        self.rows.iter().find_map(|row| {
+            (row.scope == scope && row.chords.iter().any(|chord| chord.matches(key, modifiers)))
+                .then_some(row.action)
+        })
     }
 
     /// Editor chords and table chords, which the focused pane both sees.
     pub fn find_editing(&self, key: Key, modifiers: Modifiers) -> Option<Action> {
-        self.find_where(key, modifiers, |action| {
-            matches!(action.scope(), Scope::Editor | Scope::Table)
-        })
-    }
-
-    fn find_where(
-        &self,
-        key: Key,
-        modifiers: Modifiers,
-        want: impl Fn(Action) -> bool,
-    ) -> Option<Action> {
-        Action::ALL.into_iter().find(|action| {
-            want(*action)
-                && self
-                    .chords(*action)
-                    .iter()
-                    .any(|chord| chord.matches(key, modifiers))
+        self.rows.iter().find_map(|row| {
+            (matches!(row.scope, Scope::Editor | Scope::Table)
+                && row.chords.iter().any(|chord| chord.matches(key, modifiers)))
+            .then_some(row.action)
         })
     }
 
@@ -737,6 +859,13 @@ impl KeyMap {
         }
     }
 
+    /// Removes presses of this one action and leaves every other key.
+    /// Folder search uses it so a rebound pin chord is the key the field
+    /// actually reads. Matching is exact, the same rule as [`Self::find`].
+    pub fn consume_action(&self, input: &mut egui::InputState, action: Action) -> bool {
+        Chord::consume(input, self.chords(action))
+    }
+
     /// Removes every press of an action in `scope` and returns them, in
     /// the order the keys were pressed. The panes never see those events.
     pub fn consume(&self, input: &mut egui::InputState, scope: Scope) -> Vec<Action> {
@@ -763,12 +892,13 @@ impl KeyMap {
 
     /// Applies `[keys]` entries `(action id, chord texts)`. An empty list
     /// unbinds. An unknown action, a chord that doesn't parse, or an entry
-    /// that would share a chord with another action is reported and that
-    /// action keeps its default. A swap (each action taking the other's
-    /// chord) is not a conflict. If rejecting one entry makes another
-    /// entry collide with the default that snapped back, that one is
-    /// rejected too: otherwise the snapped-back default and the entry
-    /// would share the chord.
+    /// that would share a chord with another action in a conflicting scope
+    /// is reported and that action keeps its default. A swap (each action
+    /// taking the other's chord) is not a conflict. Sharing a chord with a
+    /// scope that may overlap (search with the editor or a table command)
+    /// is not a conflict either, even when some other pair on that chord
+    /// does conflict. If rejecting one entry makes another entry collide
+    /// with the default that snapped back, that one is rejected too.
     pub fn apply(entries: &[(String, Vec<String>)]) -> Applied {
         let mut errors = Vec::new();
         let mut accepted: Vec<(Action, Vec<Chord>)> = Vec::new();
@@ -820,22 +950,36 @@ impl KeyMap {
             let before = accepted.len();
             let mut kept = Vec::new();
             for (action, chords) in accepted.drain(..) {
-                let clash = chords
-                    .iter()
-                    .find_map(|chord| clashes.iter().find(|(clashing, _)| clashing == chord));
-                let Some((chord, owners)) = clash else {
+                // A chord can be in `clashes` because two other actions
+                // conflict. This entry is rejected only when it is one of
+                // those owners. `pin_search_result = "Ctrl+B"` stays even
+                // if `insert_table = "Ctrl+B"` loses to bold.
+                let clash = chords.iter().find_map(|chord| {
+                    let (_, owners) = clashes.iter().find(|(have, _)| have == chord)?;
+                    if !owners.contains(&action) {
+                        return None;
+                    }
+                    let others: Vec<&str> = owners
+                        .iter()
+                        .filter(|owner| {
+                            **owner != action && scopes_conflict(action.scope(), owner.scope())
+                        })
+                        .map(|owner| owner.id())
+                        .collect();
+                    if others.is_empty() {
+                        None
+                    } else {
+                        Some((chord.display(), others))
+                    }
+                });
+                let Some((shown, others)) = clash else {
                     kept.push((action, chords));
                     continue;
                 };
-                let others: Vec<&str> = owners
-                    .iter()
-                    .filter(|owner| **owner != action)
-                    .map(|owner| owner.id())
-                    .collect();
                 errors.push(format!(
                     "keys.{} shares {} with {} (keeping the default)",
                     action.id(),
-                    chord.display(),
+                    shown,
                     others.join(" and ")
                 ));
             }
@@ -857,18 +1001,36 @@ impl KeyMap {
         }
     }
 
+    /// Chords where at least two owners cannot share them.
+    ///
+    /// Each owner list is only the actions that conflict with another
+    /// owner of that chord. Search may sit on the same chord and is left
+    /// out, so a conflict between the other pair does not pull it in.
     fn clashes(&self) -> Vec<(Chord, Vec<Action>)> {
         let mut found: Vec<(Chord, Vec<Action>)> = Vec::new();
-        for action in Action::ALL {
-            for chord in self.chords(action) {
+        for row in &self.rows {
+            for chord in &row.chords {
                 if let Some((_, owners)) = found.iter_mut().find(|(have, _)| have == chord) {
-                    owners.push(action);
+                    owners.push(row.action);
                 } else {
-                    found.push((*chord, vec![action]));
+                    found.push((*chord, vec![row.action]));
                 }
             }
         }
-        found.retain(|(_, owners)| owners.len() > 1);
+        found.retain_mut(|(_, owners)| {
+            let party: Vec<Action> = owners
+                .iter()
+                .copied()
+                .filter(|left| {
+                    owners.iter().any(|right| {
+                        *left != *right && scopes_conflict(left.scope(), right.scope())
+                    })
+                })
+                .collect();
+            let clash = !party.is_empty();
+            *owners = party;
+            clash
+        });
         found
     }
 
@@ -937,97 +1099,694 @@ fn toml_string(text: &str) -> String {
     format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn chord(modifiers: Modifiers, key: Key) -> Chord {
+const fn chord(modifiers: Modifiers, key: Key) -> Chord {
     Chord { modifiers, key }
 }
 
-fn default_chords(action: Action) -> Vec<Chord> {
-    use Action::*;
-    let ctrl = Modifiers::COMMAND;
-    let alt = Modifiers::ALT;
-    let shift = Modifiers::SHIFT;
-    let ctrl_shift = ctrl.plus(shift);
-    let ctrl_alt = ctrl.plus(alt);
-    let alt_shift = alt.plus(shift);
-    let ctrl_alt_shift = ctrl_alt.plus(shift);
-    match action {
-        CycleMode => vec![chord(ctrl, Key::E)],
-        FocusCode => vec![chord(ctrl, Key::Num1)],
-        FocusLive => vec![chord(ctrl, Key::Num2)],
-        ToggleMinimap => vec![chord(ctrl, Key::M)],
-        OpenFile => vec![chord(ctrl, Key::O)],
-        Save => vec![chord(ctrl, Key::S)],
-        SaveAs => vec![chord(ctrl_shift, Key::S)],
-        OpenFolder => vec![chord(ctrl_shift, Key::O)],
-        ToggleSidebar => vec![chord(ctrl_shift, Key::E)],
-        NewFile => vec![chord(ctrl, Key::N)],
-        RecentFiles => vec![chord(ctrl, Key::R)],
-        Back => vec![chord(alt, Key::ArrowLeft)],
-        Forward => vec![chord(alt, Key::ArrowRight)],
-        Rename => vec![chord(Modifiers::NONE, Key::F2)],
-        MoveToTrash => vec![chord(Modifiers::NONE, Key::Delete)],
-        Undo => vec![chord(ctrl, Key::Z)],
-        Redo => vec![chord(ctrl_shift, Key::Z), chord(ctrl, Key::Y)],
-        Bold => vec![chord(ctrl, Key::B)],
-        Italic => vec![chord(ctrl, Key::I)],
-        Code => vec![chord(ctrl, Key::Backtick)],
-        Strikethrough => vec![chord(ctrl_shift, Key::X)],
-        Link => vec![chord(ctrl, Key::K)],
-        ToggleTask => vec![chord(ctrl, Key::Enter)],
-        Heading0 => vec![chord(ctrl_alt, Key::Num0)],
-        Heading1 => vec![chord(ctrl_alt, Key::Num1)],
-        Heading2 => vec![chord(ctrl_alt, Key::Num2)],
-        Heading3 => vec![chord(ctrl_alt, Key::Num3)],
-        Heading4 => vec![chord(ctrl_alt, Key::Num4)],
-        Heading5 => vec![chord(ctrl_alt, Key::Num5)],
-        Heading6 => vec![chord(ctrl_alt, Key::Num6)],
-        SelectAll => vec![chord(ctrl, Key::A)],
-        WordLeft => vec![chord(ctrl, Key::ArrowLeft)],
-        WordRight => vec![chord(ctrl, Key::ArrowRight)],
-        DeleteWordLeft => vec![chord(ctrl, Key::Backspace)],
-        DeleteWordRight => vec![chord(ctrl, Key::Delete)],
-        DocumentStart => vec![chord(ctrl, Key::Home)],
-        DocumentEnd => vec![chord(ctrl, Key::End)],
-        InsertRowAbove => vec![chord(ctrl_alt, Key::ArrowUp)],
-        InsertRowBelow => vec![chord(ctrl_alt, Key::ArrowDown)],
-        InsertColumnLeft => vec![chord(ctrl_alt, Key::ArrowLeft)],
-        InsertColumnRight => vec![chord(ctrl_alt, Key::ArrowRight)],
-        DeleteRow => vec![chord(ctrl_alt, Key::Backspace)],
-        DeleteColumn => vec![chord(ctrl_alt_shift, Key::Backspace)],
-        MoveRowUp => vec![chord(alt_shift, Key::ArrowUp)],
-        MoveRowDown => vec![chord(alt_shift, Key::ArrowDown)],
-        MoveColumnLeft => vec![chord(alt_shift, Key::ArrowLeft)],
-        MoveColumnRight => vec![chord(alt_shift, Key::ArrowRight)],
-        FormatTable => vec![chord(ctrl_alt, Key::F)],
-        InsertTable => vec![chord(ctrl_alt, Key::T)],
-        Find => vec![chord(ctrl, Key::F)],
-        Replace => vec![chord(ctrl, Key::H)],
-        FindNext => vec![chord(Modifiers::NONE, Key::F3)],
-        FindPrevious => vec![chord(shift, Key::F3)],
-        GoToLine => vec![chord(ctrl, Key::G)],
-        SearchFolder => vec![chord(ctrl_shift, Key::F)],
-        ToggleOutline => vec![chord(ctrl_shift, Key::B)],
-        NewFolder => vec![chord(ctrl_shift, Key::N)],
-        ShowKeys => vec![chord(Modifiers::NONE, Key::F1)],
-        CloseTab => vec![chord(ctrl, Key::W)],
-        ReopenTab => vec![chord(ctrl_shift, Key::T)],
-        TabNext => vec![chord(ctrl, Key::Tab)],
-        TabPrevious => vec![chord(ctrl_shift, Key::Tab)],
-        TabLeft => vec![chord(ctrl, Key::PageUp)],
-        TabRight => vec![chord(ctrl, Key::PageDown)],
-        Tab1 => vec![chord(alt, Key::Num1)],
-        Tab2 => vec![chord(alt, Key::Num2)],
-        Tab3 => vec![chord(alt, Key::Num3)],
-        Tab4 => vec![chord(alt, Key::Num4)],
-        Tab5 => vec![chord(alt, Key::Num5)],
-        Tab6 => vec![chord(alt, Key::Num6)],
-        Tab7 => vec![chord(alt, Key::Num7)],
-        Tab8 => vec![chord(alt, Key::Num8)],
-        Tab9 => vec![chord(alt, Key::Num9)],
-        SelectWord => vec![chord(ctrl, Key::D)],
-        SelectParagraph => vec![chord(ctrl_shift, Key::P)],
-        MatchBracket => vec![chord(ctrl_shift, Key::Backslash)],
+const CTRL: Modifiers = Modifiers::COMMAND;
+const ALT: Modifiers = Modifiers::ALT;
+const SHIFT: Modifiers = Modifiers::SHIFT;
+const CTRL_SHIFT: Modifiers = CTRL.plus(SHIFT);
+const CTRL_ALT: Modifiers = CTRL.plus(ALT);
+const ALT_SHIFT: Modifiers = ALT.plus(SHIFT);
+const CTRL_ALT_SHIFT: Modifiers = CTRL_ALT.plus(SHIFT);
+
+/// One builtin shortcut. [`TABLE`] is the only place a default chord, group,
+/// scope, or description is written. [`Action::id`] and the other accessors
+/// read it, and [`KeyMap::builtin`] copies it.
+struct Builtin {
+    action: Action,
+    id: &'static str,
+    group: Group,
+    scope: Scope,
+    description: &'static str,
+    chords: &'static [Chord],
+}
+
+const TABLE: &[Builtin] = &[
+    Builtin {
+        action: Action::CycleMode,
+        id: "cycle_mode",
+        group: Group::View,
+        scope: Scope::App,
+        description: "Cycle split, code, and live",
+        chords: &[chord(CTRL, Key::E)],
+    },
+    Builtin {
+        action: Action::FocusCode,
+        id: "focus_code",
+        group: Group::View,
+        scope: Scope::App,
+        description: "Focus the code pane (switching to it when only live shows)",
+        chords: &[chord(CTRL, Key::Num1)],
+    },
+    Builtin {
+        action: Action::FocusLive,
+        id: "focus_live",
+        group: Group::View,
+        scope: Scope::App,
+        description: "Focus the live pane (switching to it when only code shows)",
+        chords: &[chord(CTRL, Key::Num2)],
+    },
+    Builtin {
+        action: Action::ToggleMinimap,
+        id: "toggle_minimap",
+        group: Group::Minimap,
+        scope: Scope::App,
+        description: "Toggle the focused pane's minimap",
+        chords: &[chord(CTRL, Key::M)],
+    },
+    Builtin {
+        action: Action::OpenFile,
+        id: "open_file",
+        group: Group::File,
+        scope: Scope::App,
+        description: "Open a file",
+        chords: &[chord(CTRL, Key::O)],
+    },
+    Builtin {
+        action: Action::Save,
+        id: "save",
+        group: Group::File,
+        scope: Scope::App,
+        description: "Save",
+        chords: &[chord(CTRL, Key::S)],
+    },
+    Builtin {
+        action: Action::SaveAs,
+        id: "save_as",
+        group: Group::File,
+        scope: Scope::App,
+        description: "Save as",
+        chords: &[chord(CTRL_SHIFT, Key::S)],
+    },
+    Builtin {
+        action: Action::OpenFolder,
+        id: "open_folder",
+        group: Group::File,
+        scope: Scope::App,
+        description: "Open a folder in the sidebar",
+        chords: &[chord(CTRL_SHIFT, Key::O)],
+    },
+    Builtin {
+        action: Action::ToggleSidebar,
+        id: "toggle_sidebar",
+        group: Group::View,
+        scope: Scope::App,
+        description: "Show or hide the sidebar",
+        chords: &[chord(CTRL_SHIFT, Key::E)],
+    },
+    Builtin {
+        action: Action::NewFile,
+        id: "new_file",
+        group: Group::File,
+        scope: Scope::App,
+        description: "New Markdown file in the selected folder, or the open folder",
+        chords: &[chord(CTRL, Key::N)],
+    },
+    Builtin {
+        action: Action::RecentFiles,
+        id: "recent_files",
+        group: Group::File,
+        scope: Scope::App,
+        description: "Recent files",
+        chords: &[chord(CTRL, Key::R)],
+    },
+    Builtin {
+        action: Action::Back,
+        id: "back",
+        group: Group::Navigation,
+        scope: Scope::App,
+        description: "Back to where you followed the last link from",
+        chords: &[chord(ALT, Key::ArrowLeft)],
+    },
+    Builtin {
+        action: Action::Forward,
+        id: "forward",
+        group: Group::Navigation,
+        scope: Scope::App,
+        description: "Forward again",
+        chords: &[chord(ALT, Key::ArrowRight)],
+    },
+    Builtin {
+        action: Action::Rename,
+        id: "rename",
+        group: Group::File,
+        scope: Scope::Browser,
+        description: "Rename the selected file or folder",
+        chords: &[chord(Modifiers::NONE, Key::F2)],
+    },
+    Builtin {
+        action: Action::MoveToTrash,
+        id: "move_to_trash",
+        group: Group::File,
+        scope: Scope::Browser,
+        description: "Move the selected file or folder to the trash",
+        chords: &[chord(Modifiers::NONE, Key::Delete)],
+    },
+    Builtin {
+        action: Action::Undo,
+        id: "undo",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Undo",
+        chords: &[chord(CTRL, Key::Z)],
+    },
+    Builtin {
+        action: Action::Redo,
+        id: "redo",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Redo",
+        chords: &[chord(CTRL_SHIFT, Key::Z), chord(CTRL, Key::Y)],
+    },
+    Builtin {
+        action: Action::Bold,
+        id: "bold",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Toggle bold",
+        chords: &[chord(CTRL, Key::B)],
+    },
+    Builtin {
+        action: Action::Italic,
+        id: "italic",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Toggle italic",
+        chords: &[chord(CTRL, Key::I)],
+    },
+    Builtin {
+        action: Action::Code,
+        id: "code",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Toggle code",
+        chords: &[chord(CTRL, Key::Backtick)],
+    },
+    Builtin {
+        action: Action::Strikethrough,
+        id: "strikethrough",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Toggle strikethrough",
+        chords: &[chord(CTRL_SHIFT, Key::X)],
+    },
+    Builtin {
+        action: Action::Link,
+        id: "link",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Insert a link",
+        chords: &[chord(CTRL, Key::K)],
+    },
+    Builtin {
+        action: Action::ToggleTask,
+        id: "toggle_task",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Toggle the line's task checkbox",
+        chords: &[chord(CTRL, Key::Enter)],
+    },
+    Builtin {
+        action: Action::Heading0,
+        id: "heading_0",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Turn the line into a paragraph",
+        chords: &[chord(CTRL_ALT, Key::Num0)],
+    },
+    Builtin {
+        action: Action::Heading1,
+        id: "heading_1",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Set heading level 1",
+        chords: &[chord(CTRL_ALT, Key::Num1)],
+    },
+    Builtin {
+        action: Action::Heading2,
+        id: "heading_2",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Set heading level 2",
+        chords: &[chord(CTRL_ALT, Key::Num2)],
+    },
+    Builtin {
+        action: Action::Heading3,
+        id: "heading_3",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Set heading level 3",
+        chords: &[chord(CTRL_ALT, Key::Num3)],
+    },
+    Builtin {
+        action: Action::Heading4,
+        id: "heading_4",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Set heading level 4",
+        chords: &[chord(CTRL_ALT, Key::Num4)],
+    },
+    Builtin {
+        action: Action::Heading5,
+        id: "heading_5",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Set heading level 5",
+        chords: &[chord(CTRL_ALT, Key::Num5)],
+    },
+    Builtin {
+        action: Action::Heading6,
+        id: "heading_6",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Set heading level 6",
+        chords: &[chord(CTRL_ALT, Key::Num6)],
+    },
+    Builtin {
+        action: Action::SelectAll,
+        id: "select_all",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Select all",
+        chords: &[chord(CTRL, Key::A)],
+    },
+    Builtin {
+        action: Action::WordLeft,
+        id: "word_left",
+        group: Group::Navigation,
+        scope: Scope::Editor,
+        description: "Move to the previous word",
+        chords: &[chord(CTRL, Key::ArrowLeft)],
+    },
+    Builtin {
+        action: Action::WordRight,
+        id: "word_right",
+        group: Group::Navigation,
+        scope: Scope::Editor,
+        description: "Move to the next word",
+        chords: &[chord(CTRL, Key::ArrowRight)],
+    },
+    Builtin {
+        action: Action::DeleteWordLeft,
+        id: "delete_word_left",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Delete the previous word",
+        chords: &[chord(CTRL, Key::Backspace)],
+    },
+    Builtin {
+        action: Action::DeleteWordRight,
+        id: "delete_word_right",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Delete the next word",
+        chords: &[chord(CTRL, Key::Delete)],
+    },
+    Builtin {
+        action: Action::DocumentStart,
+        id: "document_start",
+        group: Group::Navigation,
+        scope: Scope::Editor,
+        description: "Move to the start of the document",
+        chords: &[chord(CTRL, Key::Home)],
+    },
+    Builtin {
+        action: Action::DocumentEnd,
+        id: "document_end",
+        group: Group::Navigation,
+        scope: Scope::Editor,
+        description: "Move to the end of the document",
+        chords: &[chord(CTRL, Key::End)],
+    },
+    Builtin {
+        action: Action::InsertRowAbove,
+        id: "insert_row_above",
+        group: Group::Edit,
+        scope: Scope::Table,
+        description: "Insert a table row above",
+        chords: &[chord(CTRL_ALT, Key::ArrowUp)],
+    },
+    Builtin {
+        action: Action::InsertRowBelow,
+        id: "insert_row_below",
+        group: Group::Edit,
+        scope: Scope::Table,
+        description: "Insert a table row below",
+        chords: &[chord(CTRL_ALT, Key::ArrowDown)],
+    },
+    Builtin {
+        action: Action::InsertColumnLeft,
+        id: "insert_column_left",
+        group: Group::Edit,
+        scope: Scope::Table,
+        description: "Insert a table column to the left",
+        chords: &[chord(CTRL_ALT, Key::ArrowLeft)],
+    },
+    Builtin {
+        action: Action::InsertColumnRight,
+        id: "insert_column_right",
+        group: Group::Edit,
+        scope: Scope::Table,
+        description: "Insert a table column to the right",
+        chords: &[chord(CTRL_ALT, Key::ArrowRight)],
+    },
+    Builtin {
+        action: Action::DeleteRow,
+        id: "delete_row",
+        group: Group::Edit,
+        scope: Scope::Table,
+        description: "Delete the table row",
+        chords: &[chord(CTRL_ALT, Key::Backspace)],
+    },
+    Builtin {
+        action: Action::DeleteColumn,
+        id: "delete_column",
+        group: Group::Edit,
+        scope: Scope::Table,
+        description: "Delete the table column",
+        chords: &[chord(CTRL_ALT_SHIFT, Key::Backspace)],
+    },
+    Builtin {
+        action: Action::MoveRowUp,
+        id: "move_row_up",
+        group: Group::Edit,
+        scope: Scope::Table,
+        description: "Move the table row up",
+        chords: &[chord(ALT_SHIFT, Key::ArrowUp)],
+    },
+    Builtin {
+        action: Action::MoveRowDown,
+        id: "move_row_down",
+        group: Group::Edit,
+        scope: Scope::Table,
+        description: "Move the table row down",
+        chords: &[chord(ALT_SHIFT, Key::ArrowDown)],
+    },
+    Builtin {
+        action: Action::MoveColumnLeft,
+        id: "move_column_left",
+        group: Group::Edit,
+        scope: Scope::Table,
+        description: "Move the table column left",
+        chords: &[chord(ALT_SHIFT, Key::ArrowLeft)],
+    },
+    Builtin {
+        action: Action::MoveColumnRight,
+        id: "move_column_right",
+        group: Group::Edit,
+        scope: Scope::Table,
+        description: "Move the table column right",
+        chords: &[chord(ALT_SHIFT, Key::ArrowRight)],
+    },
+    Builtin {
+        action: Action::FormatTable,
+        id: "format_table",
+        group: Group::Edit,
+        scope: Scope::Table,
+        description: "Line up the table's pipes",
+        chords: &[chord(CTRL_ALT, Key::F)],
+    },
+    Builtin {
+        action: Action::InsertTable,
+        id: "insert_table",
+        group: Group::Edit,
+        scope: Scope::Table,
+        description: "Insert a 3×3 table",
+        chords: &[chord(CTRL_ALT, Key::T)],
+    },
+    Builtin {
+        action: Action::Find,
+        id: "find",
+        group: Group::Find,
+        scope: Scope::App,
+        description: "Find in this file",
+        chords: &[chord(CTRL, Key::F)],
+    },
+    Builtin {
+        action: Action::Replace,
+        id: "replace",
+        group: Group::Find,
+        scope: Scope::App,
+        description: "Replace in this file",
+        chords: &[chord(CTRL, Key::H)],
+    },
+    Builtin {
+        action: Action::FindNext,
+        id: "find_next",
+        group: Group::Find,
+        scope: Scope::App,
+        description: "Find the next match",
+        chords: &[chord(Modifiers::NONE, Key::F3)],
+    },
+    Builtin {
+        action: Action::FindPrevious,
+        id: "find_previous",
+        group: Group::Find,
+        scope: Scope::App,
+        description: "Find the previous match",
+        chords: &[chord(SHIFT, Key::F3)],
+    },
+    Builtin {
+        action: Action::GoToLine,
+        id: "go_to_line",
+        group: Group::Navigation,
+        scope: Scope::App,
+        description: "Go to line",
+        chords: &[chord(CTRL, Key::G)],
+    },
+    Builtin {
+        action: Action::SelectWord,
+        id: "select_word",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Select word",
+        chords: &[chord(CTRL, Key::D)],
+    },
+    Builtin {
+        action: Action::SelectParagraph,
+        id: "select_paragraph",
+        group: Group::Edit,
+        scope: Scope::Editor,
+        description: "Select paragraph",
+        chords: &[chord(CTRL_SHIFT, Key::P)],
+    },
+    Builtin {
+        action: Action::MatchBracket,
+        id: "match_bracket",
+        group: Group::Navigation,
+        scope: Scope::Editor,
+        description: "Jump to the matching fence or brackets",
+        chords: &[chord(CTRL_SHIFT, Key::Backslash)],
+    },
+    Builtin {
+        action: Action::SearchFolder,
+        id: "search_folder",
+        group: Group::Find,
+        scope: Scope::App,
+        description: "Search the open folder",
+        chords: &[chord(CTRL_SHIFT, Key::F)],
+    },
+    Builtin {
+        action: Action::PinSearchResult,
+        id: "pin_search_result",
+        group: Group::Find,
+        scope: Scope::Search,
+        description: "Open the selected folder-search result in a pinned tab",
+        chords: &[chord(CTRL, Key::Enter)],
+    },
+    Builtin {
+        action: Action::ToggleOutline,
+        id: "toggle_outline",
+        group: Group::View,
+        scope: Scope::App,
+        description: "Show or hide the outline",
+        chords: &[chord(CTRL_SHIFT, Key::B)],
+    },
+    Builtin {
+        action: Action::NewFolder,
+        id: "new_folder",
+        group: Group::File,
+        scope: Scope::App,
+        description: "New folder in the selected folder, or the open folder",
+        chords: &[chord(CTRL_SHIFT, Key::N)],
+    },
+    Builtin {
+        action: Action::ShowKeys,
+        id: "show_keys",
+        group: Group::View,
+        scope: Scope::App,
+        description: "Show or hide the key bindings",
+        chords: &[chord(CTRL, Key::Slash), chord(Modifiers::NONE, Key::F1)],
+    },
+    Builtin {
+        action: Action::CloseTab,
+        id: "close_tab",
+        group: Group::Tabs,
+        scope: Scope::App,
+        description: "Close the tab",
+        chords: &[chord(CTRL, Key::W)],
+    },
+    Builtin {
+        action: Action::TabNext,
+        id: "tab_next",
+        group: Group::Tabs,
+        scope: Scope::App,
+        description: "Switch to the next most recently used tab",
+        chords: &[chord(CTRL, Key::Tab)],
+    },
+    Builtin {
+        action: Action::TabPrevious,
+        id: "tab_previous",
+        group: Group::Tabs,
+        scope: Scope::App,
+        description: "Switch to the previous most recently used tab",
+        chords: &[chord(CTRL_SHIFT, Key::Tab)],
+    },
+    Builtin {
+        action: Action::TabLeft,
+        id: "tab_left",
+        group: Group::Tabs,
+        scope: Scope::App,
+        description: "Switch to the tab on the left",
+        chords: &[chord(CTRL, Key::PageUp)],
+    },
+    Builtin {
+        action: Action::TabRight,
+        id: "tab_right",
+        group: Group::Tabs,
+        scope: Scope::App,
+        description: "Switch to the tab on the right",
+        chords: &[chord(CTRL, Key::PageDown)],
+    },
+    Builtin {
+        action: Action::Tab1,
+        id: "tab_1",
+        group: Group::Tabs,
+        scope: Scope::App,
+        description: "Switch to tab 1",
+        chords: &[chord(ALT, Key::Num1)],
+    },
+    Builtin {
+        action: Action::Tab2,
+        id: "tab_2",
+        group: Group::Tabs,
+        scope: Scope::App,
+        description: "Switch to tab 2",
+        chords: &[chord(ALT, Key::Num2)],
+    },
+    Builtin {
+        action: Action::Tab3,
+        id: "tab_3",
+        group: Group::Tabs,
+        scope: Scope::App,
+        description: "Switch to tab 3",
+        chords: &[chord(ALT, Key::Num3)],
+    },
+    Builtin {
+        action: Action::Tab4,
+        id: "tab_4",
+        group: Group::Tabs,
+        scope: Scope::App,
+        description: "Switch to tab 4",
+        chords: &[chord(ALT, Key::Num4)],
+    },
+    Builtin {
+        action: Action::Tab5,
+        id: "tab_5",
+        group: Group::Tabs,
+        scope: Scope::App,
+        description: "Switch to tab 5",
+        chords: &[chord(ALT, Key::Num5)],
+    },
+    Builtin {
+        action: Action::Tab6,
+        id: "tab_6",
+        group: Group::Tabs,
+        scope: Scope::App,
+        description: "Switch to tab 6",
+        chords: &[chord(ALT, Key::Num6)],
+    },
+    Builtin {
+        action: Action::Tab7,
+        id: "tab_7",
+        group: Group::Tabs,
+        scope: Scope::App,
+        description: "Switch to tab 7",
+        chords: &[chord(ALT, Key::Num7)],
+    },
+    Builtin {
+        action: Action::Tab8,
+        id: "tab_8",
+        group: Group::Tabs,
+        scope: Scope::App,
+        description: "Switch to tab 8",
+        chords: &[chord(ALT, Key::Num8)],
+    },
+    Builtin {
+        action: Action::Tab9,
+        id: "tab_9",
+        group: Group::Tabs,
+        scope: Scope::App,
+        description: "Switch to tab 9",
+        chords: &[chord(ALT, Key::Num9)],
+    },
+    Builtin {
+        action: Action::ReopenTab,
+        id: "reopen_tab",
+        group: Group::Tabs,
+        scope: Scope::App,
+        description: "Reopen the closed tab",
+        chords: &[chord(CTRL_SHIFT, Key::T)],
+    },
+];
+
+impl Listed {
+    fn from_binding(row: &Binding) -> Self {
+        let other = row
+            .chords
+            .iter()
+            .map(|c| c.platform_label(egui::os::OperatingSystem::Nix))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mac = row
+            .chords
+            .iter()
+            .map(|c| c.platform_label(egui::os::OperatingSystem::Mac))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut hay = String::new();
+        hay.push_str(row.description);
+        hay.push(' ');
+        hay.push_str(row.action.id());
+        hay.push(' ');
+        hay.push_str(&other);
+        for chord in &row.chords {
+            hay.push(' ');
+            hay.push_str(chord.key.name());
+        }
+        Self {
+            haystack: hay.to_lowercase(),
+            mac_lower: mac.to_lowercase(),
+            other,
+            mac,
+        }
     }
+}
+
+/// Search may share a chord with the editor, because the field has focus
+/// instead of the pane. Every other pair can see the key together, or the
+/// app takes it first, so those conflict.
+fn scopes_conflict(a: Scope, b: Scope) -> bool {
+    if a == b {
+        return true;
+    }
+    !matches!(
+        (a, b),
+        (Scope::Search, Scope::Editor | Scope::Table)
+            | (Scope::Editor | Scope::Table, Scope::Search)
+    )
 }
 
 #[cfg(test)]
@@ -1059,6 +1818,13 @@ mod tests {
     fn defaults_give_every_action_a_chord_and_never_share_one() {
         let map = KeyMap::builtin();
         assert!(map.clashes().is_empty(), "{:?}", map.clashes());
+        // Ctrl+Enter toggles a task in the editor and pins a search hit
+        // while the search field is focused. Different scopes, so it is
+        // not a clash.
+        assert_eq!(
+            map.chords(Action::ToggleTask),
+            map.chords(Action::PinSearchResult)
+        );
         for action in Action::ALL {
             assert!(
                 !map.chords(action).is_empty(),
@@ -1082,7 +1848,8 @@ mod tests {
         );
         assert_eq!(map.shortcut_text(Action::ToggleOutline), "Ctrl+Shift+B");
         assert_eq!(map.shortcut_text(Action::NewFolder), "Ctrl+Shift+N");
-        assert_eq!(map.shortcut_text(Action::ShowKeys), "F1");
+        assert_eq!(map.shortcut_text(Action::ShowKeys), "Ctrl+/, F1");
+        assert_eq!(map.shortcut_text(Action::PinSearchResult), "Ctrl+Enter");
         assert_eq!(map.shortcut_text(Action::CloseTab), "Ctrl+W");
         assert_eq!(map.shortcut_text(Action::ReopenTab), "Ctrl+Shift+T");
         assert_eq!(map.shortcut_text(Action::TabNext), "Ctrl+Tab");
@@ -1371,5 +2138,227 @@ mod tests {
                 action.id()
             );
         }
+    }
+
+    #[test]
+    fn every_table_chord_is_what_dispatch_fires() {
+        // The table is a literal, not a walk of `Action::ALL`. This fails
+        // when a row is missing, when a second chord such as F1 is missing,
+        // or when `find` stops reading the rows.
+        let map = KeyMap::builtin();
+        assert_eq!(TABLE.len(), Action::ALL.len());
+        assert_eq!(map.bindings().len(), TABLE.len());
+        let mut seen = [false; COUNT];
+        for (i, spec) in TABLE.iter().enumerate() {
+            assert_eq!(spec.action.index(), i, "{}", spec.id);
+            assert_eq!(Action::ALL[i], spec.action, "{}", spec.id);
+            assert_eq!(spec.action.id(), spec.id);
+            assert!(!spec.description.is_empty(), "{}", spec.id);
+            assert!(!spec.chords.is_empty(), "{} has no chord", spec.id);
+            let row = &map.bindings()[i];
+            assert!(!seen[spec.action.index()], "twice: {}", spec.id);
+            seen[spec.action.index()] = true;
+            assert_eq!(row.action, spec.action);
+            assert_eq!(row.group, spec.group);
+            assert_eq!(row.scope, spec.scope);
+            assert_eq!(row.description, spec.description);
+            assert_eq!(row.chords, spec.chords);
+            for chord in spec.chords {
+                let found = match spec.scope {
+                    Scope::Editor | Scope::Table => map.find_editing(chord.key, chord.modifiers),
+                    scope => map.find(chord.key, chord.modifiers, scope),
+                };
+                assert_eq!(
+                    found,
+                    Some(spec.action),
+                    "{} via {}",
+                    spec.id,
+                    chord.display()
+                );
+            }
+        }
+        assert!(seen.iter().all(|hit| *hit));
+        // Both chords, not only the first. F1 is the alternate for Ctrl+/.
+        let show = TABLE
+            .iter()
+            .find(|spec| spec.action == Action::ShowKeys)
+            .unwrap();
+        assert_eq!(show.chords.len(), 2);
+        assert_eq!(
+            map.find(Key::F1, Modifiers::NONE, Scope::App),
+            Some(Action::ShowKeys)
+        );
+        assert_eq!(
+            map.find(Key::Slash, Modifiers::COMMAND, Scope::App),
+            Some(Action::ShowKeys)
+        );
+        // The same chord, two scopes: the editor toggles a task, search pins.
+        assert_eq!(
+            map.find_editing(Key::Enter, Modifiers::COMMAND),
+            Some(Action::ToggleTask)
+        );
+        assert_eq!(
+            map.find(Key::Enter, Modifiers::COMMAND, Scope::Search),
+            Some(Action::PinSearchResult)
+        );
+        assert_eq!(
+            map.find(Key::Enter, Modifiers::COMMAND, Scope::Editor),
+            Some(Action::ToggleTask)
+        );
+        let reopen = map
+            .bindings()
+            .iter()
+            .find(|row| row.action == Action::ReopenTab)
+            .unwrap();
+        assert_eq!(reopen.group, Group::Tabs);
+        assert_eq!(reopen.chords, &[chord(CTRL_SHIFT, Key::T)]);
+        assert!(map.bindings().iter().any(|row| row.action == Action::Tab1
+            && row.group == Group::Tabs
+            && row.chords == [chord(ALT, Key::Num1)]));
+        for group in Group::ALL {
+            assert!(
+                map.bindings().iter().any(|row| row.group == group),
+                "no row in {}",
+                group.label()
+            );
+        }
+        assert!(GESTURES.iter().any(|gesture| {
+            gesture.group == Group::Find && gesture.keys == "Middle click a search result"
+        }));
+    }
+
+    #[test]
+    fn search_may_share_an_editor_chord_but_not_an_app_chord() {
+        let shared = KeyMap::apply(&[entry("pin_search_result", &["Ctrl+B"])]);
+        assert!(shared.errors.is_empty(), "{:?}", shared.errors);
+        assert_eq!(shared.map.shortcut_text(Action::PinSearchResult), "Ctrl+B");
+        assert_eq!(shared.map.shortcut_text(Action::Bold), "Ctrl+B");
+        assert_eq!(
+            shared.map.find(Key::B, Modifiers::COMMAND, Scope::Search),
+            Some(Action::PinSearchResult)
+        );
+        assert_eq!(
+            shared.map.find_editing(Key::B, Modifiers::COMMAND),
+            Some(Action::Bold)
+        );
+
+        let app = KeyMap::apply(&[entry("pin_search_result", &["Ctrl+S"])]);
+        let text = app.errors.join("\n");
+        assert!(text.contains("pin_search_result"), "{text}");
+        assert!(text.contains("save"), "{text}");
+        assert_eq!(app.map.shortcut_text(Action::PinSearchResult), "Ctrl+Enter");
+        assert_eq!(app.map.shortcut_text(Action::Save), "Ctrl+S");
+    }
+
+    #[test]
+    fn enter_and_escape_are_accepted_for_a_search_binding() {
+        for text in ["Enter", "Escape", "Esc"] {
+            let applied = KeyMap::apply(&[entry("pin_search_result", &[text])]);
+            assert!(applied.errors.is_empty(), "{text}: {:?}", applied.errors);
+            let shown = applied.map.shortcut_text(Action::PinSearchResult);
+            assert!(
+                shown == "Enter" || shown == "Escape",
+                "{text} displayed as {shown}"
+            );
+            let key = if shown == "Enter" {
+                Key::Enter
+            } else {
+                Key::Escape
+            };
+            assert_eq!(
+                applied.map.find(key, Modifiers::NONE, Scope::Search),
+                Some(Action::PinSearchResult),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_search_binding_survives_another_pairs_conflict_on_the_same_chord() {
+        // bold owns Ctrl+B. insert_table cannot take it. pin_search_result
+        // can, because search does not run in the editor. Rejecting the
+        // table command must not also reject the search command.
+        let applied = KeyMap::apply(&[
+            entry("pin_search_result", &["Ctrl+B"]),
+            entry("insert_table", &["Ctrl+B"]),
+        ]);
+        let text = applied.errors.join("\n");
+        assert!(text.contains("insert_table"), "{text}");
+        assert!(text.contains("bold"), "{text}");
+        assert!(!text.contains("pin_search_result"), "{text}");
+        assert_eq!(applied.map.shortcut_text(Action::PinSearchResult), "Ctrl+B");
+        assert_eq!(applied.map.shortcut_text(Action::Bold), "Ctrl+B");
+        assert_eq!(applied.map.shortcut_text(Action::InsertTable), "Ctrl+Alt+T");
+        assert_eq!(
+            applied.map.find(Key::B, Modifiers::COMMAND, Scope::Search),
+            Some(Action::PinSearchResult)
+        );
+        assert_eq!(
+            applied.map.find_editing(Key::B, Modifiers::COMMAND),
+            Some(Action::Bold)
+        );
+        assert_eq!(
+            applied.map.find(Key::B, Modifiers::COMMAND, Scope::Table),
+            None
+        );
+
+        // bold is moved onto italic's chord, so it is rejected and snaps
+        // back to Ctrl+B. The second pass then rejects insert_table. The
+        // search binding still shares Ctrl+B with bold and stays.
+        let snapped = KeyMap::apply(&[
+            entry("pin_search_result", &["Ctrl+B"]),
+            entry("insert_table", &["Ctrl+B"]),
+            entry("bold", &["Ctrl+I"]),
+        ]);
+        let text = snapped.errors.join("\n");
+        assert!(text.contains("insert_table"), "{text}");
+        assert!(text.contains("bold"), "{text}");
+        assert!(!text.contains("pin_search_result"), "{text}");
+        assert_eq!(snapped.map.shortcut_text(Action::PinSearchResult), "Ctrl+B");
+        assert_eq!(snapped.map.shortcut_text(Action::Bold), "Ctrl+B");
+        assert_eq!(snapped.map.shortcut_text(Action::Italic), "Ctrl+I");
+        assert_eq!(snapped.map.shortcut_text(Action::InsertTable), "Ctrl+Alt+T");
+    }
+
+    #[test]
+    fn the_overlay_query_matches_the_action_name_or_the_key() {
+        let map = KeyMap::builtin();
+        let os = egui::os::OperatingSystem::Nix;
+        let hit = |query: &str, action: Action| map.matches_query(action, os, query);
+        assert!(hit("reopen", Action::ReopenTab));
+        assert!(hit("REOPEN", Action::ReopenTab));
+        assert!(hit("ctrl+shift+t", Action::ReopenTab));
+        assert!(!hit("reopen", Action::Bold));
+        assert!(hit("show_keys", Action::ShowKeys));
+        assert!(hit("ctrl+/", Action::ShowKeys));
+        assert!(hit("f1", Action::ShowKeys));
+        assert!(hit("", Action::Bold));
+        assert!(hit("   ", Action::Save));
+        assert!(
+            GESTURES
+                .iter()
+                .any(|gesture| gesture.matches_query("ctrl+click"))
+        );
+        assert!(!GESTURES.iter().any(|gesture| gesture.matches_query("bold")));
+    }
+
+    #[test]
+    fn chords_say_ctrl_on_linux_and_cmd_on_mac() {
+        let map = KeyMap::builtin();
+        let linux = egui::os::OperatingSystem::Nix;
+        let mac = egui::os::OperatingSystem::Mac;
+        assert!(!linux.is_mac());
+        assert_eq!(map.platform_text(linux, Action::Bold), "Ctrl+B");
+        assert_eq!(map.platform_text(linux, Action::ReopenTab), "Ctrl+Shift+T");
+        assert_eq!(map.platform_text(linux, Action::ShowKeys), "Ctrl+/, F1");
+        assert_eq!(map.platform_text(linux, Action::Back), "Alt+Left");
+        assert_eq!(map.shortcut_text(Action::Bold), "Ctrl+B");
+        assert_eq!(map.platform_text(mac, Action::Bold), "Cmd+B");
+        assert_eq!(map.platform_text(mac, Action::Redo), "Shift+Cmd+Z, Cmd+Y");
+        assert_eq!(map.platform_text(mac, Action::Back), "Option+Left");
+        let super_i = Chord::parse("Super+I").unwrap();
+        assert_eq!(super_i.platform_label(linux), "Super+I");
+        assert_eq!(super_i.platform_label(mac), "Cmd+I");
+        assert_eq!(Chord::parse("Ctrl+/").unwrap().display(), "Ctrl+/");
     }
 }

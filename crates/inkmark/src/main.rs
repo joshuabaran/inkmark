@@ -453,8 +453,21 @@ struct App {
     new_file: Option<NewFilePrompt>,
     /// Asks for a name, then creates the folder and selects it.
     new_folder: Option<NewFilePrompt>,
-    /// F1. The chords in effect, in the same order as `--list-keys`.
+    /// Ctrl+/ and F1. The chords in effect, grouped, filtered by `keys_query`.
     show_keys: bool,
+    /// The overlay's filter. Cleared each time the overlay opens.
+    keys_query: String,
+    /// The overlay had the keyboard last frame. The frame it closes still
+    /// has the modal layer, so the pane surrenders focus while it draws
+    /// and has to be focused again afterwards.
+    keys_return_focus: bool,
+    /// Ask the filter for focus once, on the frame the overlay opens.
+    /// Asking again each frame interrupts IME composition.
+    keys_focus_filter: bool,
+    /// The pane was given focus last frame, before its arrow lock could
+    /// stick. This frame the pane's own lock applies, and an arrow must
+    /// not move egui's focus away from it.
+    keys_arm_lock: bool,
     /// Asks for a new name for this file or folder.
     rename: Option<RenamePrompt>,
     /// Asks before moving this file or folder to the trash.
@@ -644,6 +657,10 @@ impl App {
             new_file: None,
             new_folder: None,
             show_keys: false,
+            keys_query: String::new(),
+            keys_return_focus: false,
+            keys_focus_filter: false,
+            keys_arm_lock: false,
             rename: None,
             trash_confirm: None,
             trash: Box::new(SystemTrash),
@@ -1906,6 +1923,17 @@ impl App {
         if self.confirm.is_some() {
             return;
         }
+        // The overlay takes the keyboard. Only its own chord is consumed
+        // here, so a key typed into the filter does not also save or switch
+        // tabs. Other app chords, including one rebound onto Escape, stay
+        // in the event list: Escape still closes the overlay in `keys_ui`.
+        if self.show_keys {
+            let toggle = ctx.input_mut(|i| self.keys.consume_action(i, Action::ShowKeys));
+            if toggle {
+                self.toggle_keys();
+            }
+            return;
+        }
         // App chords are taken before a pane sees the key. Matching is
         // exact, so a pane chord that adds Shift or Alt (Ctrl+Alt+1 is a
         // heading, Alt+Shift+Left moves a table column) is left for the pane.
@@ -2006,13 +2034,15 @@ impl App {
             Action::Tab9 => self.jump_tab(8),
             Action::NewFile => self.begin_new_file(),
             Action::NewFolder => self.begin_new_folder(),
-            Action::ShowKeys => self.toggle_keys(ctx),
+            Action::ShowKeys => self.toggle_keys(),
             Action::Find => self.open_find(ctx, false),
             Action::Replace => self.open_find(ctx, true),
             Action::FindNext => self.find_move(true),
             Action::FindPrevious => self.find_move(false),
             Action::GoToLine => self.open_goto(ctx),
             Action::SearchFolder => self.open_folder_search(ctx),
+            // The search field reads this chord itself. It is not an app chord.
+            Action::PinSearchResult => {}
             _ => {}
         }
     }
@@ -2097,22 +2127,67 @@ impl App {
         }
     }
 
-    /// F1 opens the list, and F1 again closes it. Another dialog keeps it shut.
-    fn toggle_keys(&mut self, ctx: &egui::Context) {
+    /// Ctrl+/ or F1 opens the list, and either key closes it. Another dialog
+    /// keeps it shut.
+    fn toggle_keys(&mut self) {
         if self.show_keys {
-            self.show_keys = false;
-            self.show_recent_if_empty();
+            self.close_keys();
             return;
         }
         if self.modal_open() {
             return;
         }
         self.recent_list = None;
+        self.keys_query.clear();
+        self.keys_focus_filter = true;
         self.show_keys = true;
-        if !self.tabs.is_empty() {
-            self.tab_mut().code.release_focus(ctx);
-            self.tab_mut().live.release_focus(ctx);
+    }
+
+    fn close_keys(&mut self) {
+        self.show_keys = false;
+        self.keys_focus_filter = false;
+        self.show_recent_if_empty();
+        // The panes draw after this, under the modal layer from the previous
+        // frame, and would surrender a focus request made now.
+        // `finish_keys_focus` asks after they draw.
+    }
+
+    /// Puts keyboard focus back on the code or live pane that had it.
+    ///
+    /// `request_focus` clears the arrow lock. The lock sticks on the
+    /// following frame, once the pane already had focus at the start of
+    /// that frame (CRO-128). [`Self::finish_keys_focus`] arms that frame.
+    fn restore_editor_focus(&mut self, ctx: &egui::Context) {
+        if self.tabs.is_empty() {
+            return;
         }
+        match self.tab().focus {
+            Pane::Code => self.tab().code.request_focus(ctx),
+            Pane::Live => self.tab().live.request_focus(ctx),
+        }
+    }
+
+    /// After the panes have drawn, on the frame the overlay closes: focus
+    /// the pane the list borrowed. The filter keeps focus while the list
+    /// is open. The arrow lock cannot stick on this same frame, because the
+    /// pane did not have focus when the frame began, so the next frame arms
+    /// it (CRO-128).
+    fn finish_keys_focus(&mut self, ctx: &egui::Context) {
+        if self.keys_arm_lock {
+            self.keys_arm_lock = false;
+            // begin_pass already saw the unlocked arrow. Drop that focus
+            // move so the key edits the pane and the pane keeps the keyboard.
+            ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+        }
+        let closing = self.keys_return_focus && !self.show_keys;
+        self.keys_return_focus = self.show_keys;
+        // A new-file or rename prompt can replace the list on this frame.
+        // That prompt owns the keyboard.
+        if !closing || self.modal_open() {
+            return;
+        }
+        self.restore_editor_focus(ctx);
+        self.keys_arm_lock = true;
     }
 
     fn modal_open(&self) -> bool {
@@ -2480,15 +2555,20 @@ impl App {
             self.modal_was_open = open;
             return;
         }
+        // The filter holds the keyboard while the list is open. Releasing
+        // the browser keeps the sidebar from taking keys. The editor is
+        // focused again when the list closes (CRO-128).
+        if self.show_keys {
+            ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("file_browser")));
+            self.modal_was_open = true;
+            return;
+        }
         if open {
             self.tab_mut().code.release_focus(ctx);
             self.tab_mut().live.release_focus(ctx);
             ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("file_browser")));
         } else if self.modal_was_open {
-            match self.tab().focus {
-                Pane::Code => self.tab_mut().code.request_focus(ctx),
-                Pane::Live => self.tab_mut().live.request_focus(ctx),
-            }
+            self.restore_editor_focus(ctx);
         }
         self.modal_was_open = open;
     }
@@ -2844,47 +2924,139 @@ impl App {
         }
     }
 
-    /// The chords in effect. Escape or F1 closes the list.
+    /// The chords in effect, grouped and filtered. Escape, Ctrl+/, or F1
+    /// closes the list. The filter is focused when the list opens, and it
+    /// keeps that focus until the list closes.
     fn keys_ui(&mut self, ctx: &egui::Context) {
         if !self.show_keys {
             return;
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
-            self.show_keys = false;
-            self.show_recent_if_empty();
+            self.close_keys();
             return;
         }
-        let rows: Vec<(String, String)> = Action::ALL
-            .into_iter()
-            .map(|action| {
-                let chord = self.keys.shortcut_text(action);
+        let field = egui::Id::new("keys_filter");
+        let os = ctx.os();
+        // Stay inside a small window. 640×420 is the preferred size; the
+        // e2e viewport is 480×320, and a fixed minimum overflows it.
+        let screen = ctx.content_rect();
+        let pad = 32.0;
+        let max_w = (screen.width() - pad * 2.0).max(200.0);
+        let max_h = (screen.height() - pad * 2.0).max(160.0);
+        // Preferred size, but never wider or taller than this window. The
+        // e2e viewport is 480×320.
+        let width = max_w.min(640.0);
+        let list_h = (max_h - 140.0).clamp(80.0, 420.0);
+        egui::Modal::new(egui::Id::new("keys")).show(ctx, |ui| {
+            ui.set_width(width);
+            ui.heading("Key bindings");
+            ui.add_space(4.0);
+            // The modal's first frame only measures, and a focus request
+            // there is dropped. Ask once, on the frame that can hold it.
+            // Asking again later interrupts IME composition.
+            if self.keys_focus_filter && !ui.is_sizing_pass() {
+                self.keys_focus_filter = false;
+                ui.memory_mut(|m| m.request_focus(field));
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.keys_query)
+                    .id(field)
+                    .hint_text("Filter by name or key")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(6.0);
+            let rows = self.overlay_rows(os);
+            // A stable height, capped by the window. The modal keeps whatever
+            // size it had last frame, so a list that shrank to one filter
+            // result would clip the next, taller result.
+            let scroll_width = ui.available_width();
+            ui.allocate_ui(egui::vec2(scroll_width, list_h), |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if rows.is_empty() {
+                        ui.label("No matching shortcuts");
+                        return;
+                    }
+                    let mut shown: Option<keys::Group> = None;
+                    for (group, chord, description) in &rows {
+                        if shown != Some(*group) {
+                            if shown.is_some() {
+                                ui.add_space(8.0);
+                            }
+                            ui.label(RichText::new(group.label()).strong());
+                            shown = Some(*group);
+                        }
+                        // Wrap, so a long row cannot stretch the dialog
+                        // past the window.
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(chord).strong());
+                            ui.add_space(16.0);
+                            ui.label(description);
+                        });
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            let close = self.keys.platform_text(os, Action::ShowKeys);
+            ui.label(
+                RichText::new(format!("Esc or {close} closes"))
+                    .small()
+                    .weak(),
+            );
+        });
+        // The filter read these. The pane must not apply them too.
+        self.eat_overlay_keys(ctx);
+    }
+
+    /// One row of the overlay: group, chord text for this machine, description.
+    ///
+    /// Actions come from [`keys::KeyMap::bindings`], the same rows input
+    /// handling reads. Pointer gestures follow the actions in their group.
+    fn overlay_rows(&self, os: egui::os::OperatingSystem) -> Vec<(keys::Group, String, String)> {
+        let query = self.keys_query.trim().to_lowercase();
+        let mut rows = Vec::new();
+        for group in keys::Group::ALL {
+            for action in Action::ALL {
+                let binding_group = self.keys.bindings()[action.index()].group;
+                let description = self.keys.bindings()[action.index()].description;
+                if binding_group != group || !self.keys.matches_lower(action, os, &query) {
+                    continue;
+                }
+                let chord = self.keys.platform_text(os, action);
                 let chord = if chord.is_empty() {
                     "unbound".to_owned()
                 } else {
                     chord
                 };
-                (chord, action.description().to_owned())
-            })
-            .collect();
-        egui::Modal::new(egui::Id::new("keys")).show(ctx, |ui| {
-            ui.set_min_width(520.0);
-            ui.heading("Key bindings");
-            ui.add_space(6.0);
-            egui::ScrollArea::vertical()
-                .max_height(420.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("key_bindings")
-                        .striped(true)
-                        .show(ui, |ui| {
-                            for (chord, description) in &rows {
-                                ui.label(RichText::new(chord).strong());
-                                ui.label(description);
-                                ui.end_row();
-                            }
-                        });
-                });
-            ui.add_space(6.0);
-            ui.label(RichText::new("Esc closes").small().weak());
+                rows.push((group, chord, description.to_owned()));
+            }
+            for gesture in keys::GESTURES {
+                if gesture.group == group && gesture.matches_lower(&query) {
+                    rows.push((
+                        group,
+                        gesture.platform_keys(os),
+                        gesture.description.to_owned(),
+                    ));
+                }
+            }
+        }
+        rows
+    }
+
+    /// Drops key and text events the filter already applied, so the pane
+    /// behind the overlay does not type or move.
+    fn eat_overlay_keys(&self, ctx: &egui::Context) {
+        ctx.input_mut(|input| {
+            input.events.retain(|event| {
+                !matches!(
+                    event,
+                    egui::Event::Key { .. }
+                        | egui::Event::Text(_)
+                        | egui::Event::Paste(_)
+                        | egui::Event::Copy
+                        | egui::Event::Cut
+                        | egui::Event::Ime(_)
+                )
+            });
         });
     }
 
@@ -3232,11 +3404,13 @@ impl App {
             let root = self.browser.root().to_path_buf();
             let show_all = self.browser.show_all();
             let modal = self.modal_open();
-            let search_open = self.search.is_open();
+            // The bar reads the live table. Clone so the sidebar can borrow
+            // `search` mutably while it still has the chords.
+            let search_keys = self.search.is_open().then(|| self.keys.clone());
             let (hit, closed) = ui
                 .scope_builder(UiBuilder::new().max_rect(left), |ui| {
-                    let bar = if search_open {
-                        Some(self.search.show_bar(ui, &root, show_all, modal))
+                    let bar = if let Some(keys) = &search_keys {
+                        Some(self.search.show_bar(ui, &root, show_all, modal, keys))
                     } else {
                         None
                     };
@@ -4102,6 +4276,7 @@ impl App {
         self.measure_step(&ctx);
         self.trim_background_line_caches();
         self.pin_edited_preview();
+        self.finish_keys_focus(&ctx);
     }
 }
 
@@ -7706,9 +7881,12 @@ mod tests {
             run.frame(vec![]);
         }
         assert!(run.text_rect("Key bindings").is_some());
-        assert!(run.text_rect("Ctrl+E").is_some());
-        assert!(run.text_rect("Cycle split, code, and live").is_some());
-        assert!(run.text_rect("Ctrl+Shift+E").is_some());
+        assert!(run.text_rect("Filter by name or key").is_some());
+        assert!(run.text_rect("File").is_some());
+        assert!(run.text_rect("Ctrl+O").is_some());
+        assert!(run.text_rect("Open a file").is_some());
+        assert!(run.text_rect("Ctrl+S").is_some());
+        assert!(run.text_rect("Esc or Ctrl+/, F1 closes").is_some());
         assert_eq!(
             run.app.keys.shortcut_text(Action::ToggleOutline),
             "Ctrl+Shift+B"
@@ -7717,7 +7895,7 @@ mod tests {
             run.app.keys.shortcut_text(Action::NewFolder),
             "Ctrl+Shift+N"
         );
-        assert_eq!(run.app.keys.shortcut_text(Action::ShowKeys), "F1");
+        assert_eq!(run.app.keys.shortcut_text(Action::ShowKeys), "Ctrl+/, F1");
 
         run.key(egui::Key::Escape, egui::Modifiers::NONE);
         assert!(!run.app.show_keys);
@@ -7727,6 +7905,387 @@ mod tests {
         assert!(run.app.show_keys);
         run.key(egui::Key::F1, egui::Modifiers::NONE);
         assert!(!run.app.show_keys);
+    }
+
+    #[test]
+    fn the_key_overlay_filters_and_returns_focus() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "hello\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        assert!(run.app.tab().code.has_focus(&run.ctx));
+
+        run.key(egui::Key::Slash, egui::Modifiers::COMMAND);
+        assert!(run.app.show_keys);
+        // A modal's first frame only measures. The list is painted after that.
+        for _ in 0..3 {
+            if run.text_rect("Key bindings").is_some() {
+                break;
+            }
+            run.frame(vec![]);
+        }
+        assert!(run.text_rect("Key bindings").is_some());
+        assert!(run.text_rect("Filter by name or key").is_some());
+        assert!(
+            run.ctx
+                .memory(|m| m.has_focus(egui::Id::new("keys_filter"))),
+            "the filter takes focus when the list opens"
+        );
+        // A later frame must not ask for focus again, and must not hand
+        // the keyboard back to the pane while the list is open.
+        run.frame(vec![]);
+        assert!(
+            run.ctx
+                .memory(|m| m.has_focus(egui::Id::new("keys_filter"))),
+            "the filter keeps focus"
+        );
+        assert!(!run.app.tab().code.has_focus(&run.ctx));
+        assert!(run.text_rect("File").is_some());
+        assert!(run.text_rect("Ctrl+O").is_some());
+        assert!(run.text_rect("Open a file").is_some());
+        // Tabs follows File. Edit and the later groups sit below the fold
+        // until the filter brings them up.
+        assert!(run.text_rect("Tabs").is_some());
+        assert_eq!(text(&run.app), "hello\n");
+
+        run.frame(vec![egui::Event::Text("reopen".into())]);
+        assert_eq!(run.app.keys_query, "reopen");
+        assert!(
+            run.ctx
+                .memory(|m| m.has_focus(egui::Id::new("keys_filter")))
+        );
+        assert_eq!(text(&run.app), "hello\n");
+        assert!(run.text_rect("Tabs").is_some());
+        assert!(run.text_rect("Reopen the closed tab").is_some());
+        assert!(run.text_rect("Ctrl+Shift+T").is_some());
+        assert!(run.text_rect("Toggle bold").is_none());
+        assert!(run.text_rect("Edit").is_none());
+        assert!(run.text_rect("File").is_none());
+
+        run.app.keys_query = "cycle".into();
+        run.frame(vec![]);
+        assert!(run.text_rect("View/Layout").is_some());
+        assert!(run.text_rect("Ctrl+E").is_some());
+        assert!(run.text_rect("Cycle split, code, and live").is_some());
+        assert!(run.text_rect("Reopen the closed tab").is_none());
+
+        run.app.keys_query = "ctrl+click".into();
+        run.frame(vec![]);
+        assert!(run.text_rect("Minimap/Mouse").is_some());
+        assert!(run.text_rect("Ctrl+click").is_some());
+        assert!(run.text_rect("Follow a link, in a preview tab").is_some());
+
+        run.app.keys_query = "middle".into();
+        run.frame(vec![]);
+        assert!(run.text_rect("Middle click a tab").is_some());
+        assert!(run.text_rect("Middle click a link").is_some());
+        assert!(run.text_rect("Middle click a search result").is_some());
+        assert!(
+            run.text_rect("Open the search result in a pinned tab")
+                .is_some()
+        );
+        assert!(run.text_rect("Follow a link, in a pinned tab").is_some());
+
+        // The same chord is two rows: the editor toggles a task, search pins.
+        run.app.keys_query = "ctrl+enter".into();
+        run.frame(vec![]);
+        assert!(run.text_rect("Toggle the line's task checkbox").is_some());
+        assert!(
+            run.text_rect("Open the selected folder-search result in a pinned tab")
+                .is_some()
+        );
+        assert!(
+            run.ctx
+                .memory(|m| m.has_focus(egui::Id::new("keys_filter")))
+        );
+
+        run.app.keys_query = "zzzzz".into();
+        run.frame(vec![]);
+        assert!(run.text_rect("No matching shortcuts").is_some());
+        assert!(run.text_rect("Ctrl+O").is_none());
+
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!run.app.show_keys);
+        assert!(run.text_rect("Key bindings").is_none());
+        assert!(run.app.tab().code.has_focus(&run.ctx));
+        // The arrow stays in the pane, and the next character lands there
+        // (CRO-128: a fresh focus request would drop the arrow lock).
+        let before = run.app.tab().code.selection();
+        run.key(egui::Key::ArrowRight, egui::Modifiers::NONE);
+        assert!(run.app.tab().code.has_focus(&run.ctx));
+        assert_ne!(run.app.tab().code.selection(), before);
+        run.frame(vec![egui::Event::Text("Z".into())]);
+        assert_eq!(text(&run.app), "hZello\n");
+        assert!(run.app.tab().code.has_focus(&run.ctx));
+
+        // Key text matches, and the same chord closes.
+        run.key(egui::Key::Slash, egui::Modifiers::COMMAND);
+        assert!(run.app.show_keys);
+        assert!(run.app.keys_query.is_empty());
+        for _ in 0..3 {
+            if run.text_rect("Filter by name or key").is_some() {
+                break;
+            }
+            run.frame(vec![]);
+        }
+        assert!(
+            run.ctx
+                .memory(|m| m.has_focus(egui::Id::new("keys_filter")))
+        );
+        run.frame(vec![egui::Event::Text("alt+1".into())]);
+        assert!(run.text_rect("Switch to tab 1").is_some());
+        assert!(run.text_rect("Toggle bold").is_none());
+        assert!(run.text_rect("Reopen the closed tab").is_none());
+        run.key(egui::Key::Slash, egui::Modifiers::COMMAND);
+        assert!(!run.app.show_keys);
+        assert!(run.app.tab().code.has_focus(&run.ctx));
+
+        // The live pane gets its own focus back, lock included.
+        run.app.focus_pane(&run.ctx, Pane::Live);
+        run.frame(vec![]);
+        assert!(run.app.tab().live.has_focus(&run.ctx));
+        run.key(egui::Key::F1, egui::Modifiers::NONE);
+        assert!(run.app.show_keys);
+        run.frame(vec![]);
+        assert!(
+            run.ctx
+                .memory(|m| m.has_focus(egui::Id::new("keys_filter")))
+        );
+        assert!(!run.app.tab().live.has_focus(&run.ctx));
+        run.key(egui::Key::F1, egui::Modifiers::NONE);
+        assert!(!run.app.show_keys);
+        assert!(run.app.tab().live.has_focus(&run.ctx));
+        let before = run.app.tab().live.selection();
+        run.key(egui::Key::ArrowRight, egui::Modifiers::NONE);
+        assert!(run.app.tab().live.has_focus(&run.ctx));
+        assert_ne!(run.app.tab().live.selection(), before);
+        run.frame(vec![egui::Event::Text("Q".into())]);
+        assert!(text(&run.app).contains('Q'));
+        assert!(run.app.tab().live.has_focus(&run.ctx));
+    }
+
+    /// Escape closes the list even when config binds it to an app action.
+    /// That action must not run: the key is left for the overlay.
+    #[test]
+    fn escape_closes_the_overlay_when_save_is_bound_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "hello\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path.clone()));
+        run.frame(vec![egui::Event::Text("X".into())]);
+        assert!(run.app.tab().doc.is_dirty());
+        run.app
+            .keys
+            .set(Action::Save, vec![keys::Chord::parse("Escape").unwrap()]);
+        run.app.install_keys();
+        run.key(egui::Key::F1, egui::Modifiers::NONE);
+        assert!(run.app.show_keys);
+        for _ in 0..3 {
+            if run.text_rect("Key bindings").is_some() {
+                break;
+            }
+            run.frame(vec![]);
+        }
+        assert!(
+            run.ctx
+                .memory(|m| m.has_focus(egui::Id::new("keys_filter")))
+        );
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!run.app.show_keys);
+        assert!(run.app.tab().doc.is_dirty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello\n");
+        assert!(run.app.error.is_none());
+        assert!(run.app.tab().code.has_focus(&run.ctx));
+    }
+
+    /// The e2e window is 480×320. The list has to fit that, not a fixed 640×420.
+    #[test]
+    fn the_key_overlay_fits_the_e2e_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "hello\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        let size = egui::vec2(480.0, 320.0);
+        run.frame_sized(vec![shortcut(egui::Key::F1, egui::Modifiers::NONE)], size);
+        assert!(run.app.show_keys);
+        for _ in 0..4 {
+            run.frame_sized(vec![], size);
+        }
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        for label in [
+            "Key bindings",
+            "Filter by name or key",
+            "Esc or Ctrl+/, F1 closes",
+        ] {
+            let rect = run
+                .text_rect(label)
+                .unwrap_or_else(|| panic!("{label} isn't on screen"));
+            assert!(
+                screen.contains_rect(rect),
+                "{label} {rect:?} falls outside {screen:?}"
+            );
+        }
+        assert!(
+            run.ctx
+                .memory(|m| m.has_focus(egui::Id::new("keys_filter")))
+        );
+    }
+
+    /// Folder search reads `pin_search_result`. Rebinding it changes the
+    /// chord the field consumes, and the overlay shows that same chord.
+    #[test]
+    fn folder_search_reads_the_pin_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = dir.path().join("alpha.md");
+        let beta = dir.path().join("beta.md");
+        let gamma = dir.path().join("gamma.md");
+        fs::write(&alpha, "hello\n").unwrap();
+        fs::write(&beta, "token\n").unwrap();
+        fs::write(&gamma, "other\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(alpha));
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("beta".into())]);
+        run.wait_search();
+        run.key(egui::Key::Enter, egui::Modifiers::COMMAND);
+        run.settle();
+        assert_eq!(run.app.tab().doc.path(), Some(beta.as_path()));
+        assert!(!run.app.tab().preview);
+        assert_eq!(text(&run.app), "token\n");
+
+        run.app.keys.set(
+            Action::PinSearchResult,
+            vec![keys::Chord::parse("Ctrl+P").unwrap()],
+        );
+        run.app.install_keys();
+        assert_eq!(
+            run.app.keys.shortcut_text(Action::PinSearchResult),
+            "Ctrl+P"
+        );
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("gamma".into())]);
+        run.wait_search();
+        assert!(
+            run.text_rect("gamma.md").is_some(),
+            "the new query replaced the old one"
+        );
+        run.key(egui::Key::Enter, egui::Modifiers::COMMAND);
+        assert!(
+            run.app
+                .tabs
+                .iter()
+                .all(|tab| tab.doc.path() != Some(gamma.as_path()))
+        );
+        assert_eq!(run.app.tab().doc.path(), Some(beta.as_path()));
+        assert_eq!(text(&run.app), "token\n");
+        run.key(egui::Key::P, egui::Modifiers::COMMAND);
+        run.settle();
+        assert_eq!(run.app.tab().doc.path(), Some(gamma.as_path()));
+        assert!(!run.app.tab().preview);
+        assert_eq!(text(&run.app), "other\n");
+
+        run.key(egui::Key::F1, egui::Modifiers::NONE);
+        for _ in 0..3 {
+            if run.text_rect("Filter by name or key").is_some() {
+                break;
+            }
+            run.frame(vec![]);
+        }
+        run.frame(vec![egui::Event::Text("ctrl+p".into())]);
+        assert!(
+            run.text_rect("Open the selected folder-search result in a pinned tab")
+                .is_some()
+        );
+        assert!(run.text_rect("Ctrl+P").is_some());
+        assert!(run.text_rect("Toggle the line's task checkbox").is_none());
+    }
+
+    /// Enter opens an unpinned preview. Binding that key, or Escape, to
+    /// `pin_search_result` runs the binding. The hardcoded key must not
+    /// take the event first.
+    #[test]
+    fn search_bindings_on_enter_and_escape_are_not_shadowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = dir.path().join("alpha.md");
+        let beta = dir.path().join("beta.md");
+        let gamma = dir.path().join("gamma.md");
+        fs::write(&alpha, "hello\n").unwrap();
+        fs::write(&beta, "beta token\n").unwrap();
+        fs::write(&gamma, "gamma token\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(alpha));
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("beta".into())]);
+        run.wait_search();
+        run.key(egui::Key::Enter, egui::Modifiers::NONE);
+        run.settle();
+        assert_eq!(run.app.tab().doc.path(), Some(beta.as_path()));
+        assert!(run.app.tab().preview);
+        assert!(run.app.search.is_open());
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!run.app.search.is_open());
+        assert_eq!(run.app.tab().doc.path(), Some(beta.as_path()));
+
+        let applied = keys::KeyMap::apply(&[("pin_search_result".into(), vec!["Enter".into()])]);
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        run.app.keys = applied.map;
+        run.app.install_keys();
+        assert_eq!(run.app.keys.shortcut_text(Action::PinSearchResult), "Enter");
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("gamma".into())]);
+        run.wait_search();
+        assert!(run.text_rect("gamma.md").is_some());
+        run.key(egui::Key::Enter, egui::Modifiers::NONE);
+        run.settle();
+        assert_eq!(run.app.tab().doc.path(), Some(gamma.as_path()));
+        assert!(
+            !run.app.tab().preview,
+            "Enter is the pin chord, so the hit is not a preview"
+        );
+        assert!(run.app.search.is_open());
+
+        run.key(egui::Key::F1, egui::Modifiers::NONE);
+        for _ in 0..3 {
+            if run.text_rect("Filter by name or key").is_some() {
+                break;
+            }
+            run.frame(vec![]);
+        }
+        run.frame(vec![egui::Event::Text("pinned tab".into())]);
+        assert!(
+            run.text_rect("Open the selected folder-search result in a pinned tab")
+                .is_some()
+        );
+        assert!(run.text_rect("Enter").is_some());
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!run.app.show_keys);
+
+        let applied = keys::KeyMap::apply(&[("pin_search_result".into(), vec!["Escape".into()])]);
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        run.app.keys = applied.map;
+        run.app.install_keys();
+        assert_eq!(
+            run.app.keys.shortcut_text(Action::PinSearchResult),
+            "Escape"
+        );
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("beta".into())]);
+        run.wait_search();
+        assert!(run.text_rect("beta.md").is_some());
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        run.settle();
+        assert!(
+            run.app.search.is_open(),
+            "Escape is the pin chord, so it does not close the bar"
+        );
+        assert_eq!(run.app.tab().doc.path(), Some(beta.as_path()));
+        assert!(!run.app.tab().preview);
     }
 
     #[test]

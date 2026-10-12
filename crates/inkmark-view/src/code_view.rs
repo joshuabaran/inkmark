@@ -372,6 +372,12 @@ impl CodeView {
         ctx.memory_mut(|m| m.request_focus(self.id));
     }
 
+    /// Puts the arrow lock back after [`Self::request_focus`]. The lock
+    /// sticks only when this pane already had focus at the start of the frame.
+    pub fn lock_focus(&self, ctx: &egui::Context) {
+        lines::lock_focus_ctx(ctx, self.id);
+    }
+
     /// Draws and edits `doc`. `parse`, when given, is brought up to date
     /// after this frame's edits and colors the Markdown syntax.
     pub fn show(

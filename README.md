@@ -170,9 +170,10 @@ inkmark               # browses the current directory and shows recent files
 | Ctrl+Shift+P | Select paragraph (`select_paragraph`) |
 | Ctrl+Shift+Backslash | Jump to the matching fence or brackets (`match_bracket`) |
 | Ctrl+Shift+F | Search the open folder (`search_folder`) |
+| Ctrl+Enter | Open the selected folder-search result in a pinned tab (`pin_search_result`) |
 | Ctrl+Shift+B | Show or hide the outline (`toggle_outline`) |
 | Ctrl+Shift+N | New folder in the selected folder, or the open folder (`new_folder`) |
-| F1 | Show or hide the key bindings (`show_keys`) |
+| Ctrl+/, F1 | Show or hide the key bindings (`show_keys`) |
 | Ctrl+W | Close the tab (`close_tab`) |
 | Ctrl+Tab | Switch to the next most recently used tab (`tab_next`) |
 | Ctrl+Shift+Tab | Switch to the previous most recently used tab (`tab_previous`) |
@@ -232,7 +233,9 @@ and a missing file shows ✕. Arrow keys move through the
 tree, Left and Right collapse and expand a folder, and Enter opens a
 Markdown file. Ctrl+Shift+F searches this folder, and so does ∗. A file
 name is listed first, and a match inside a file follows; opening either
-one opens that note. A name without a Markdown extension gets `.md`. A
+one opens that note. Ctrl+Enter opens the selected result in a pinned
+tab, and a middle click on the row does the same. A name without a
+Markdown extension gets `.md`. A
 new folder keeps the name you type. A blank name, a slash, a backslash,
 `.`, or `..` is refused. Right-click an entry to rename it,
 move it (or drag it onto a folder), move it to the trash, or create a
@@ -244,7 +247,7 @@ which of the code and live panes are open, each pane's minimap, the split
 between them, the outline's width, and whether the outline is showing.
 « and » at the edges of the status bar show or hide the sidebar and the
 outline. Drag the lines between the sidebar, the panes, and the outline
-to set those widths. F1 lists the keys in effect.
+to set those widths. Ctrl+/ or F1 lists the keys in effect.
 
 ### Settings
 

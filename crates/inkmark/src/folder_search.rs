@@ -14,6 +14,7 @@ use eframe::egui::{self, FontId, Key, Modifiers, RichText, ScrollArea, Sense, Te
 use inkmark_buffer::Document;
 use inkmark_buffer::find::{Finder, SearchOptions};
 use inkmark_files::{NoteFile, walk_notes};
+use inkmark_view::keys::{Action, KeyMap, Scope};
 use inkmark_view::theme;
 
 const QUERY: &str = "folder_query";
@@ -44,7 +45,8 @@ pub(crate) enum SearchOpen {
     },
 }
 
-/// A search row the user asked to open. `pin` is Ctrl+Enter or a middle click.
+/// A search row the user asked to open. `pin` is `pin_search_result`
+/// or a middle click on the row.
 pub(crate) struct SearchChoice {
     pub open: SearchOpen,
     pub pin: bool,
@@ -215,6 +217,7 @@ impl FolderSearch {
         root: &Path,
         show_all: bool,
         modal: bool,
+        keys: &KeyMap,
     ) -> SearchFrame {
         if self.root != root || self.show_all != show_all {
             self.root = root.to_path_buf();
@@ -231,16 +234,25 @@ impl FolderSearch {
         let query_focused = ui.memory(|m| m.has_focus(query_id));
         let showing = self.showing_results();
         let (escape, enter, pin_enter, up, down) = ui.input_mut(|input| {
+            let steer = query_focused && showing;
+            // Search-scope chords come from the binding table. Take them
+            // before hardcoded Enter (open an unpinned preview) and Escape
+            // (close the bar). Otherwise `pin_search_result = "Enter"` is
+            // accepted and still opens a preview, and an Escape binding
+            // never runs.
+            let pin_enter = steer
+                && keys
+                    .consume(input, Scope::Search)
+                    .contains(&Action::PinSearchResult);
             let escape = if modal {
                 false
             } else {
                 input.consume_key(Modifiers::NONE, Key::Escape)
             };
-            let steer = query_focused && showing;
             (
                 escape,
                 steer && input.consume_key(Modifiers::NONE, Key::Enter),
-                steer && input.consume_key(Modifiers::COMMAND, Key::Enter),
+                pin_enter,
                 steer && input.consume_key(Modifiers::NONE, Key::ArrowUp),
                 steer && input.consume_key(Modifiers::NONE, Key::ArrowDown),
             )
@@ -256,12 +268,22 @@ impl FolderSearch {
 
         let before = (self.query.clone(), self.case_sensitive, self.regex);
         ui.add_space(4.0);
+        // Escape is this bar's key (close, or a search binding such as
+        // `pin_search_result`). The default filter lets egui drop focus on
+        // Escape before this function reads the key, so the binding never
+        // runs and the close path sees an unfocused field.
         let edit = ui
             .horizontal(|ui| {
                 TextEdit::singleline(&mut self.query)
                     .id(query_id)
                     .desired_width(ui.available_width())
                     .hint_text("Search this folder")
+                    .event_filter(egui::EventFilter {
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                        ..Default::default()
+                    })
                     .show(ui)
             })
             .inner;
@@ -306,6 +328,7 @@ impl FolderSearch {
         }
         // The rows can still belong to the previous query while this one
         // waits out the debounce. Opening one would land on that old hit.
+        // Enter opens unpinned only when no search chord already took it.
         if !self.dirty && (pin_enter || enter) {
             open = self.open_hit(self.selected).map(|open| SearchChoice {
                 open,
@@ -395,6 +418,7 @@ impl FolderSearch {
                             egui::pos2(rect.left() + 8.0, rect.center().y - galley.size().y * 0.5);
                         ui.painter().galley(pos, galley, color);
                         if let Some(hit) = hit {
+                            // The overlay lists this as "Middle click a search result".
                             if response.middle_clicked() {
                                 clicked = Some((hit, true));
                             } else if response.clicked() {

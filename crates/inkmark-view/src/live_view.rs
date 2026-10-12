@@ -435,6 +435,12 @@ impl LiveView {
         ctx.memory_mut(|m| m.request_focus(self.id));
     }
 
+    /// Puts the arrow lock back after [`Self::request_focus`]. The lock
+    /// sticks only when this pane already had focus at the start of the frame.
+    pub fn lock_focus(&self, ctx: &egui::Context) {
+        lines::lock_focus_ctx(ctx, self.id);
+    }
+
     pub fn has_focus(&self, ctx: &egui::Context) -> bool {
         ctx.memory(|m| m.has_focus(self.id))
     }
