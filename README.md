@@ -170,6 +170,7 @@ inkmark               # browses the current directory and shows recent files
 | Ctrl+Shift+P | Select paragraph (`select_paragraph`) |
 | Ctrl+Shift+Backslash | Jump to the matching fence or brackets (`match_bracket`) |
 | Ctrl+Shift+F | Search the open folder (`search_folder`) |
+| Ctrl+Enter | Open the selected folder-search result in a pinned tab (`pin_search_result`) |
 | Ctrl+Shift+B | Show or hide the outline (`toggle_outline`) |
 | Ctrl+Shift+N | New folder in the selected folder, or the open folder (`new_folder`) |
 | Ctrl+/, F1 | Show or hide the key bindings (`show_keys`) |
@@ -232,7 +233,9 @@ and a missing file shows ✕. Arrow keys move through the
 tree, Left and Right collapse and expand a folder, and Enter opens a
 Markdown file. Ctrl+Shift+F searches this folder, and so does ∗. A file
 name is listed first, and a match inside a file follows; opening either
-one opens that note. A name without a Markdown extension gets `.md`. A
+one opens that note. Ctrl+Enter opens the selected result in a pinned
+tab, and a middle click on the row does the same. A name without a
+Markdown extension gets `.md`. A
 new folder keeps the name you type. A blank name, a slash, a backslash,
 `.`, or `..` is refused. Right-click an entry to rename it,
 move it (or drag it onto a folder), move it to the trash, or create a

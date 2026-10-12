@@ -14,6 +14,7 @@ use eframe::egui::{self, FontId, Key, Modifiers, RichText, ScrollArea, Sense, Te
 use inkmark_buffer::Document;
 use inkmark_buffer::find::{Finder, SearchOptions};
 use inkmark_files::{NoteFile, walk_notes};
+use inkmark_view::keys::Chord;
 use inkmark_view::theme;
 
 const QUERY: &str = "folder_query";
@@ -44,7 +45,8 @@ pub(crate) enum SearchOpen {
     },
 }
 
-/// A search row the user asked to open. `pin` is Ctrl+Enter or a middle click.
+/// A search row the user asked to open. `pin` is the pin-search chord
+/// ([`Chord`]s from `pin_search_result`) or a middle click on the row.
 pub(crate) struct SearchChoice {
     pub open: SearchOpen,
     pub pin: bool,
@@ -215,6 +217,7 @@ impl FolderSearch {
         root: &Path,
         show_all: bool,
         modal: bool,
+        pin_chords: &[Chord],
     ) -> SearchFrame {
         if self.root != root || self.show_all != show_all {
             self.root = root.to_path_buf();
@@ -240,7 +243,9 @@ impl FolderSearch {
             (
                 escape,
                 steer && input.consume_key(Modifiers::NONE, Key::Enter),
-                steer && input.consume_key(Modifiers::COMMAND, Key::Enter),
+                // The pin chord comes from the binding table (`pin_search_result`),
+                // the same row the overlay and the conflict check use.
+                steer && Chord::consume(input, pin_chords),
                 steer && input.consume_key(Modifiers::NONE, Key::ArrowUp),
                 steer && input.consume_key(Modifiers::NONE, Key::ArrowDown),
             )
@@ -395,6 +400,7 @@ impl FolderSearch {
                             egui::pos2(rect.left() + 8.0, rect.center().y - galley.size().y * 0.5);
                         ui.painter().galley(pos, galley, color);
                         if let Some(hit) = hit {
+                            // The overlay lists this as "Middle click a search result".
                             if response.middle_clicked() {
                                 clicked = Some((hit, true));
                             } else if response.clicked() {
