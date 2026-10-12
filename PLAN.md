@@ -99,7 +99,7 @@
 - **Code:** plain line strips or downsampled glyphs from the rope. The viewport box marks the visible line range.
 - **Live:** a cheap structure strip. Headings are thick bars by level; other blocks are density ticks. Positions come from the HeightCache, never from laying out the whole document.
 - **When to rebuild:** rebuild the sample when the BlockTree is swapped. On scroll, update only the viewport box.
-- **Interaction and state:** click or drag sets the pane's scroll target. `show_minimap` is per pane and survives mode switches.
+- **Interaction and state:** a click outside the preview box centres the pane on that point. A press on the box does not jump; dragging it keeps the box under the pointer. A short document scrolls by the pointer movement divided by the minimap scale. When the document is taller than the minimap window, that window follows the scroll in proportion, so the box still tracks the pointer and both ends of the document stay reachable. The scrollbar is unchanged. `show_minimap` is per pane and survives mode switches.
 
 ### 5. Rendering
 
@@ -134,7 +134,7 @@ Three view modes, toggled instantly, with the same document and cursor kept acro
 
 Both panes are editable. An edit in the live pane is a direct, minimal patch to the Markdown source. It is never a whole-block rewrite and never a lossy HTML round-trip. There is one undo history for each open document, whichever pane made the edit.
 
-Each pane can show or hide its own minimap (VS Code style): a narrow overview you can click or drag to navigate, with the viewport highlighted. The code minimap shows the source; the live minimap shows rendered structure. Minimap state is per pane and survives mode switches.
+Each pane can show or hide its own minimap (VS Code style): a narrow overview, with the viewport highlighted. Clicking outside that box jumps there. Dragging the box scrolls with the pointer. The code minimap shows the source; the live minimap shows rendered structure. Minimap state is per pane and survives mode switches.
 
 ### MVP
 

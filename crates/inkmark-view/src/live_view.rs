@@ -1100,15 +1100,9 @@ impl LiveView {
             let hit = ui.interact(rect, self.id.with("minimap"), Sense::click_and_drag());
             lines::keep_focus(ui, self.id, &hit);
             minimap_hovered = hit.hovered();
-            let pressed =
-                hit.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed());
             let map = self.lines.minimap(rect, viewport);
             // The minimap sits outside the text area, so the drag is `hit`'s.
-            let target = match hit.interact_pointer_pos() {
-                Some(p) if pressed => Some(map.jump_target(p.y)),
-                Some(p) if hit.dragged() => Some(map.drag_target(p.y)),
-                _ => None,
-            };
+            let target = lines::minimap_target(ui, hit.id, &map, &hit);
             if let Some(top) = target {
                 self.lines.anchor = self.lines.heights.line_at(top);
                 self.lines.anchor = self
