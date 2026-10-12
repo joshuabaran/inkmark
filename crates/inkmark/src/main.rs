@@ -346,6 +346,15 @@ impl Tab {
     }
 }
 
+/// What `open_existing` did with a path that was supposed to be a file.
+enum ExistingOpen {
+    Opened,
+    /// Not on disk. The caller drops it. A new file is not created.
+    Missing,
+    /// On disk, but it could not be read. `String` is the banner text.
+    Failed(String),
+}
+
 /// A tab Ctrl+Shift+T can open again. The text is not kept: the file is
 /// read from disk, at this caret and scroll. It comes back pinned.
 struct ClosedTab {
@@ -430,6 +439,10 @@ struct App {
     session_adopted: bool,
     /// A restore is opening tabs. Writes wait until that list is finished.
     session_quiet: bool,
+    /// Still on disk, but not opened: unreadable, or not UTF-8. Missing
+    /// paths are not kept. These stay in the session file so the next
+    /// launch can try again.
+    session_unopened: Vec<session_tabs::StoredTab>,
     /// Closed tabs, oldest first. Ctrl+Shift+T takes from the back.
     closed: VecDeque<ClosedTab>,
     /// Drawn outline width where the current drag began.
@@ -571,7 +584,14 @@ impl App {
                 parse: ParseState::new(Arc::new(GfmParser), &Document::default(), move || {
                     parse_ctx.request_repaint()
                 }),
-                focus: Pane::Code,
+                // Live-only must be the focus before the first restore.
+                // Focusing the code pane from here switches the mode to
+                // code and writes that into the layout file.
+                focus: if mode == Mode::Live {
+                    Pane::Live
+                } else {
+                    Pane::Code
+                },
                 banner: None,
                 disk: None,
                 find: FindState::default(),
@@ -617,6 +637,7 @@ impl App {
             session_saved,
             session_adopted: false,
             session_quiet: false,
+            session_unopened: Vec::new(),
             closed: VecDeque::new(),
             outline_drag_from: None,
             split_drag_from: None,
@@ -652,6 +673,10 @@ impl App {
         if restore {
             app.restore_session();
         }
+        // Opening the file argument replaces the blank tab and clears the
+        // banner. A session file that could not be read still needs to be
+        // reported, or the launch looks like it succeeded.
+        let session_error = app.error.clone();
         match launch {
             Launch::File { file, .. } => app.open(file),
             Launch::Folder { .. } => {
@@ -659,6 +684,12 @@ impl App {
                     app.recent_list = Some(0);
                 }
             }
+        }
+        if let Some(earlier) = session_error {
+            app.error = Some(match app.error.as_deref() {
+                Some(later) if later != earlier => format!("{earlier}. {later}"),
+                _ => earlier,
+            });
         }
         for tab in &mut app.tabs {
             tab.code.show_minimap = code_minimap;
@@ -1009,7 +1040,9 @@ impl App {
     }
 
     fn reopen_one(&mut self, closed: &ClosedTab) -> bool {
-        if self.tab_index(&closed.path).is_none() && !self.open_existing(&closed.path, true) {
+        if self.tab_index(&closed.path).is_none()
+            && !matches!(self.open_existing(&closed.path, true), ExistingOpen::Opened)
+        {
             return false;
         }
         let Some(index) = self.tab_index(&closed.path) else {
@@ -1023,20 +1056,27 @@ impl App {
 
     /// Opens a file that is already on disk. A missing path is not created.
     /// `remember_recent` is false while restoring, so a launch does not
-    /// reshuffle the recent-files list.
-    fn open_existing(&mut self, path: &Path, remember_recent: bool) -> bool {
+    /// reshuffle the recent-files list. A file that is there but cannot be
+    /// read is `ExistingOpen::Failed`, and the caller decides whether to
+    /// keep it in the session.
+    fn open_existing(&mut self, path: &Path, remember_recent: bool) -> ExistingOpen {
         if let Some(index) = self.tab_index(path) {
+            self.forget_unopened(path);
             self.activate(index);
-            return true;
+            return ExistingOpen::Opened;
         }
         let doc = match Document::open(path) {
             Ok(doc) => doc,
-            Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return ExistingOpen::Missing;
+            }
             Err(e) => {
-                self.error = Some(format!("Couldn't open {}: {e}", path.display()));
-                return false;
+                let message = format!("Couldn't open {}: {e}", path.display());
+                self.error = Some(message.clone());
+                return ExistingOpen::Failed(message);
             }
         };
+        self.forget_unopened(path);
         if remember_recent {
             self.recent.add(path);
         }
@@ -1048,7 +1088,13 @@ impl App {
         } else {
             self.push_tab(doc);
         }
-        true
+        ExistingOpen::Opened
+    }
+
+    /// `path` opened, so a failed restore of it must not be written again.
+    fn forget_unopened(&mut self, path: &Path) {
+        self.session_unopened
+            .retain(|kept| !same_file(&kept.path, path));
     }
 
     /// Puts the caret and the scroll back without scrolling to the caret.
@@ -1070,8 +1116,9 @@ impl App {
     }
 
     /// No file argument, or a file argument: put the saved tabs back.
-    /// A missing file is skipped. A store that is not a session is left
-    /// as it is.
+    /// A missing file is skipped. A file that is there but cannot be read
+    /// stays in the list, and the error is shown. A store that is not a
+    /// session is left as it is.
     fn restore_session(&mut self) {
         let Some(path) = self.session_store.clone() else {
             return;
@@ -1081,14 +1128,28 @@ impl App {
         };
         self.session_quiet = true;
         let mut slots = Vec::with_capacity(session.tabs.len());
+        let mut failed = Vec::new();
         for stored in &session.tabs {
             if !stored.path.is_file() {
                 slots.push(None);
                 continue;
             }
-            if self.tab_index(&stored.path).is_none() && !self.open_existing(&stored.path, false) {
-                slots.push(None);
-                continue;
+            if self.tab_index(&stored.path).is_none() {
+                match self.open_existing(&stored.path, false) {
+                    ExistingOpen::Opened => {}
+                    ExistingOpen::Missing => {
+                        slots.push(None);
+                        continue;
+                    }
+                    ExistingOpen::Failed(message) => {
+                        // A later tab's open clears `error`. Hold the message
+                        // and the path: a missing file is the only one dropped.
+                        failed.push(message);
+                        self.session_unopened.push(stored.clone());
+                        slots.push(None);
+                        continue;
+                    }
+                }
             }
             let Some(index) = self.tab_index(&stored.path) else {
                 slots.push(None);
@@ -1137,6 +1198,9 @@ impl App {
         {
             tab.preview = true;
         }
+        if !failed.is_empty() {
+            self.error = Some(failed.join(". "));
+        }
         self.session_quiet = false;
         self.session_adopted = true;
         self.remember_session();
@@ -1164,6 +1228,22 @@ impl App {
                 caret,
                 scroll_line: scroll.line,
                 scroll_frac: scroll.frac,
+            });
+        }
+        for kept in &self.session_unopened {
+            let path = session_tabs::canonical(&kept.path);
+            if path.to_str().is_none() || !path.is_file() {
+                continue;
+            }
+            if tabs.iter().any(|tab| same_file(&tab.path, &path)) {
+                continue;
+            }
+            tabs.push(session_tabs::StoredTab {
+                path,
+                preview: kept.preview,
+                caret: kept.caret,
+                scroll_line: kept.scroll_line,
+                scroll_frac: kept.scroll_frac,
             });
         }
         session_tabs::Session { active, tabs }
@@ -8979,6 +9059,95 @@ mod tests {
         assert!(ignored.tab().doc.path().is_none());
         assert!(ignored.error.is_none());
         assert_eq!(fs::read_to_string(&store).unwrap(), "nope\n");
+    }
+
+    #[test]
+    fn a_live_only_session_stays_live_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "alpha\n").unwrap();
+        write_session(dir.path(), 0, vec![stored(&a, false, 0, 0, 0.0)]);
+        let layout = dir.path().join("layout");
+        fs::write(&layout, "live\n1\n1\n0.5\n200\n1\n").unwrap();
+        let before = fs::read_to_string(&layout).unwrap();
+        let ctx = egui::Context::default();
+        let app = App::with_recent(
+            &ctx,
+            None,
+            recent::Recent::from_store(Some(dir.path().join("recent"))),
+        );
+        assert!(app.mode == Mode::Live);
+        assert!(app.tab().focus == Pane::Live);
+        assert!(same_file(app.tab().doc.path().unwrap(), &a));
+        assert_eq!(fs::read_to_string(&layout).unwrap(), before);
+    }
+
+    #[test]
+    fn an_unreadable_tab_is_kept_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.md");
+        let good = dir.path().join("good.md");
+        fs::write(&bad, [0xff]).unwrap();
+        fs::write(&good, "keep\n").unwrap();
+        write_session(
+            dir.path(),
+            0,
+            vec![
+                stored(&bad, false, 4, 1, 0.0),
+                stored(&good, false, 2, 0, 0.0),
+            ],
+        );
+        let ctx = egui::Context::default();
+        let app = App::with_recent(
+            &ctx,
+            None,
+            recent::Recent::from_store(Some(dir.path().join("recent"))),
+        );
+        assert_eq!(app.tabs.len(), 1);
+        assert!(same_file(app.tab().doc.path().unwrap(), &good));
+        let error = app.error.expect("the unreadable file is reported");
+        assert!(error.contains("bad.md"), "{error}");
+        assert!(error.contains("UTF-8"), "{error}");
+        let kept = session_tabs::load(&dir.path().join("tabs")).unwrap();
+        assert!(
+            kept.tabs.iter().any(|tab| same_file(&tab.path, &bad)),
+            "the session dropped the unreadable file"
+        );
+        assert_eq!(
+            kept.tabs
+                .iter()
+                .find(|tab| same_file(&tab.path, &bad))
+                .unwrap()
+                .caret,
+            4
+        );
+
+        fs::write(&bad, "fixed\n").unwrap();
+        let again = App::with_recent(
+            &ctx,
+            None,
+            recent::Recent::from_store(Some(dir.path().join("recent"))),
+        );
+        assert!(again.error.is_none(), "{:?}", again.error);
+        assert_eq!(again.tabs.len(), 2);
+        assert!(
+            again
+                .tabs
+                .iter()
+                .any(|tab| tab.doc.path().is_some_and(|p| same_file(p, &bad)))
+        );
+        assert!(
+            again
+                .tabs
+                .iter()
+                .any(|tab| tab.doc.path().is_some_and(|p| same_file(p, &good)))
+        );
+        let fixed = again
+            .tabs
+            .iter()
+            .find(|tab| tab.doc.path().is_some_and(|p| same_file(p, &bad)))
+            .unwrap();
+        assert_eq!(fixed.code.selection().head, 4);
     }
 
     #[test]

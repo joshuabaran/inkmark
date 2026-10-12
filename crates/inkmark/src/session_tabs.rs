@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+#[derive(Clone)]
 pub(crate) struct StoredTab {
     pub path: PathBuf,
     pub preview: bool,
