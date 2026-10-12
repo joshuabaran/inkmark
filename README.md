@@ -189,6 +189,9 @@ inkmark               # browses the current directory and shows recent files
 | Alt+8 | Switch to tab 8 (`tab_8`) |
 | Alt+9 | Switch to tab 9 (`tab_9`) |
 | Ctrl+Shift+T | Reopen the closed tab (`reopen_tab`) |
+| Ctrl+Shift+/ | Show or hide the Markdown syntax cheatsheet (`show_syntax`) |
+
+Ctrl+Shift+/ opens this list of Markdown syntax. Each row shows the source in the code font and the same text rendered as in the live pane. Escape closes it, and clicking a row inserts that snippet at the caret.
 
 Arrows, Home, End, Page Up, Page Down, Backspace, Enter and Tab edit as
 usual, and holding Shift extends a selection. Those keys are not in the

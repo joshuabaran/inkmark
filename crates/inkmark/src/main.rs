@@ -12,10 +12,10 @@ use inkmark_files::{
     Launch, NewFileError, NewFolderError, SystemTrash, Trash, choose_root, create_new_file,
     create_new_folder, move_into, rename,
 };
-use inkmark_parse::{GfmParser, ParseState};
+use inkmark_parse::{GfmParser, MarkdownParser, ParseState};
 use inkmark_text::Fonts;
 use inkmark_view::keys::{self, Action, Scope};
-use inkmark_view::{BrowserOutput, CodeView, FileBrowser, LiveView, ScrollPos, theme};
+use inkmark_view::{BrowserOutput, Cheatsheet, CodeView, FileBrowser, LiveView, ScrollPos, theme};
 
 /// Font sizes, in points, unless config.toml sets them, and line height as
 /// a multiple of the size.
@@ -457,9 +457,9 @@ struct App {
     show_keys: bool,
     /// The overlay's filter. Cleared each time the overlay opens.
     keys_query: String,
-    /// The overlay had the keyboard last frame. The frame it closes still
-    /// has the modal layer, so the pane surrenders focus while it draws
-    /// and has to be focused again afterwards.
+    /// The key list or the syntax cheatsheet had the keyboard last frame.
+    /// The frame one of them closes still has the modal layer, so the pane
+    /// surrenders focus while it draws and has to be focused again afterwards.
     keys_return_focus: bool,
     /// Ask the filter for focus once, on the frame the overlay opens.
     /// Asking again each frame interrupts IME composition.
@@ -468,6 +468,10 @@ struct App {
     /// stick. This frame the pane's own lock applies, and an arrow must
     /// not move egui's focus away from it.
     keys_arm_lock: bool,
+    /// Ctrl+Shift+/. The Markdown syntax cheatsheet.
+    show_syntax: bool,
+    /// Rows for the cheatsheet. Drawn only while `show_syntax` is set.
+    syntax: Cheatsheet,
     /// Asks for a new name for this file or folder.
     rename: Option<RenamePrompt>,
     /// Asks before moving this file or folder to the trash.
@@ -661,6 +665,8 @@ impl App {
             keys_return_focus: false,
             keys_focus_filter: false,
             keys_arm_lock: false,
+            show_syntax: false,
+            syntax: Cheatsheet::new(fonts.clone()),
             rename: None,
             trash_confirm: None,
             trash: Box::new(SystemTrash),
@@ -1923,14 +1929,21 @@ impl App {
         if self.confirm.is_some() {
             return;
         }
-        // The overlay takes the keyboard. Only its own chord is consumed
+        // An overlay takes the keyboard. Only its own chord is consumed
         // here, so a key typed into the filter does not also save or switch
         // tabs. Other app chords, including one rebound onto Escape, stay
-        // in the event list: Escape still closes the overlay in `keys_ui`.
+        // in the event list: Escape still closes the overlay.
         if self.show_keys {
             let toggle = ctx.input_mut(|i| self.keys.consume_action(i, Action::ShowKeys));
             if toggle {
                 self.toggle_keys();
+            }
+            return;
+        }
+        if self.show_syntax {
+            let toggle = ctx.input_mut(|i| self.keys.consume_action(i, Action::ShowSyntax));
+            if toggle {
+                self.toggle_syntax();
             }
             return;
         }
@@ -1959,6 +1972,7 @@ impl App {
                     | Action::ToggleOutline
                     | Action::SearchFolder
                     | Action::ShowKeys
+                    | Action::ShowSyntax
                     | Action::ReopenTab
             )
         {
@@ -1972,6 +1986,7 @@ impl App {
             }
             Action::RecentFiles => {
                 self.show_keys = false;
+                self.show_syntax = false;
                 if self.tabs.is_empty() {
                     // The pane already shows the list. Ctrl+R only clears a
                     // dialog that was covering it.
@@ -2035,6 +2050,7 @@ impl App {
             Action::NewFile => self.begin_new_file(),
             Action::NewFolder => self.begin_new_folder(),
             Action::ShowKeys => self.toggle_keys(),
+            Action::ShowSyntax => self.toggle_syntax(),
             Action::Find => self.open_find(ctx, false),
             Action::Replace => self.open_find(ctx, true),
             Action::FindNext => self.find_move(true),
@@ -2152,6 +2168,32 @@ impl App {
         // `finish_keys_focus` asks after they draw.
     }
 
+    /// Ctrl+Shift+/ opens the cheatsheet, and the same chord closes it.
+    /// Another dialog keeps it shut. Escape closes it from `syntax_ui`.
+    fn toggle_syntax(&mut self) {
+        if self.show_syntax {
+            self.close_syntax();
+            return;
+        }
+        if self.modal_open() {
+            return;
+        }
+        self.recent_list = None;
+        self.show_syntax = true;
+    }
+
+    fn close_syntax(&mut self) {
+        self.show_syntax = false;
+        self.show_recent_if_empty();
+        // Same as `close_keys`: the panes would surrender a focus request
+        // made before they draw. `finish_keys_focus` asks after they draw.
+    }
+
+    /// The key list or the syntax cheatsheet is up.
+    fn overlay_open(&self) -> bool {
+        self.show_keys || self.show_syntax
+    }
+
     /// Puts keyboard focus back on the code or live pane that had it.
     ///
     /// `request_focus` clears the arrow lock. The lock sticks on the
@@ -2167,9 +2209,9 @@ impl App {
         }
     }
 
-    /// After the panes have drawn, on the frame the overlay closes: focus
-    /// the pane the list borrowed. The filter keeps focus while the list
-    /// is open. The arrow lock cannot stick on this same frame, because the
+    /// After the panes have drawn, on the frame an overlay closes: focus
+    /// the pane it borrowed. The filter or the cheatsheet keeps focus while
+    /// it is open. The arrow lock cannot stick on this same frame, because the
     /// pane did not have focus when the frame began, so the next frame arms
     /// it (CRO-128).
     fn finish_keys_focus(&mut self, ctx: &egui::Context) {
@@ -2179,8 +2221,8 @@ impl App {
             // move so the key edits the pane and the pane keeps the keyboard.
             ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
         }
-        let closing = self.keys_return_focus && !self.show_keys;
-        self.keys_return_focus = self.show_keys;
+        let closing = self.keys_return_focus && !self.overlay_open();
+        self.keys_return_focus = self.overlay_open();
         // A new-file or rename prompt can replace the list on this frame.
         // That prompt owns the keyboard.
         if !closing || self.modal_open() {
@@ -2195,7 +2237,7 @@ impl App {
             || self.confirm.is_some()
             || self.new_file.is_some()
             || self.new_folder.is_some()
-            || self.show_keys
+            || self.overlay_open()
             || self.rename.is_some()
             || self.trash_confirm.is_some()
             || self.dialog.is_some()
@@ -2545,7 +2587,7 @@ impl App {
             || self.confirm.is_some()
             || self.new_file.is_some()
             || self.new_folder.is_some()
-            || self.show_keys
+            || self.overlay_open()
             || self.rename.is_some()
             || self.trash_confirm.is_some();
         if self.tabs.is_empty() {
@@ -2555,10 +2597,10 @@ impl App {
             self.modal_was_open = open;
             return;
         }
-        // The filter holds the keyboard while the list is open. Releasing
-        // the browser keeps the sidebar from taking keys. The editor is
-        // focused again when the list closes (CRO-128).
-        if self.show_keys {
+        // The filter or the cheatsheet holds the keyboard while that overlay
+        // is open. Releasing the browser keeps the sidebar from taking keys.
+        // The editor is focused again when the overlay closes (CRO-128).
+        if self.overlay_open() {
             ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("file_browser")));
             self.modal_was_open = true;
             return;
@@ -2838,6 +2880,7 @@ impl App {
         }
         self.recent_list = None;
         self.show_keys = false;
+        self.show_syntax = false;
         self.new_file = Some(NewFilePrompt {
             dir: self.browser.new_file_dir(),
             name: String::new(),
@@ -2856,6 +2899,7 @@ impl App {
         }
         self.recent_list = None;
         self.show_keys = false;
+        self.show_syntax = false;
         self.new_folder = Some(NewFilePrompt {
             dir: self.browser.new_file_dir(),
             name: String::new(),
@@ -3060,6 +3104,129 @@ impl App {
         });
     }
 
+    /// The Markdown cheatsheet. Each row is the source in the code font and
+    /// the same source through the live renderer. Escape or Ctrl+Shift+/
+    /// closes it. Clicking a row inserts that snippet at the caret.
+    fn syntax_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_syntax {
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.close_syntax();
+            return;
+        }
+        self.sync_syntax_type();
+        if let Some(cache) = self.images.clone() {
+            self.syntax.share_images(cache, u64::MAX);
+        }
+        self.syntax.begin_rows();
+        let screen = ctx.content_rect();
+        let pad = 32.0;
+        let max_w = (screen.width() - pad * 2.0).max(200.0);
+        let max_h = (screen.height() - pad * 2.0).max(160.0);
+        // Preferred size, but never wider or taller than this window. The
+        // e2e viewport is 480×320.
+        let width = max_w.min(760.0);
+        let list_h = (max_h - 160.0).clamp(80.0, 480.0);
+        let close = self.keys.platform_text(ctx.os(), Action::ShowSyntax);
+        let sheet = egui::Id::new("syntax_sheet");
+        let mut clicked = None;
+        egui::Modal::new(egui::Id::new("syntax")).show(ctx, |ui| {
+            ui.set_width(width);
+            // A focus target on this layer, so the pane underneath gives up
+            // the keyboard. Registered before the rows, so a row click stays
+            // on top. Asking again each frame would reset that focus.
+            let _focus = ui.interact(
+                egui::Rect::from_min_size(ui.cursor().min, egui::vec2(1.0, 1.0)),
+                sheet,
+                egui::Sense::click(),
+            );
+            if !ui.is_sizing_pass() && !ui.memory(|m| m.has_focus(sheet)) {
+                ui.memory_mut(|m| m.request_focus(sheet));
+            }
+            ui.heading("Markdown syntax");
+            ui.add_space(4.0);
+            ui.columns_const(|[left, right]| {
+                left.label(RichText::new("Syntax").strong());
+                right.label(RichText::new("Rendered").strong());
+            });
+            ui.add_space(4.0);
+            let scroll_width = ui.available_width();
+            ui.allocate_ui(egui::vec2(scroll_width, list_h), |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (index, sample) in inkmark_view::samples().iter().enumerate() {
+                        let doc = Document::from_text(&sample.source);
+                        let parse = GfmParser.parse(&sample.source);
+                        if self
+                            .syntax
+                            .show_row(ui, index, &sample.source, &doc, &parse)
+                        {
+                            clicked = Some(index);
+                        }
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!("Esc or {close} closes. Click a row to insert it."))
+                    .small()
+                    .weak(),
+            );
+        });
+        if let Some(index) = clicked {
+            let source = inkmark_view::samples()[index].source.clone();
+            self.insert_snippet(ctx, &source);
+        }
+        self.eat_overlay_keys(ctx);
+    }
+
+    /// Font sizes from the open tab, so the two columns match the panes.
+    fn sync_syntax_type(&mut self) {
+        if let Some(tab) = self.tabs.get(self.active) {
+            self.syntax.set_type_size(
+                tab.code.font_size,
+                tab.code.line_height,
+                tab.live.font_size,
+                tab.live.line_height,
+            );
+            return;
+        }
+        let code_size = self.settings.code_size.unwrap_or(CODE_SIZE);
+        let text_size = self.settings.text_size.unwrap_or(TEXT_SIZE);
+        self.syntax.set_type_size(
+            code_size,
+            (code_size * CODE_LINE).round(),
+            text_size,
+            (text_size * TEXT_LINE).round(),
+        );
+    }
+
+    /// Puts `source` at the caret. With no note open, copies it instead.
+    /// The cheatsheet stays open.
+    fn insert_snippet(&mut self, ctx: &egui::Context, source: &str) {
+        if self.tabs.is_empty() {
+            ctx.copy_text(source.to_owned());
+            self.show_hint("Copied the snippet");
+            return;
+        }
+        let before = self.selection();
+        let range = before.range();
+        let after = Selection::caret(range.start + source.len());
+        if self
+            .tab_mut()
+            .doc
+            .apply(
+                vec![inkmark_buffer::Edit::replace(range, source)],
+                before,
+                after,
+                inkmark_buffer::EditKind::Other,
+            )
+            .is_ok()
+        {
+            self.show_match(after);
+        }
+    }
+
     /// Creates the named file and opens it in a tab. The empty file stays
     /// on disk even if a later close of that tab is refused.
     fn submit_new_file(&mut self) {
@@ -3123,7 +3290,7 @@ impl App {
         if self.confirm.is_some()
             || self.new_file.is_some()
             || self.new_folder.is_some()
-            || self.show_keys
+            || self.overlay_open()
         {
             return;
         }
@@ -4212,6 +4379,7 @@ impl App {
         // Dialogs take the keyboard before the panes see it.
         self.recent_ui(&ctx);
         self.keys_ui(&ctx);
+        self.syntax_ui(&ctx);
         self.hold_focus_for_dialogs(&ctx);
 
         let show_banner = self.error.is_some()
@@ -8129,6 +8297,196 @@ mod tests {
             run.ctx
                 .memory(|m| m.has_focus(egui::Id::new("keys_filter")))
         );
+    }
+
+    /// Ctrl+Shift+/ opens the cheatsheet. Escape and the same chord close
+    /// it, and the pane that had the keyboard gets it back, arrow lock
+    /// included (CRO-128). A click inserts the row and leaves the sheet open.
+    #[test]
+    fn the_syntax_cheatsheet_opens_closes_and_returns_focus() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "hello\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path.clone()));
+        assert!(run.app.tab().code.has_focus(&run.ctx));
+
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::Slash, shift);
+        assert!(run.app.show_syntax);
+        assert!(!run.app.show_keys);
+        for _ in 0..4 {
+            let painted = run.text_rect("Markdown syntax").is_some()
+                && run
+                    .app
+                    .syntax
+                    .row_rects()
+                    .first()
+                    .is_some_and(|rect| rect.height() > 8.0);
+            let focused = run
+                .ctx
+                .memory(|m| m.has_focus(egui::Id::new("syntax_sheet")));
+            if painted && focused {
+                break;
+            }
+            run.frame(vec![]);
+        }
+        assert!(run.text_rect("Markdown syntax").is_some());
+        assert!(run.text_rect("Syntax").is_some());
+        assert!(run.text_rect("Rendered").is_some());
+        assert!(
+            run.text_rect("Esc or Ctrl+Shift+/ closes. Click a row to insert it.")
+                .is_some()
+        );
+        assert!(
+            run.ctx
+                .memory(|m| m.has_focus(egui::Id::new("syntax_sheet"))),
+            "the cheatsheet takes focus"
+        );
+        assert!(!run.app.tab().code.has_focus(&run.ctx));
+        assert!(
+            run.app
+                .syntax
+                .row_rects()
+                .first()
+                .is_some_and(|rect| rect.height() > 8.0),
+            "a row was drawn"
+        );
+
+        // Keys behind the sheet do not edit the note.
+        run.frame(vec![egui::Event::Text("Z".into())]);
+        assert_eq!(text(&run.app), "hello\n");
+
+        let row = run.app.syntax.row_rects()[0];
+        run.click_pos(row.center(), egui::PointerButton::Primary);
+        assert!(
+            run.app.show_syntax,
+            "a click inserts and leaves the sheet open"
+        );
+        assert!(
+            text(&run.app).starts_with("# Heading\n"),
+            "{}",
+            text(&run.app)
+        );
+        assert!(text(&run.app).contains("hello"));
+
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!run.app.show_syntax);
+        assert!(run.text_rect("Markdown syntax").is_none());
+        assert!(run.app.tab().code.has_focus(&run.ctx));
+        let before = run.app.tab().code.selection();
+        run.key(egui::Key::ArrowRight, egui::Modifiers::NONE);
+        assert!(run.app.tab().code.has_focus(&run.ctx));
+        assert_ne!(run.app.tab().code.selection(), before);
+        run.frame(vec![egui::Event::Text("Z".into())]);
+        assert!(text(&run.app).contains('Z'));
+        assert!(run.app.tab().code.has_focus(&run.ctx));
+
+        // The same chord closes, and focus comes back.
+        run.key(egui::Key::Slash, shift);
+        assert!(run.app.show_syntax);
+        run.key(egui::Key::Slash, shift);
+        assert!(!run.app.show_syntax);
+        assert!(run.app.tab().code.has_focus(&run.ctx));
+
+        // The live pane gets its own focus back, lock included.
+        run.app.focus_pane(&run.ctx, Pane::Live);
+        run.frame(vec![]);
+        assert!(run.app.tab().live.has_focus(&run.ctx));
+        run.key(egui::Key::Slash, shift);
+        assert!(run.app.show_syntax);
+        for _ in 0..4 {
+            if run
+                .ctx
+                .memory(|m| m.has_focus(egui::Id::new("syntax_sheet")))
+            {
+                break;
+            }
+            run.frame(vec![]);
+        }
+        assert!(!run.app.tab().live.has_focus(&run.ctx));
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!run.app.show_syntax);
+        assert!(run.app.tab().live.has_focus(&run.ctx));
+        let before = run.app.tab().live.selection();
+        run.key(egui::Key::ArrowRight, egui::Modifiers::NONE);
+        assert!(run.app.tab().live.has_focus(&run.ctx));
+        assert_ne!(run.app.tab().live.selection(), before);
+        run.frame(vec![egui::Event::Text("Q".into())]);
+        assert!(text(&run.app).contains('Q'));
+        assert!(run.app.tab().live.has_focus(&run.ctx));
+
+        // Listed in the key-binding overlay.
+        run.key(egui::Key::F1, egui::Modifiers::NONE);
+        assert!(run.app.show_keys);
+        for _ in 0..3 {
+            if run.text_rect("Filter by name or key").is_some() {
+                break;
+            }
+            run.frame(vec![]);
+        }
+        run.frame(vec![egui::Event::Text("cheatsheet".into())]);
+        assert!(
+            run.text_rect("Show or hide the Markdown syntax cheatsheet")
+                .is_some()
+        );
+        assert!(run.text_rect("Ctrl+Shift+/").is_some());
+        assert!(run.text_rect("Toggle bold").is_none());
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!run.app.show_keys);
+        assert!(run.app.tab().live.has_focus(&run.ctx));
+
+        // Escape closes the sheet and does not Save, even when Save is Escape.
+        run.app.focus_pane(&run.ctx, Pane::Code);
+        run.frame(vec![]);
+        run.app
+            .keys
+            .set(Action::Save, vec![keys::Chord::parse("Escape").unwrap()]);
+        run.app.install_keys();
+        run.key(egui::Key::Slash, shift);
+        assert!(run.app.show_syntax);
+        for _ in 0..3 {
+            if run.text_rect("Markdown syntax").is_some() {
+                break;
+            }
+            run.frame(vec![]);
+        }
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!run.app.show_syntax);
+        assert!(run.app.tab().doc.is_dirty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello\n");
+        assert!(text(&run.app).contains("# Heading"));
+        assert!(run.app.tab().code.has_focus(&run.ctx));
+    }
+
+    /// The e2e window is 480×320. The cheatsheet has to fit that.
+    #[test]
+    fn the_syntax_cheatsheet_fits_the_e2e_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "hello\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        let size = egui::vec2(480.0, 320.0);
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.frame_sized(vec![shortcut(egui::Key::Slash, shift)], size);
+        assert!(run.app.show_syntax);
+        for _ in 0..4 {
+            run.frame_sized(vec![], size);
+        }
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        for label in [
+            "Markdown syntax",
+            "Syntax",
+            "Rendered",
+            "Esc or Ctrl+Shift+/ closes. Click a row to insert it.",
+        ] {
+            let rect = run
+                .text_rect(label)
+                .unwrap_or_else(|| panic!("{label} isn't on screen"));
+            assert!(
+                screen.contains_rect(rect),
+                "{label} {rect:?} falls outside {screen:?}"
+            );
+        }
     }
 
     /// Folder search reads `pin_search_result`. Rebinding it changes the

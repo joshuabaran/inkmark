@@ -1,6 +1,7 @@
 //! CodeView, LiveView, the file browser, reveal rules, smart edit rules, hit-test, scroll sync.
 
 mod browser;
+mod cheatsheet;
 mod code_view;
 mod commands;
 mod folds;
@@ -17,6 +18,7 @@ mod tables;
 pub mod theme;
 
 pub use browser::{BrowserOutput, FileBrowser, OpenFile};
+pub use cheatsheet::{Cheatsheet, Sample, samples};
 pub use images::ImageCache;
 
 /// A click that follows a link. Ctrl+click opens the preview tab.
