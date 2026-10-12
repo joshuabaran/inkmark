@@ -1,9 +1,10 @@
 //! Images for the live view, decoded off the UI thread and kept as textures.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::SystemTime;
 
 use egui::{ColorImage, TextureHandle, TextureOptions, Vec2, vec2};
 
@@ -12,6 +13,9 @@ use egui::{ColorImage, TextureHandle, TextureOptions, Vec2, vec2};
 const MAX_DIMENSION: u32 = 4096;
 /// Files bigger than this aren't decoded.
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Decoded textures kept at once. One 4096² image is 64 MiB, so this holds
+/// two of those and then the least recently shown one is dropped.
+const TEXTURE_BUDGET: usize = 128 * 1024 * 1024;
 
 /// What the live view can show for an image right now.
 #[derive(Clone)]
@@ -32,71 +36,455 @@ enum State {
     Failed(String),
 }
 
-pub(crate) struct ImageCache {
-    states: Arc<Mutex<HashMap<PathBuf, State>>>,
-    jobs: Sender<PathBuf>,
+/// Modification time and length. A missing file has neither, so creating it
+/// is a different stamp and the failure is decoded again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+impl Stamp {
+    fn missing() -> Self {
+        Self {
+            modified: None,
+            len: 0,
+        }
+    }
+}
+
+struct Job {
+    path: PathBuf,
+    stamp: Stamp,
+}
+
+struct Entry {
+    stamp: Stamp,
+    state: State,
+    bytes: usize,
+    /// Tabs that have asked for this image and not been closed or reloaded.
+    users: HashSet<u64>,
+    /// Bumped on each request. Eviction drops the smallest first.
+    used: u64,
+}
+
+struct Inner {
+    map: HashMap<PathBuf, Entry>,
+    bytes: usize,
+    clock: u64,
+    budget: usize,
+}
+
+struct Shared {
+    inner: Mutex<Inner>,
+    queue: Mutex<VecDeque<Job>>,
+    cv: Condvar,
+    /// Tab whose images are decoded before the others.
+    active: AtomicU64,
+    paused: AtomicBool,
+    closed: AtomicBool,
+    /// `ImageCache` clones. The worker does not count, so the last clone
+    /// can stop it.
+    owners: AtomicUsize,
+}
+
+/// One decoder and one texture map. Clone it into every live view so an
+/// image used by two documents is decoded once. The key is the canonical
+/// path plus the file's stamp, so a renamed link is not decoded twice and
+/// a replaced file is decoded again. Closing a tab drops images nobody
+/// else is showing. Past the byte budget, the least recently shown image
+/// that is not on screen is dropped. The tab on screen is decoded first.
+pub struct ImageCache {
+    shared: Arc<Shared>,
+}
+
+impl Clone for ImageCache {
+    fn clone(&self) -> Self {
+        self.shared.owners.fetch_add(1, Ordering::Relaxed);
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl Drop for ImageCache {
+    fn drop(&mut self) {
+        if self.shared.owners.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.shared.closed.store(true, Ordering::Release);
+            self.shared.cv.notify_all();
+        }
+    }
 }
 
 impl ImageCache {
     pub fn new(ctx: &egui::Context) -> Self {
-        let states: Arc<Mutex<HashMap<PathBuf, State>>> = Arc::default();
-        let (jobs, rx) = mpsc::channel::<PathBuf>();
-        let worker_states = Arc::clone(&states);
+        let shared = Arc::new(Shared {
+            inner: Mutex::new(Inner {
+                map: HashMap::new(),
+                bytes: 0,
+                clock: 0,
+                budget: TEXTURE_BUDGET,
+            }),
+            queue: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            active: AtomicU64::new(0),
+            paused: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            owners: AtomicUsize::new(1),
+        });
+        let worker = Arc::clone(&shared);
         let ctx = ctx.clone();
         std::thread::Builder::new()
             .name("inkmark-images".into())
-            .spawn(move || {
-                while let Ok(path) = rx.recv() {
-                    let max_side = ctx.input(|i| i.max_texture_side) as u32;
-                    // A decoder bug on a bad file must not take the thread down.
-                    let decoded =
-                        std::panic::catch_unwind(|| decode(&path, MAX_DIMENSION.min(max_side)))
-                            .unwrap_or_else(|_| {
-                                Err("the image decoder crashed on this file".into())
-                            });
-                    let state = match decoded {
-                        Ok(image) => {
-                            let size = vec2(image.width() as f32, image.height() as f32);
-                            let name = path.display().to_string();
-                            State::Ready(
-                                ctx.load_texture(name, image, TextureOptions::LINEAR),
-                                size,
-                            )
-                        }
-                        Err(e) => State::Failed(e),
-                    };
-                    worker_states
-                        .lock()
-                        .expect("image cache poisoned")
-                        .insert(path, state);
-                    ctx.request_repaint();
-                }
-            })
+            .spawn(move || serve(worker, ctx))
             .expect("spawn image thread");
-        Self { states, jobs }
+        Self { shared }
+    }
+
+    /// The tab on screen. Its queued images move ahead of the others.
+    pub fn set_active(&self, user: u64) {
+        if self.shared.active.swap(user, Ordering::AcqRel) == user {
+            return;
+        }
+        let wanted: HashSet<PathBuf> = {
+            let inner = self.shared.inner.lock().expect("image cache poisoned");
+            inner
+                .map
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.users.contains(&user) && matches!(entry.state, State::Loading)
+                })
+                .map(|(path, _)| path.clone())
+                .collect()
+        };
+        let mut queue = self.shared.queue.lock().expect("image queue poisoned");
+        let mut jobs: Vec<Job> = queue.drain(..).collect();
+        // Stable: the active tab's jobs stay in their own order, in front.
+        jobs.sort_by_key(|job| usize::from(!wanted.contains(&job.path)));
+        *queue = jobs.into();
+        self.shared.cv.notify_all();
+    }
+
+    /// The tab closed, or its document was replaced. Images nobody else is
+    /// showing are dropped, and their queued decodes are not started.
+    pub fn release_user(&self, user: u64) {
+        let mut drop_paths = Vec::new();
+        {
+            let mut inner = self.shared.inner.lock().expect("image cache poisoned");
+            let mut dropped = 0;
+            inner.map.retain(|path, entry| {
+                entry.users.remove(&user);
+                if entry.users.is_empty() {
+                    dropped += entry.bytes;
+                    drop_paths.push(path.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            inner.bytes = inner.bytes.saturating_sub(dropped);
+        }
+        if drop_paths.is_empty() {
+            return;
+        }
+        let mut queue = self.shared.queue.lock().expect("image queue poisoned");
+        queue.retain(|job| !drop_paths.iter().any(|path| path == &job.path));
     }
 
     /// The image at `dest` (as written in the Markdown), relative to `base`
-    /// (the document's folder). The first request starts loading it.
-    pub fn get(&self, dest: &str, base: Option<&Path>) -> ImageSlot {
+    /// (the document's folder). The first request starts loading it. `user`
+    /// is the tab, so closing that tab can drop the image.
+    pub(crate) fn get(&self, dest: &str, base: Option<&Path>, user: u64) -> ImageSlot {
         let Some(path) = resolve(dest, base) else {
             return ImageSlot::Remote;
         };
-        let mut states = self.states.lock().expect("image cache poisoned");
-        match states.get(&path) {
-            Some(State::Loading) => ImageSlot::Loading,
-            Some(State::Ready(texture, size)) => ImageSlot::Ready {
-                texture: texture.clone(),
-                size: *size,
-            },
-            Some(State::Failed(e)) => ImageSlot::Failed(e.clone()),
-            None => {
-                states.insert(path.clone(), State::Loading);
-                let _ = self.jobs.send(path);
-                ImageSlot::Loading
+        let (path, stamp) = identify(path);
+        let promote = {
+            let mut inner = self.shared.inner.lock().expect("image cache poisoned");
+            let active = self.shared.active.load(Ordering::Acquire) == user;
+            inner.clock = inner.clock.wrapping_add(1);
+            let used = inner.clock;
+            if let Some(entry) = inner.map.get_mut(&path)
+                && entry.stamp == stamp
+            {
+                entry.used = used;
+                entry.users.insert(user);
+                matches!(entry.state, State::Loading) && active
+            } else {
+                if let Some(old) = inner.map.remove(&path) {
+                    inner.bytes = inner.bytes.saturating_sub(old.bytes);
+                }
+                inner.map.insert(
+                    path.clone(),
+                    Entry {
+                        stamp,
+                        state: State::Loading,
+                        bytes: 0,
+                        users: HashSet::from([user]),
+                        used,
+                    },
+                );
+                drop(inner);
+                self.enqueue(Job { path, stamp }, user);
+                return ImageSlot::Loading;
             }
+        };
+        if promote {
+            self.promote(&path);
+        }
+        // The slot was built while the lock was held. Re-read it: the
+        // branch above returns early for a miss, so this is a hit.
+        let inner = self.shared.inner.lock().expect("image cache poisoned");
+        inner
+            .map
+            .get(&path)
+            .map(slot_of)
+            .unwrap_or(ImageSlot::Loading)
+    }
+
+    fn enqueue(&self, job: Job, user: u64) {
+        let active = self.shared.active.load(Ordering::Acquire) == user;
+        let mut queue = self.shared.queue.lock().expect("image queue poisoned");
+        if let Some(existing) = queue.iter().position(|queued| queued.path == job.path) {
+            if active {
+                let job = queue.remove(existing).expect("position just found");
+                queue.push_front(job);
+            }
+        } else if active {
+            queue.push_front(job);
+        } else {
+            queue.push_back(job);
+        }
+        self.shared.cv.notify_one();
+    }
+
+    fn promote(&self, path: &Path) {
+        let mut queue = self.shared.queue.lock().expect("image queue poisoned");
+        if let Some(index) = queue.iter().position(|job| job.path == path) {
+            let job = queue.remove(index).expect("position just found");
+            queue.push_front(job);
         }
     }
+
+    #[cfg(test)]
+    fn stored(&self) -> usize {
+        self.shared
+            .inner
+            .lock()
+            .expect("image cache poisoned")
+            .map
+            .len()
+    }
+
+    #[cfg(test)]
+    fn set_budget(&self, budget: usize) {
+        self.shared
+            .inner
+            .lock()
+            .expect("image cache poisoned")
+            .budget = budget;
+    }
+
+    #[cfg(test)]
+    fn resident_bytes(&self) -> usize {
+        self.shared
+            .inner
+            .lock()
+            .expect("image cache poisoned")
+            .bytes
+    }
+
+    #[cfg(test)]
+    fn pause(&self, paused: bool) {
+        self.shared.paused.store(paused, Ordering::Release);
+        self.shared.cv.notify_all();
+    }
+
+    #[cfg(test)]
+    fn queued(&self) -> Vec<PathBuf> {
+        self.shared
+            .queue
+            .lock()
+            .expect("image queue poisoned")
+            .iter()
+            .map(|job| job.path.clone())
+            .collect()
+    }
+}
+
+fn slot_of(entry: &Entry) -> ImageSlot {
+    match &entry.state {
+        State::Loading => ImageSlot::Loading,
+        State::Ready(texture, size) => ImageSlot::Ready {
+            texture: texture.clone(),
+            size: *size,
+        },
+        State::Failed(e) => ImageSlot::Failed(e.clone()),
+    }
+}
+
+fn serve(shared: Arc<Shared>, ctx: egui::Context) {
+    while let Some(job) = next_job(&shared) {
+        if !still_wanted(&shared, &job) {
+            continue;
+        }
+        let max_side = ctx.input(|i| i.max_texture_side) as u32;
+        // A decoder bug on a bad file must not take the thread down.
+        let decoded = std::panic::catch_unwind(|| decode(&job.path, MAX_DIMENSION.min(max_side)))
+            .unwrap_or_else(|_| Err("the image decoder crashed on this file".into()));
+        if !still_wanted(&shared, &job) {
+            continue;
+        }
+        let built = match decoded {
+            Ok(image) => {
+                let bytes = image.width() * image.height() * 4;
+                let size = vec2(image.width() as f32, image.height() as f32);
+                let name = job.path.display().to_string();
+                let texture = ctx.load_texture(name, image, TextureOptions::LINEAR);
+                Ok((texture, size, bytes))
+            }
+            Err(e) => Err(e),
+        };
+        let wake = publish(&shared, &job, built);
+        if wake {
+            ctx.request_repaint();
+        }
+    }
+}
+
+/// The next job whose tab is still waiting, or `None` when the cache is gone.
+fn next_job(shared: &Shared) -> Option<Job> {
+    let mut queue = shared.queue.lock().expect("image queue poisoned");
+    loop {
+        if shared.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        if shared.paused.load(Ordering::Acquire) {
+            let (guard, _) = shared
+                .cv
+                .wait_timeout(queue, std::time::Duration::from_millis(2))
+                .expect("image queue poisoned");
+            queue = guard;
+            continue;
+        }
+        if let Some(job) = queue.pop_front() {
+            return Some(job);
+        }
+        if shared.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        queue = shared.cv.wait(queue).expect("image queue poisoned");
+    }
+}
+
+fn still_wanted(shared: &Shared, job: &Job) -> bool {
+    let inner = shared.inner.lock().expect("image cache poisoned");
+    matches!(
+        inner.map.get(&job.path),
+        Some(entry) if entry.stamp == job.stamp && matches!(entry.state, State::Loading)
+    )
+}
+
+/// Stores a finished decode. Returns whether the tab on screen is waiting
+/// for it. A hidden tab's completion does not ask for a frame, and neither
+/// does a job whose tab closed while it was decoding.
+fn publish(
+    shared: &Shared,
+    job: &Job,
+    built: Result<(TextureHandle, Vec2, usize), String>,
+) -> bool {
+    let mut inner = shared.inner.lock().expect("image cache poisoned");
+    let Some(entry) = inner.map.get_mut(&job.path) else {
+        return false;
+    };
+    if entry.stamp != job.stamp || !matches!(entry.state, State::Loading) {
+        return false;
+    }
+    let active = shared.active.load(Ordering::Acquire);
+    let wake = entry.users.contains(&active);
+    let (bytes, ready) = match built {
+        Ok((texture, size, bytes)) => {
+            entry.state = State::Ready(texture, size);
+            entry.bytes = bytes;
+            (bytes, true)
+        }
+        Err(error) => {
+            let bytes = error.len();
+            entry.bytes = bytes;
+            entry.state = State::Failed(error);
+            (bytes, false)
+        }
+    };
+    inner.bytes += bytes;
+    if ready {
+        evict(&mut inner, &job.path, active);
+    }
+    wake
+}
+
+/// Drops the least recently shown images until `budget`. The image just
+/// decoded stays, and so does anything still loading. An image the tab on
+/// screen is using is dropped only after the hidden ones.
+fn evict(inner: &mut Inner, protect: &Path, active: u64) {
+    while inner.bytes > inner.budget {
+        let victim = inner
+            .map
+            .iter()
+            .filter(|(path, entry)| *path != protect && !matches!(entry.state, State::Loading))
+            .min_by_key(|(_, entry)| (u8::from(entry.users.contains(&active)), entry.used))
+            .map(|(path, _)| path.clone());
+        let Some(path) = victim else {
+            break;
+        };
+        if let Some(entry) = inner.map.remove(&path) {
+            inner.bytes = inner.bytes.saturating_sub(entry.bytes);
+        }
+    }
+}
+
+/// Canonical path when the file exists, so two links to one file share an
+/// entry. Otherwise a lexical absolute path, with `.` and `..` collapsed.
+fn identify(path: PathBuf) -> (PathBuf, Stamp) {
+    match std::fs::canonicalize(&path) {
+        Ok(canon) => {
+            let stamp = stamp_of(&canon);
+            (canon, stamp)
+        }
+        Err(_) => {
+            let path = lexical_normal(&path);
+            let stamp = stamp_of(&path);
+            (path, stamp)
+        }
+    }
+}
+
+fn stamp_of(path: &Path) -> Stamp {
+    match std::fs::metadata(path) {
+        Ok(meta) => Stamp {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+        },
+        Err(_) => Stamp::missing(),
+    }
+}
+
+fn lexical_normal(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // `/..` stays at the root. A relative path may still climb.
+                Some(Component::RootDir) => {}
+                _ => out.push(component),
+            },
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// A local path for `dest`, or `None` for remote URLs.
@@ -259,12 +647,31 @@ mod tests {
     fn wait_for(cache: &ImageCache, dest: &str, base: &Path) -> ImageSlot {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let slot = cache.get(dest, Some(base));
+            let slot = cache.get(dest, Some(base), 1);
             if !matches!(slot, ImageSlot::Loading) || Instant::now() > deadline {
                 return slot;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn a_clone_is_the_same_cache() {
+        let ctx = egui::Context::default();
+        let cache = ImageCache::new(&ctx);
+        let other = cache.clone();
+        assert!(matches!(
+            cache.get("note.png", Some(Path::new("/notes")), 1),
+            ImageSlot::Loading
+        ));
+        assert_eq!(other.stored(), 1);
+        // The worker may already have failed the missing file. Either way
+        // the second view must not insert its own entry.
+        assert!(matches!(
+            other.get("note.png", Some(Path::new("/notes")), 1),
+            ImageSlot::Loading | ImageSlot::Failed(_)
+        ));
+        assert_eq!(cache.stored(), 1);
     }
 
     #[test]
@@ -300,7 +707,7 @@ mod tests {
             ImageSlot::Failed(_)
         ));
         assert!(matches!(
-            cache.get("https://x/y.png", Some(dir.path())),
+            cache.get("https://x/y.png", Some(dir.path()), 1),
             ImageSlot::Remote
         ));
     }
@@ -366,5 +773,124 @@ mod tests {
         std::fs::write(&path, gz.finish().unwrap()).unwrap();
         let image = decode(&path, 4096).unwrap();
         assert_eq!(image.pixels[0], egui::Color32::from_rgb(0, 0, 255));
+    }
+
+    fn save_png(path: &Path, w: u32, h: u32) {
+        image::RgbaImage::from_pixel(w, h, image::Rgba([255, 0, 0, 255]))
+            .save(path)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_link_to_the_same_file_is_not_decoded_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.png");
+        save_png(&real, 4, 4);
+        std::os::unix::fs::symlink("real.png", dir.path().join("alias.png")).unwrap();
+        let ctx = egui::Context::default();
+        let cache = ImageCache::new(&ctx);
+        cache.pause(true);
+        cache.set_active(1);
+        assert!(matches!(
+            cache.get("real.png", Some(dir.path()), 1),
+            ImageSlot::Loading
+        ));
+        assert!(matches!(
+            cache.get("alias.png", Some(dir.path()), 1),
+            ImageSlot::Loading
+        ));
+        assert_eq!(cache.stored(), 1);
+        assert_eq!(cache.queued().len(), 1);
+    }
+
+    #[test]
+    fn a_replaced_file_and_a_file_that_appears_are_decoded_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pic.png");
+        save_png(&path, 40, 20);
+        let ctx = egui::Context::default();
+        let cache = ImageCache::new(&ctx);
+        cache.set_active(1);
+        match wait_for(&cache, "pic.png", dir.path()) {
+            ImageSlot::Ready { size, .. } => assert_eq!(size, vec2(40.0, 20.0)),
+            _ => panic!("pic.png didn't load"),
+        }
+        save_png(&path, 8, 8);
+        match wait_for(&cache, "pic.png", dir.path()) {
+            ImageSlot::Ready { size, .. } => assert_eq!(size, vec2(8.0, 8.0)),
+            _ => panic!("the replaced file kept the old image"),
+        }
+
+        assert!(matches!(
+            wait_for(&cache, "later.png", dir.path()),
+            ImageSlot::Failed(_)
+        ));
+        save_png(&dir.path().join("later.png"), 4, 4);
+        match wait_for(&cache, "later.png", dir.path()) {
+            ImageSlot::Ready { size, .. } => assert_eq!(size, vec2(4.0, 4.0)),
+            _ => panic!("a file that appeared stayed failed"),
+        }
+    }
+
+    #[test]
+    fn closing_a_tab_drops_its_image_and_a_full_cache_drops_the_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        save_png(&dir.path().join("a.png"), 40, 20);
+        save_png(&dir.path().join("b.png"), 40, 20);
+        let ctx = egui::Context::default();
+        let cache = ImageCache::new(&ctx);
+        cache.set_active(1);
+        // 40×20 is 3200 bytes. Two of them do not fit.
+        cache.set_budget(4000);
+        assert!(matches!(
+            wait_for(&cache, "a.png", dir.path()),
+            ImageSlot::Ready { .. }
+        ));
+        cache.release_user(1);
+        assert_eq!(cache.stored(), 0, "closing the tab kept the texture");
+
+        cache.set_active(1);
+        assert!(matches!(
+            wait_for(&cache, "a.png", dir.path()),
+            ImageSlot::Ready { .. }
+        ));
+        assert!(matches!(
+            wait_for(&cache, "b.png", dir.path()),
+            ImageSlot::Ready { .. }
+        ));
+        assert_eq!(cache.stored(), 1, "the budget kept both textures");
+        assert!(cache.resident_bytes() <= 4000);
+        assert!(matches!(
+            cache.get("b.png", Some(dir.path()), 1),
+            ImageSlot::Ready { .. }
+        ));
+        assert!(
+            !matches!(
+                cache.get("a.png", Some(dir.path()), 1),
+                ImageSlot::Ready { .. }
+            ),
+            "the image on screen was the one dropped"
+        );
+    }
+
+    #[test]
+    fn a_hidden_tab_does_not_stay_ahead_of_the_tab_on_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let cache = ImageCache::new(&ctx);
+        cache.pause(true);
+        cache.set_active(1);
+        cache.get("a.png", Some(dir.path()), 1);
+        cache.get("b.png", Some(dir.path()), 1);
+        cache.set_active(2);
+        cache.get("c.png", Some(dir.path()), 2);
+        let queued = cache.queued();
+        assert_eq!(queued.len(), 3);
+        assert!(queued[0].ends_with("c.png"), "the tab on screen waited");
+        cache.release_user(1);
+        let queued = cache.queued();
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].ends_with("c.png"));
+        assert_eq!(cache.stored(), 1);
     }
 }

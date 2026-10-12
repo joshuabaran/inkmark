@@ -92,6 +92,23 @@ struct CachedLine {
     key: LineKey,
     line: BufferLine,
     last_used: u64,
+    /// Both copies of the source plus the shaped glyphs.
+    bytes: usize,
+}
+
+/// Bytes a cached line is estimated to hold. `BufferLine` keeps its own
+/// copy of the source, and the shape cache holds another glyph array that
+/// this crate cannot see, so the laid-out glyphs are counted twice.
+fn account(key: &LineKey, line: &BufferLine, line_height_px: f32) -> usize {
+    let mut bytes = key.text.len()
+        + line.text().len()
+        + key.runs.capacity() * std::mem::size_of::<(Range<usize>, FontStyle)>();
+    let glyph = std::mem::size_of::<cosmic_text::LayoutGlyph>() * 2;
+    for run in line.layout_runs(None, line_height_px) {
+        bytes += std::mem::size_of::<cosmic_text::LayoutLine>();
+        bytes += run.glyphs.len() * glyph;
+    }
+    bytes
 }
 
 /// The font database and glyph atlas, shared by every pane's renderer.
@@ -202,6 +219,9 @@ pub struct TextRenderer {
     /// Average advance of typical text, for height estimates.
     avg_advance_px: f32,
     lines: HashMap<u64, CachedLine>,
+    /// Running total of [`CachedLine::bytes`]. Trim reads this instead of
+    /// walking every pane's lines on every frame.
+    cached_bytes: usize,
     frame: u64,
     /// `Fonts::generation` the cached lines were shaped with.
     font_generation: u64,
@@ -242,6 +262,7 @@ impl TextRenderer {
             line_height_px: 0.0,
             avg_advance_px: 0.0,
             lines: HashMap::new(),
+            cached_bytes: 0,
             frame: 0,
             font_generation: 0,
         }
@@ -266,7 +287,10 @@ impl TextRenderer {
         self.config = Some(config);
         self.pixels_per_point = pixels_per_point;
         self.line_height_px = (config.line_height * pixels_per_point).round().max(1.0);
-        self.lines.clear();
+        // Drop the table, not only its entries, so a font change does not
+        // keep the buckets from thousands of old lines.
+        self.lines = HashMap::new();
+        self.cached_bytes = 0;
         self.avg_advance_px = self.measure_avg_advance();
         true
     }
@@ -547,16 +571,23 @@ impl TextRenderer {
                 true,
                 mono_width,
             );
+            let key = LineKey {
+                text: line.text.to_owned(),
+                runs: line.runs.to_vec(),
+                wrap_width: line.wrap_width.map(f32::to_bits),
+            };
+            let bytes = account(&key, &buffer_line, self.line_height_px);
+            if let Some(old) = self.lines.remove(&hash) {
+                self.cached_bytes = self.cached_bytes.saturating_sub(old.bytes);
+            }
+            self.cached_bytes += bytes;
             self.lines.insert(
                 hash,
                 CachedLine {
-                    key: LineKey {
-                        text: line.text.to_owned(),
-                        runs: line.runs.to_vec(),
-                        wrap_width: line.wrap_width.map(f32::to_bits),
-                    },
+                    key,
                     line: buffer_line,
                     last_used: frame,
+                    bytes,
                 },
             );
         }
@@ -655,7 +686,17 @@ impl TextRenderer {
         );
         if self.lines.len() > LINE_CACHE_CAPACITY {
             let frame = self.frame;
-            self.lines.retain(|_, l| l.last_used == frame);
+            let mut kept = 0;
+            self.lines.retain(|_, line| {
+                if line.last_used == frame {
+                    kept += line.bytes;
+                    true
+                } else {
+                    false
+                }
+            });
+            self.cached_bytes = kept;
+            self.lines.shrink_to_fit();
         }
     }
 
@@ -665,6 +706,21 @@ impl TextRenderer {
 
     pub fn cached_lines(&self) -> usize {
         self.lines.len()
+    }
+
+    /// Drops shaped lines and the table that held them. The next paint lays
+    /// out what is on screen again. Heights and the scroll anchor live with
+    /// the view, not here.
+    pub fn release_line_cache(&mut self) {
+        self.lines = HashMap::new();
+        self.cached_bytes = 0;
+    }
+
+    /// Estimated bytes held by the shaped-line cache: both copies of the
+    /// source and the shaped glyphs. A trim compares this, and it does not
+    /// walk the lines.
+    pub fn cached_line_bytes(&self) -> usize {
+        self.cached_bytes
     }
 }
 

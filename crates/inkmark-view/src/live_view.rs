@@ -285,6 +285,8 @@ pub struct LiveView {
     checkboxes: Vec<(Rect, usize, bool)>,
     /// Created on the first frame, when an egui context is at hand.
     images: Option<ImageCache>,
+    /// Tab that owns the images this view has asked for.
+    image_user: u64,
     /// Formula drawings for the live pane. The document bytes are not rewritten.
     math: crate::math::MathCache,
     /// Context of the frame being drawn, so a formula texture can be uploaded.
@@ -325,6 +327,7 @@ impl LiveView {
             remeasure: Vec::new(),
             checkboxes: Vec::new(),
             images: None,
+            image_user: 0,
             math: crate::math::MathCache::default(),
             ctx: None,
             font_size: 16.0,
@@ -394,6 +397,23 @@ impl LiveView {
     pub fn mirror_selection(&mut self, selection: Selection) {
         self.selection = selection;
         self.selection_current = true;
+    }
+
+    /// Uses `cache` instead of starting another decoder thread. `user` is
+    /// this tab, so closing it can drop images nobody else is showing.
+    pub fn share_images(&mut self, cache: ImageCache, user: u64) {
+        self.images = Some(cache);
+        self.image_user = user;
+    }
+
+    /// Drops shaped lines. The scroll anchor and measured heights stay.
+    pub fn release_line_cache(&mut self) {
+        self.text.release_line_cache();
+    }
+
+    /// Estimated bytes in the shaped-line cache.
+    pub fn cached_line_bytes(&self) -> usize {
+        self.text.cached_line_bytes()
     }
 
     pub fn reset(&mut self) {
@@ -1292,7 +1312,7 @@ impl LiveView {
         if has_image && let Some(cache) = &self.images {
             let base = doc.path().and_then(|p| p.parent());
             for image in inline_images(&doc.slice(range.clone()), link_defs) {
-                let slot = cache.get(&image.dest, base);
+                let slot = cache.get(&image.dest, base, self.image_user);
                 let size = match &slot {
                     ImageSlot::Ready { size, .. } if size.x > wrap => *size * (wrap / size.x),
                     ImageSlot::Ready { size, .. } => *size,
