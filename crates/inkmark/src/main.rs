@@ -3404,19 +3404,13 @@ impl App {
             let root = self.browser.root().to_path_buf();
             let show_all = self.browser.show_all();
             let modal = self.modal_open();
-            let search_open = self.search.is_open();
-            let pin_chords = if search_open {
-                self.keys.chords(Action::PinSearchResult).to_vec()
-            } else {
-                Vec::new()
-            };
+            // The bar reads the live table. Clone so the sidebar can borrow
+            // `search` mutably while it still has the chords.
+            let search_keys = self.search.is_open().then(|| self.keys.clone());
             let (hit, closed) = ui
                 .scope_builder(UiBuilder::new().max_rect(left), |ui| {
-                    let bar = if search_open {
-                        Some(
-                            self.search
-                                .show_bar(ui, &root, show_all, modal, &pin_chords),
-                        )
+                    let bar = if let Some(keys) = &search_keys {
+                        Some(self.search.show_bar(ui, &root, show_all, modal, keys))
                     } else {
                         None
                     };
@@ -8206,6 +8200,92 @@ mod tests {
         );
         assert!(run.text_rect("Ctrl+P").is_some());
         assert!(run.text_rect("Toggle the line's task checkbox").is_none());
+    }
+
+    /// Enter opens an unpinned preview. Binding that key, or Escape, to
+    /// `pin_search_result` runs the binding. The hardcoded key must not
+    /// take the event first.
+    #[test]
+    fn search_bindings_on_enter_and_escape_are_not_shadowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = dir.path().join("alpha.md");
+        let beta = dir.path().join("beta.md");
+        let gamma = dir.path().join("gamma.md");
+        fs::write(&alpha, "hello\n").unwrap();
+        fs::write(&beta, "beta token\n").unwrap();
+        fs::write(&gamma, "gamma token\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(alpha));
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("beta".into())]);
+        run.wait_search();
+        run.key(egui::Key::Enter, egui::Modifiers::NONE);
+        run.settle();
+        assert_eq!(run.app.tab().doc.path(), Some(beta.as_path()));
+        assert!(run.app.tab().preview);
+        assert!(run.app.search.is_open());
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!run.app.search.is_open());
+        assert_eq!(run.app.tab().doc.path(), Some(beta.as_path()));
+
+        let applied = keys::KeyMap::apply(&[("pin_search_result".into(), vec!["Enter".into()])]);
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        run.app.keys = applied.map;
+        run.app.install_keys();
+        assert_eq!(run.app.keys.shortcut_text(Action::PinSearchResult), "Enter");
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("gamma".into())]);
+        run.wait_search();
+        assert!(run.text_rect("gamma.md").is_some());
+        run.key(egui::Key::Enter, egui::Modifiers::NONE);
+        run.settle();
+        assert_eq!(run.app.tab().doc.path(), Some(gamma.as_path()));
+        assert!(
+            !run.app.tab().preview,
+            "Enter is the pin chord, so the hit is not a preview"
+        );
+        assert!(run.app.search.is_open());
+
+        run.key(egui::Key::F1, egui::Modifiers::NONE);
+        for _ in 0..3 {
+            if run.text_rect("Filter by name or key").is_some() {
+                break;
+            }
+            run.frame(vec![]);
+        }
+        run.frame(vec![egui::Event::Text("pinned tab".into())]);
+        assert!(
+            run.text_rect("Open the selected folder-search result in a pinned tab")
+                .is_some()
+        );
+        assert!(run.text_rect("Enter").is_some());
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!run.app.show_keys);
+
+        let applied = keys::KeyMap::apply(&[("pin_search_result".into(), vec!["Escape".into()])]);
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        run.app.keys = applied.map;
+        run.app.install_keys();
+        assert_eq!(
+            run.app.keys.shortcut_text(Action::PinSearchResult),
+            "Escape"
+        );
+        run.key(egui::Key::F, shift);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text("beta".into())]);
+        run.wait_search();
+        assert!(run.text_rect("beta.md").is_some());
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        run.settle();
+        assert!(
+            run.app.search.is_open(),
+            "Escape is the pin chord, so it does not close the bar"
+        );
+        assert_eq!(run.app.tab().doc.path(), Some(beta.as_path()));
+        assert!(!run.app.tab().preview);
     }
 
     #[test]

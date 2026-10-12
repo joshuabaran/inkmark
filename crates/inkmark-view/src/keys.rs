@@ -892,12 +892,13 @@ impl KeyMap {
 
     /// Applies `[keys]` entries `(action id, chord texts)`. An empty list
     /// unbinds. An unknown action, a chord that doesn't parse, or an entry
-    /// that would share a chord with another action is reported and that
-    /// action keeps its default. A swap (each action taking the other's
-    /// chord) is not a conflict. If rejecting one entry makes another
-    /// entry collide with the default that snapped back, that one is
-    /// rejected too: otherwise the snapped-back default and the entry
-    /// would share the chord.
+    /// that would share a chord with another action in a conflicting scope
+    /// is reported and that action keeps its default. A swap (each action
+    /// taking the other's chord) is not a conflict. Sharing a chord with a
+    /// scope that may overlap (search with the editor or a table command)
+    /// is not a conflict either, even when some other pair on that chord
+    /// does conflict. If rejecting one entry makes another entry collide
+    /// with the default that snapped back, that one is rejected too.
     pub fn apply(entries: &[(String, Vec<String>)]) -> Applied {
         let mut errors = Vec::new();
         let mut accepted: Vec<(Action, Vec<Chord>)> = Vec::new();
@@ -949,22 +950,36 @@ impl KeyMap {
             let before = accepted.len();
             let mut kept = Vec::new();
             for (action, chords) in accepted.drain(..) {
-                let clash = chords
-                    .iter()
-                    .find_map(|chord| clashes.iter().find(|(clashing, _)| clashing == chord));
-                let Some((chord, owners)) = clash else {
+                // A chord can be in `clashes` because two other actions
+                // conflict. This entry is rejected only when it is one of
+                // those owners. `pin_search_result = "Ctrl+B"` stays even
+                // if `insert_table = "Ctrl+B"` loses to bold.
+                let clash = chords.iter().find_map(|chord| {
+                    let (_, owners) = clashes.iter().find(|(have, _)| have == chord)?;
+                    if !owners.contains(&action) {
+                        return None;
+                    }
+                    let others: Vec<&str> = owners
+                        .iter()
+                        .filter(|owner| {
+                            **owner != action && scopes_conflict(action.scope(), owner.scope())
+                        })
+                        .map(|owner| owner.id())
+                        .collect();
+                    if others.is_empty() {
+                        None
+                    } else {
+                        Some((chord.display(), others))
+                    }
+                });
+                let Some((shown, others)) = clash else {
                     kept.push((action, chords));
                     continue;
                 };
-                let others: Vec<&str> = owners
-                    .iter()
-                    .filter(|owner| **owner != action)
-                    .map(|owner| owner.id())
-                    .collect();
                 errors.push(format!(
                     "keys.{} shares {} with {} (keeping the default)",
                     action.id(),
-                    chord.display(),
+                    shown,
                     others.join(" and ")
                 ));
             }
@@ -986,6 +1001,11 @@ impl KeyMap {
         }
     }
 
+    /// Chords where at least two owners cannot share them.
+    ///
+    /// Each owner list is only the actions that conflict with another
+    /// owner of that chord. Search may sit on the same chord and is left
+    /// out, so a conflict between the other pair does not pull it in.
     fn clashes(&self) -> Vec<(Chord, Vec<Action>)> {
         let mut found: Vec<(Chord, Vec<Action>)> = Vec::new();
         for row in &self.rows {
@@ -997,12 +1017,19 @@ impl KeyMap {
                 }
             }
         }
-        found.retain(|(_, owners)| {
-            owners.iter().any(|left| {
-                owners
-                    .iter()
-                    .any(|right| *left != *right && scopes_conflict(left.scope(), right.scope()))
-            })
+        found.retain_mut(|(_, owners)| {
+            let party: Vec<Action> = owners
+                .iter()
+                .copied()
+                .filter(|left| {
+                    owners.iter().any(|right| {
+                        *left != *right && scopes_conflict(left.scope(), right.scope())
+                    })
+                })
+                .collect();
+            let clash = !party.is_empty();
+            *owners = party;
+            clash
         });
         found
     }
@@ -2221,6 +2248,76 @@ mod tests {
         assert!(text.contains("save"), "{text}");
         assert_eq!(app.map.shortcut_text(Action::PinSearchResult), "Ctrl+Enter");
         assert_eq!(app.map.shortcut_text(Action::Save), "Ctrl+S");
+    }
+
+    #[test]
+    fn enter_and_escape_are_accepted_for_a_search_binding() {
+        for text in ["Enter", "Escape", "Esc"] {
+            let applied = KeyMap::apply(&[entry("pin_search_result", &[text])]);
+            assert!(applied.errors.is_empty(), "{text}: {:?}", applied.errors);
+            let shown = applied.map.shortcut_text(Action::PinSearchResult);
+            assert!(
+                shown == "Enter" || shown == "Escape",
+                "{text} displayed as {shown}"
+            );
+            let key = if shown == "Enter" {
+                Key::Enter
+            } else {
+                Key::Escape
+            };
+            assert_eq!(
+                applied.map.find(key, Modifiers::NONE, Scope::Search),
+                Some(Action::PinSearchResult),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_search_binding_survives_another_pairs_conflict_on_the_same_chord() {
+        // bold owns Ctrl+B. insert_table cannot take it. pin_search_result
+        // can, because search does not run in the editor. Rejecting the
+        // table command must not also reject the search command.
+        let applied = KeyMap::apply(&[
+            entry("pin_search_result", &["Ctrl+B"]),
+            entry("insert_table", &["Ctrl+B"]),
+        ]);
+        let text = applied.errors.join("\n");
+        assert!(text.contains("insert_table"), "{text}");
+        assert!(text.contains("bold"), "{text}");
+        assert!(!text.contains("pin_search_result"), "{text}");
+        assert_eq!(applied.map.shortcut_text(Action::PinSearchResult), "Ctrl+B");
+        assert_eq!(applied.map.shortcut_text(Action::Bold), "Ctrl+B");
+        assert_eq!(applied.map.shortcut_text(Action::InsertTable), "Ctrl+Alt+T");
+        assert_eq!(
+            applied.map.find(Key::B, Modifiers::COMMAND, Scope::Search),
+            Some(Action::PinSearchResult)
+        );
+        assert_eq!(
+            applied.map.find_editing(Key::B, Modifiers::COMMAND),
+            Some(Action::Bold)
+        );
+        assert_eq!(
+            applied.map.find(Key::B, Modifiers::COMMAND, Scope::Table),
+            None
+        );
+
+        // bold is moved onto italic's chord, so it is rejected and snaps
+        // back to Ctrl+B. The second pass then rejects insert_table. The
+        // search binding still shares Ctrl+B with bold and stays.
+        let snapped = KeyMap::apply(&[
+            entry("pin_search_result", &["Ctrl+B"]),
+            entry("insert_table", &["Ctrl+B"]),
+            entry("bold", &["Ctrl+I"]),
+        ]);
+        let text = snapped.errors.join("\n");
+        assert!(text.contains("insert_table"), "{text}");
+        assert!(text.contains("bold"), "{text}");
+        assert!(!text.contains("pin_search_result"), "{text}");
+        assert_eq!(snapped.map.shortcut_text(Action::PinSearchResult), "Ctrl+B");
+        assert_eq!(snapped.map.shortcut_text(Action::Bold), "Ctrl+B");
+        assert_eq!(snapped.map.shortcut_text(Action::Italic), "Ctrl+I");
+        assert_eq!(snapped.map.shortcut_text(Action::InsertTable), "Ctrl+Alt+T");
     }
 
     #[test]
