@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -29,6 +29,8 @@ const HINT_TIME: Duration = Duration::from_secs(4);
 
 /// How often we look for changes made to the file by other programs.
 const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Ctrl+Shift+T remembers this many closed tabs. Older ones are dropped.
+const CLOSED_TABS: usize = 10;
 const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd", "txt"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,6 +50,7 @@ mod os_theme;
 mod outline;
 mod recent;
 mod session;
+mod session_tabs;
 mod tabs;
 
 use findbar::FindState;
@@ -59,9 +62,11 @@ mod sidebar;
 const USAGE: &str = "\
 Usage: inkmark [FILE | FOLDER]
 
-  FILE     open it, browsing its folder (a missing path becomes a new file)
+  FILE     open it beside the restored tabs, browsing its folder
+           (a missing path becomes a new file)
   FOLDER   browse it, with nothing open
-           (no argument: browse the current directory)
+           (no argument: restore the last session's tabs,
+            browsing the current directory)
 
 Options:
   -h, --help     show this help
@@ -341,6 +346,14 @@ impl Tab {
     }
 }
 
+/// A tab Ctrl+Shift+T can open again. The text is not kept: the file is
+/// read from disk, at this caret and scroll. It comes back pinned.
+struct ClosedTab {
+    path: PathBuf,
+    caret: usize,
+    scroll: ScrollPos,
+}
+
 struct App {
     tabs: Vec<Tab>,
     active: usize,
@@ -408,6 +421,17 @@ struct App {
     sidebar: sidebar::Sidebar,
     /// Mode, minimaps, the split, and the outline width, restored on open.
     layout: layout::Layout,
+    /// `$XDG_STATE_HOME/inkmark/tabs`, beside the layout file.
+    session_store: Option<PathBuf>,
+    /// The session file as last written, or as it was when we left it alone.
+    session_saved: String,
+    /// This window's tabs are the session. A folder launch leaves this
+    /// false so browsing does not wipe the tabs saved by the last window.
+    session_adopted: bool,
+    /// A restore is opening tabs. Writes wait until that list is finished.
+    session_quiet: bool,
+    /// Closed tabs, oldest first. Ctrl+Shift+T takes from the back.
+    closed: VecDeque<ClosedTab>,
     /// Drawn outline width where the current drag began.
     outline_drag_from: Option<f32>,
     /// Drawn split position where the current drag began.
@@ -471,6 +495,16 @@ fn clamp_offset(doc: &Document, offset: usize) -> usize {
     }
 }
 
+/// The caret and the scroll of the pane that has the keyboard.
+fn tab_place(tab: &Tab) -> (usize, ScrollPos) {
+    let caret = tab.selection().head;
+    let scroll = match tab.focus {
+        Pane::Code => tab.code.scroll_pos(),
+        Pane::Live => tab.live.scroll_pos(&tab.doc, tab.parse.output()),
+    };
+    (caret, scroll)
+}
+
 fn clamp_scroll(pos: ScrollPos, lines: usize) -> ScrollPos {
     if lines == 0 || pos.line >= lines {
         ScrollPos {
@@ -516,6 +550,11 @@ impl App {
             .and_then(|store| store.parent().map(Path::to_path_buf));
         let sidebar_store = state_dir.as_ref().map(|dir| dir.join("sidebar"));
         let layout_store = state_dir.as_ref().map(|dir| dir.join("layout"));
+        let session_store = state_dir.as_ref().map(|dir| dir.join("tabs"));
+        let session_saved = session_store
+            .as_deref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
         let layout = layout::Layout::load(layout_store);
         let mode = layout.mode;
         let code_minimap = layout.code_minimap;
@@ -574,6 +613,11 @@ impl App {
             browser: FileBrowser::new(root.clone()),
             sidebar: sidebar::Sidebar::load(sidebar_store),
             layout,
+            session_store,
+            session_saved,
+            session_adopted: false,
+            session_quiet: false,
+            closed: VecDeque::new(),
             outline_drag_from: None,
             split_drag_from: None,
             new_file: None,
@@ -597,13 +641,21 @@ impl App {
             #[cfg(test)]
             dialog_hook: None,
         };
-        // A file (including one that doesn't exist yet) browses its parent.
-        // A folder browses that folder with nothing open. No argument browses
-        // the current directory and still offers recent files.
+        // No argument reopens the saved tabs, then offers recent files when
+        // that list was empty. A file opens beside those tabs. A folder
+        // browses that folder with nothing open and leaves the saved tabs
+        // for the next launch that asks for them.
+        let restore = match &launch {
+            Launch::File { .. } => true,
+            Launch::Folder { .. } => path.is_none(),
+        };
+        if restore {
+            app.restore_session();
+        }
         match launch {
             Launch::File { file, .. } => app.open(file),
             Launch::Folder { .. } => {
-                if path.is_none() && !app.recent.entries().is_empty() {
+                if path.is_none() && app.sole_blank_tab() && !app.recent.entries().is_empty() {
                     app.recent_list = Some(0);
                 }
             }
@@ -649,29 +701,40 @@ impl App {
     /// already open is focused, and a pin request pins that tab.
     fn open_tab(&mut self, path: PathBuf, pin: bool) {
         self.pin_edited_preview();
-        if let Some(index) = self.tab_index(&path) {
-            self.recent.add(&path);
+        let was_quiet = self.session_quiet;
+        self.session_quiet = true;
+        let changed = self.open_tab_now(&path, pin);
+        self.session_quiet = was_quiet;
+        if changed {
+            self.touch_session();
+        }
+    }
+
+    /// Opens `path`. `true` when a tab was added, replaced, focused, or pinned.
+    fn open_tab_now(&mut self, path: &Path, pin: bool) -> bool {
+        if let Some(index) = self.tab_index(path) {
+            self.recent.add(path);
             if pin {
                 self.tabs[index].preview = false;
             }
             self.activate(index);
-            return;
+            return true;
         }
-        let doc = match Document::open(&path) {
+        let doc = match Document::open(path) {
             Ok(doc) => doc,
             // A path that doesn't exist yet becomes a new file there.
             Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 let mut doc = Document::default();
-                doc.set_path(&path);
+                doc.set_path(path);
                 doc
             }
             Err(e) => {
                 self.error = Some(format!("Couldn't open {}: {e}", path.display()));
-                return;
+                return false;
             }
         };
         // Only files that opened (or are deliberately new) are remembered.
-        self.recent.add(&path);
+        self.recent.add(path);
         if !pin && let Some(index) = self.tabs.iter().position(|tab| tab.preview) {
             // An edit pins a preview, and so does an unanswered disk alert.
             // Replacing the slot would drop the only buffer of a missing file.
@@ -682,7 +745,7 @@ impl App {
                 self.replace_document(doc);
                 self.tabs[self.active].preview = true;
                 self.focus_active();
-                return;
+                return true;
             }
         }
         if self.sole_blank_tab() {
@@ -696,6 +759,7 @@ impl App {
                 self.tabs[self.active].preview = true;
             }
         }
+        true
     }
 
     /// The window's starting document: nothing saved, nothing typed.
@@ -728,6 +792,7 @@ impl App {
         self.focus_active();
         if switched {
             self.remember_epoch();
+            self.remember_session();
         }
     }
 
@@ -747,13 +812,15 @@ impl App {
         };
         if tab.preview && tab.doc.epoch() != self.doc_epoch {
             self.tabs[self.active].preview = false;
+            self.remember_session();
         }
     }
 
     /// A middle click asked to pin, and the destination is this document.
     fn pin_if(&mut self, pin: bool) {
-        if pin {
+        if pin && self.tabs.get(self.active).is_some_and(|tab| tab.preview) {
             self.tab_mut().preview = false;
+            self.remember_session();
         }
     }
 
@@ -814,6 +881,7 @@ impl App {
             return;
         };
         self.note_mru(index);
+        self.remember_session();
     }
 
     /// Ctrl+PgUp / Ctrl+PgDn. `delta` is in strip order, and it wraps.
@@ -858,6 +926,8 @@ impl App {
         if index >= self.tabs.len() {
             return;
         }
+        let had_path = self.tabs[index].doc.path().is_some();
+        self.note_closed(index);
         let shown = self.tabs.get(self.active).map(|tab| tab.id);
         let id = self.tabs[index].id;
         self.forget_tab_images(id);
@@ -879,18 +949,251 @@ impl App {
             self.goto.close();
             self.recent_list = None;
             self.empty_recent = 0;
+        } else {
+            self.active = self.mru[0];
+            // The closed tab is already gone. Remember the landed document
+            // when it is a different tab, and do not pin it: that would compare
+            // its epoch with the tab we just left. Closing a background tab
+            // keeps the same document, so an edit in this frame can still pin it.
+            if self.tabs.get(self.active).map(|tab| tab.id) != shown {
+                self.remember_epoch();
+            }
+            self.reveal_disk();
+            self.focus_active();
+        }
+        // A blank tab was never in the session. Closing it must not adopt
+        // the file and erase the tabs a folder launch left untouched.
+        if had_path {
+            self.touch_session();
+        } else {
+            self.remember_session();
+        }
+    }
+
+    /// Remembers a closed file so Ctrl+Shift+T can open it again. A tab
+    /// with no path has nothing on disk to reopen.
+    fn note_closed(&mut self, index: usize) {
+        let Some(path) = self.tabs[index].doc.path().map(Path::to_path_buf) else {
+            return;
+        };
+        let (caret, scroll) = tab_place(&self.tabs[index]);
+        self.closed.push_back(ClosedTab {
+            path,
+            caret,
+            scroll,
+        });
+        while self.closed.len() > CLOSED_TABS {
+            self.closed.pop_front();
+        }
+    }
+
+    /// Opens the most recently closed file that is still on disk. A missing
+    /// file is skipped. The reopened tab is pinned, so it does not replace
+    /// the preview that is open now.
+    fn reopen_closed(&mut self) {
+        while let Some(closed) = self.closed.pop_back() {
+            if !closed.path.is_file() {
+                continue;
+            }
+            let was_quiet = self.session_quiet;
+            self.session_quiet = true;
+            let opened = self.reopen_one(&closed);
+            self.session_quiet = was_quiet;
+            if opened {
+                self.touch_session();
+                return;
+            }
+            self.closed.push_back(closed);
             return;
         }
-        self.active = self.mru[0];
-        // The closed tab is already gone. Remember the landed document
-        // when it is a different tab, and do not pin it: that would compare
-        // its epoch with the tab we just left. Closing a background tab
-        // keeps the same document, so an edit in this frame can still pin it.
-        if self.tabs.get(self.active).map(|tab| tab.id) != shown {
-            self.remember_epoch();
+    }
+
+    fn reopen_one(&mut self, closed: &ClosedTab) -> bool {
+        if self.tab_index(&closed.path).is_none() && !self.open_existing(&closed.path, true) {
+            return false;
         }
-        self.reveal_disk();
-        self.focus_active();
+        let Some(index) = self.tab_index(&closed.path) else {
+            return false;
+        };
+        self.place_in_tab(index, closed.caret, closed.scroll);
+        self.tabs[index].preview = false;
+        self.activate(index);
+        true
+    }
+
+    /// Opens a file that is already on disk. A missing path is not created.
+    /// `remember_recent` is false while restoring, so a launch does not
+    /// reshuffle the recent-files list.
+    fn open_existing(&mut self, path: &Path, remember_recent: bool) -> bool {
+        if let Some(index) = self.tab_index(path) {
+            self.activate(index);
+            return true;
+        }
+        let doc = match Document::open(path) {
+            Ok(doc) => doc,
+            Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(e) => {
+                self.error = Some(format!("Couldn't open {}: {e}", path.display()));
+                return false;
+            }
+        };
+        if remember_recent {
+            self.recent.add(path);
+        }
+        if self.sole_blank_tab() {
+            self.replace_document(doc);
+            self.tabs[self.active].preview = false;
+            self.note_mru(self.active);
+            self.focus_active();
+        } else {
+            self.push_tab(doc);
+        }
+        true
+    }
+
+    /// Puts the caret and the scroll back without scrolling to the caret.
+    /// A reveal would drop the scroll position.
+    fn place_in_tab(&mut self, index: usize, caret: usize, scroll: ScrollPos) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let caret = clamp_offset(&tab.doc, caret);
+        let scroll = clamp_scroll(scroll, tab.doc.line_count());
+        let selection = Selection::caret(caret);
+        tab.code.mirror_selection(selection);
+        tab.code.set_scroll_pos(scroll);
+        tab.live.mirror_selection(selection);
+        let Tab {
+            doc, parse, live, ..
+        } = tab;
+        live.set_scroll_pos(doc, parse.output(), scroll);
+    }
+
+    /// No file argument, or a file argument: put the saved tabs back.
+    /// A missing file is skipped. A store that is not a session is left
+    /// as it is.
+    fn restore_session(&mut self) {
+        let Some(path) = self.session_store.clone() else {
+            return;
+        };
+        let Some(session) = session_tabs::load(&path) else {
+            return;
+        };
+        self.session_quiet = true;
+        let mut slots = Vec::with_capacity(session.tabs.len());
+        for stored in &session.tabs {
+            if !stored.path.is_file() {
+                slots.push(None);
+                continue;
+            }
+            if self.tab_index(&stored.path).is_none() && !self.open_existing(&stored.path, false) {
+                slots.push(None);
+                continue;
+            }
+            let Some(index) = self.tab_index(&stored.path) else {
+                slots.push(None);
+                continue;
+            };
+            self.place_in_tab(
+                index,
+                stored.caret,
+                ScrollPos {
+                    line: stored.scroll_line,
+                    frac: stored.scroll_frac,
+                },
+            );
+            slots.push(Some(index));
+        }
+        let chosen = slots
+            .get(session.active)
+            .copied()
+            .flatten()
+            .or_else(|| {
+                let below = session.active.min(slots.len());
+                slots[..below].iter().rev().find_map(|slot| *slot)
+            })
+            .or_else(|| slots.iter().find_map(|slot| *slot));
+        if let Some(index) = chosen {
+            self.activate(index);
+        }
+        for tab in &mut self.tabs {
+            tab.preview = false;
+        }
+        let preview_at = slots
+            .iter()
+            .enumerate()
+            .find_map(|(i, slot)| {
+                let index = (*slot)?;
+                (session.tabs.get(i)?.preview && chosen == Some(index)).then_some(index)
+            })
+            .or_else(|| {
+                slots.iter().enumerate().rev().find_map(|(i, slot)| {
+                    let index = (*slot)?;
+                    session.tabs.get(i)?.preview.then_some(index)
+                })
+            });
+        if let Some(index) = preview_at
+            && let Some(tab) = self.tabs.get_mut(index)
+        {
+            tab.preview = true;
+        }
+        self.session_quiet = false;
+        self.session_adopted = true;
+        self.remember_session();
+    }
+
+    /// The open files, in strip order, as the session file would store them.
+    fn session_snapshot(&self) -> session_tabs::Session {
+        let mut tabs = Vec::new();
+        let mut active = 0;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let Some(path) = tab.doc.path() else {
+                continue;
+            };
+            let path = session_tabs::canonical(path);
+            if path.to_str().is_none() {
+                continue;
+            }
+            if index == self.active {
+                active = tabs.len();
+            }
+            let (caret, scroll) = tab_place(tab);
+            tabs.push(session_tabs::StoredTab {
+                path,
+                preview: tab.preview,
+                caret,
+                scroll_line: scroll.line,
+                scroll_frac: scroll.frac,
+            });
+        }
+        session_tabs::Session { active, tabs }
+    }
+
+    /// Writes the session when this window owns it and the text changed.
+    fn remember_session(&mut self) {
+        if self.session_quiet || !self.session_adopted {
+            return;
+        }
+        let Some(store) = self.session_store.clone() else {
+            return;
+        };
+        let session = self.session_snapshot();
+        let text = session_tabs::encode(&session);
+        if text == self.session_saved {
+            return;
+        }
+        if session_tabs::save(&store, &session).is_ok() {
+            self.session_saved = text;
+        }
+    }
+
+    /// This window's tabs are now the session.
+    fn touch_session(&mut self) {
+        if self.session_quiet {
+            return;
+        }
+        self.session_adopted = true;
+        self.remember_session();
     }
 
     /// A dialog that just closed must not leave the recent-files dialog up.
@@ -1096,6 +1399,7 @@ impl App {
             self.tab_mut().disk = None;
         }
         self.error = None;
+        self.touch_session();
         match self.after_save {
             None => {}
             Some(AfterSave::Tab(id)) => {
@@ -1302,6 +1606,9 @@ impl App {
                 self.apply_settings();
             }
             self.poll_tabs_on_disk();
+            // The same wake. A caret or scroll move since the tab list was
+            // written lands here, without a timer of its own.
+            self.remember_session();
         }
         // The same one-second wake as before. A background tab does not
         // ask for a frame: its parse waits until the tab is shown, and the
@@ -1544,6 +1851,7 @@ impl App {
                     | Action::ToggleOutline
                     | Action::SearchFolder
                     | Action::ShowKeys
+                    | Action::ReopenTab
             )
         {
             return;
@@ -1602,6 +1910,7 @@ impl App {
             Action::Save => self.save(),
             Action::OpenFile => self.spawn_dialog(DialogKind::Open),
             Action::CloseTab => self.close_tab(self.active),
+            Action::ReopenTab => self.reopen_closed(),
             Action::TabNext => self.cycle_mru(true),
             Action::TabPrevious => self.cycle_mru(false),
             Action::TabLeft => self.move_tab(-1),
@@ -1834,6 +2143,10 @@ impl App {
     /// one list. Discard closes the window either way.
     fn guard_close(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|i| i.viewport().close_requested());
+        if requested {
+            // The one-second check may not have run since the last caret move.
+            self.remember_session();
+        }
         let dirty = self.dirty_count();
         if requested && !self.logged_close {
             let cancel = dirty > 0 && !self.close_allowed;
@@ -2671,12 +2984,14 @@ impl App {
                 new.join(rest)
             })
         };
+        let mut session_moved = false;
         for &(index, was_unchanged) in followed {
             let Some(open) = self.tabs[index].doc.path().map(Path::to_path_buf) else {
                 continue;
             };
             if let Some(path) = relocate(&open) {
                 self.tabs[index].doc.moved_to(path, was_unchanged);
+                session_moved = true;
             }
         }
         // Places to go back to, and a jump waiting on a file, follow too.
@@ -2703,6 +3018,15 @@ impl App {
             }
         }
         self.recent.moved(old, new);
+        for closed in &mut self.closed {
+            if let Some(updated) = relocate(&closed.path) {
+                closed.path = updated;
+                session_moved = true;
+            }
+        }
+        if session_moved {
+            self.touch_session();
+        }
         for dir in [old.parent(), new.parent()].into_iter().flatten() {
             self.browser.refresh_dir(dir);
         }
@@ -4082,10 +4406,14 @@ mod tests {
 
         let cwd = std::env::current_dir().unwrap();
         let ctx = egui::Context::default();
+        // A state directory of its own: the opens above wrote a session
+        // next to `recent`, and a no-argument launch would restore it.
+        let fresh = dir.path().join("fresh-state");
+        fs::create_dir(&fresh).unwrap();
         let here = App::with_recent(
             &ctx,
             None,
-            recent::Recent::from_store(Some(dir.path().join("empty-recent"))),
+            recent::Recent::from_store(Some(fresh.join("recent"))),
         );
         assert_eq!(here.browser.root(), cwd);
         assert!(here.tab().doc.path().is_none());
@@ -4095,7 +4423,9 @@ mod tests {
         // when a folder was.
         let remembered = dir.path().join("old.md");
         fs::write(&remembered, "old\n").unwrap();
-        let store = dir.path().join("recent2");
+        let state = dir.path().join("recent-state");
+        fs::create_dir(&state).unwrap();
+        let store = state.join("recent");
         let mut recent = recent::Recent::from_store(Some(store.clone()));
         recent.add(&remembered);
         let offered = App::with_recent(&ctx, None, recent);
@@ -8536,6 +8866,276 @@ mod tests {
             !run.text_in_view("n09.md"),
             "the first row scrolls off a short window"
         );
+    }
+
+    fn write_session(dir: &Path, active: usize, tabs: Vec<session_tabs::StoredTab>) {
+        session_tabs::save(&dir.join("tabs"), &session_tabs::Session { active, tabs }).unwrap();
+    }
+
+    fn stored(
+        path: &Path,
+        preview: bool,
+        caret: usize,
+        line: usize,
+        frac: f32,
+    ) -> session_tabs::StoredTab {
+        session_tabs::StoredTab {
+            path: path.to_path_buf(),
+            preview,
+            caret,
+            scroll_line: line,
+            scroll_frac: frac,
+        }
+    }
+
+    #[test]
+    fn reopening_restores_tabs_the_caret_and_the_scroll() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "one\ntwo\nthree\n").unwrap();
+        fs::write(&b, "beta\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::with_recent(
+            &ctx,
+            Some(a.clone()),
+            recent::Recent::from_store(Some(dir.path().join("recent"))),
+        );
+        app.open_tab(b.clone(), false);
+        app.activate(0);
+        let caret = app.tab().doc.line_to_byte(2);
+        app.jump_to(caret);
+        let scroll = ScrollPos { line: 1, frac: 0.5 };
+        {
+            let tab = app.tab_mut();
+            tab.code.set_scroll_pos(scroll);
+            let Tab {
+                doc, parse, live, ..
+            } = tab;
+            live.set_scroll_pos(doc, parse.output(), scroll);
+        }
+        app.remember_session();
+
+        let ctx = egui::Context::default();
+        let app = App::with_recent(
+            &ctx,
+            None,
+            recent::Recent::from_store(Some(dir.path().join("recent"))),
+        );
+        assert_eq!(app.tabs.len(), 2);
+        assert!(same_file(app.tabs[0].doc.path().unwrap(), &a));
+        assert!(same_file(app.tabs[1].doc.path().unwrap(), &b));
+        assert!(same_file(app.tab().doc.path().unwrap(), &a));
+        assert!(!app.tabs[0].preview);
+        assert!(app.tabs[1].preview);
+        assert_eq!(app.tab().code.selection().head, caret);
+        assert_eq!(app.tab().live.selection().head, caret);
+        assert_eq!(app.tab().code.scroll_pos().line, 1);
+        assert!((app.tab().code.scroll_pos().frac - 0.5).abs() < 0.001);
+        assert_eq!(
+            app.tab()
+                .live
+                .scroll_pos(&app.tab().doc, app.tab().parse.output())
+                .line,
+            1
+        );
+        assert!(app.error.is_none());
+        assert!(app.recent_list.is_none());
+    }
+
+    #[test]
+    fn a_missing_tab_is_skipped_and_a_bad_session_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let gone = dir.path().join("gone.md");
+        fs::write(&a, "keep\n").unwrap();
+        write_session(
+            dir.path(),
+            1,
+            vec![stored(&a, false, 2, 0, 0.0), stored(&gone, true, 0, 0, 0.0)],
+        );
+        let ctx = egui::Context::default();
+        let app = App::with_recent(
+            &ctx,
+            None,
+            recent::Recent::from_store(Some(dir.path().join("recent"))),
+        );
+        assert_eq!(app.tabs.len(), 1);
+        assert!(same_file(app.tab().doc.path().unwrap(), &a));
+        assert_eq!(app.tab().code.selection().head, 2);
+        assert!(!app.tab().preview);
+        assert!(app.error.is_none());
+        assert!(!gone.exists());
+
+        let bad = dir.path().join("bad-state");
+        fs::create_dir(&bad).unwrap();
+        let store = bad.join("tabs");
+        fs::write(&store, "nope\n").unwrap();
+        let ignored = App::with_recent(
+            &ctx,
+            None,
+            recent::Recent::from_store(Some(bad.join("recent"))),
+        );
+        assert!(ignored.tab().doc.path().is_none());
+        assert!(ignored.error.is_none());
+        assert_eq!(fs::read_to_string(&store).unwrap(), "nope\n");
+    }
+
+    #[test]
+    fn a_file_argument_opens_beside_the_restored_tabs() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        let c = dir.path().join("c.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "beta\n").unwrap();
+        fs::write(&c, "gamma\n").unwrap();
+        write_session(
+            dir.path(),
+            0,
+            vec![stored(&a, false, 3, 0, 0.0), stored(&b, false, 1, 0, 0.0)],
+        );
+        let ctx = egui::Context::default();
+        let recent = recent::Recent::from_store(Some(dir.path().join("recent")));
+        let opened = App::with_recent(&ctx, Some(c.clone()), recent);
+        assert_eq!(opened.tabs.len(), 3);
+        assert!(same_file(opened.tabs[0].doc.path().unwrap(), &a));
+        assert!(same_file(opened.tabs[1].doc.path().unwrap(), &b));
+        assert!(same_file(opened.tab().doc.path().unwrap(), &c));
+        assert_eq!(opened.tabs[0].code.selection().head, 3);
+
+        // The launch above saved the three open tabs. Put the two-tab
+        // session back, so this launch is the one that already has the file.
+        write_session(
+            dir.path(),
+            0,
+            vec![stored(&a, false, 3, 0, 0.0), stored(&b, false, 1, 0, 0.0)],
+        );
+        let again = recent::Recent::from_store(Some(dir.path().join("recent")));
+        let focused = App::with_recent(&ctx, Some(a.clone()), again);
+        assert_eq!(focused.tabs.len(), 2);
+        assert!(same_file(focused.tab().doc.path().unwrap(), &a));
+        assert_eq!(focused.tabs[0].code.selection().head, 3);
+    }
+
+    #[test]
+    fn a_folder_argument_does_not_restore_or_clear_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        fs::create_dir(&notes).unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "alpha\n").unwrap();
+        write_session(dir.path(), 0, vec![stored(&a, false, 1, 0, 0.0)]);
+        let before = fs::read_to_string(dir.path().join("tabs")).unwrap();
+        let ctx = egui::Context::default();
+        let app = App::with_recent(
+            &ctx,
+            Some(notes.clone()),
+            recent::Recent::from_store(Some(dir.path().join("recent"))),
+        );
+        assert!(app.tab().doc.path().is_none());
+        assert_eq!(app.browser.root(), notes);
+        assert_eq!(fs::read_to_string(dir.path().join("tabs")).unwrap(), before);
+    }
+
+    #[test]
+    fn ctrl_shift_t_reopens_the_most_recently_closed_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        let c = dir.path().join("c.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "beta\nline\n").unwrap();
+        fs::write(&c, "gamma\nline\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a.clone()));
+        run.app.request_open(b.clone());
+        run.app.request_open(c.clone());
+        let c_at = run.app.tab().doc.line_to_byte(1);
+        run.app.jump_to(c_at);
+        {
+            let tab = run.app.tab_mut();
+            let pos = ScrollPos {
+                line: 1,
+                frac: 0.25,
+            };
+            tab.code.set_scroll_pos(pos);
+            let Tab {
+                doc, parse, live, ..
+            } = tab;
+            live.set_scroll_pos(doc, parse.output(), pos);
+        }
+        run.key(egui::Key::W, egui::Modifiers::COMMAND);
+        assert!(same_file(run.app.tab().doc.path().unwrap(), &b));
+        let b_at = 2;
+        run.app.jump_to(b_at);
+        run.key(egui::Key::W, egui::Modifiers::COMMAND);
+        assert!(same_file(run.app.tab().doc.path().unwrap(), &a));
+
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::T, shift);
+        assert!(same_file(run.app.tab().doc.path().unwrap(), &b));
+        assert_eq!(run.app.tab().code.selection().head, b_at);
+        assert!(!run.app.tab().preview);
+        run.key(egui::Key::T, shift);
+        assert!(same_file(run.app.tab().doc.path().unwrap(), &c));
+        assert_eq!(run.app.tab().code.selection().head, c_at);
+        assert_eq!(run.app.tab().code.scroll_pos().line, 1);
+        assert_eq!(run.app.tabs.len(), 3);
+
+        while !run.app.tabs.is_empty() {
+            run.key(egui::Key::W, egui::Modifiers::COMMAND);
+        }
+        run.key(egui::Key::T, shift);
+        assert_eq!(run.app.tabs.len(), 1);
+        assert!(same_file(run.app.tab().doc.path().unwrap(), &a));
+    }
+
+    #[test]
+    fn ctrl_shift_t_skips_a_deleted_file_and_keeps_ten() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "alpha\n").unwrap();
+        fs::write(&b, "beta\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(a.clone()));
+        run.app.request_open(b.clone());
+        run.key(egui::Key::W, egui::Modifiers::COMMAND);
+        fs::remove_file(&b).unwrap();
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::T, shift);
+        assert_eq!(run.app.tabs.len(), 1);
+        assert!(same_file(run.app.tab().doc.path().unwrap(), &a));
+        assert!(!b.exists());
+
+        let mut paths = Vec::new();
+        for i in 0..11 {
+            let path = dir.path().join(format!("n{i}.md"));
+            fs::write(&path, format!("{i}\n")).unwrap();
+            run.app.request_open(path.clone());
+            paths.push(path);
+        }
+        while !run.app.tabs.is_empty() {
+            run.key(egui::Key::W, egui::Modifiers::COMMAND);
+        }
+        // Ctrl+W closes the tab on screen and lands on the previous one, so
+        // the files close from n10 down through n0 and then a. The stack
+        // keeps the last ten of those. n9 and n10 were closed first.
+        let mut expect = vec![a];
+        expect.extend(paths.iter().take(9).cloned());
+        for path in &expect {
+            run.key(egui::Key::T, shift);
+            let got = run.app.tab().doc.path().unwrap();
+            assert!(
+                same_file(got, path),
+                "reopened {} wanted {}",
+                got.display(),
+                path.display()
+            );
+        }
+        let open = run.app.tabs.len();
+        assert_eq!(open, expect.len());
+        run.key(egui::Key::T, shift);
+        assert_eq!(run.app.tabs.len(), open);
     }
 
     #[test]

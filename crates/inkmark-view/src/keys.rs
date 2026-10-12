@@ -113,9 +113,10 @@ pub enum Action {
     Tab7 = 72,
     Tab8 = 73,
     Tab9 = 74,
+    ReopenTab = 75,
 }
 
-const COUNT: usize = 75;
+const COUNT: usize = 76;
 
 impl Action {
     pub const ALL: [Action; COUNT] = [
@@ -194,6 +195,7 @@ impl Action {
         Action::Tab7,
         Action::Tab8,
         Action::Tab9,
+        Action::ReopenTab,
     ];
 
     pub const fn index(self) -> usize {
@@ -279,6 +281,7 @@ impl Action {
             Tab7 => "tab_7",
             Tab8 => "tab_8",
             Tab9 => "tab_9",
+            ReopenTab => "reopen_tab",
         }
     }
 
@@ -361,6 +364,7 @@ impl Action {
             Tab7 => "Switch to tab 7",
             Tab8 => "Switch to tab 8",
             Tab9 => "Switch to tab 9",
+            ReopenTab => "Reopen the closed tab",
         }
     }
 
@@ -370,8 +374,8 @@ impl Action {
             CycleMode | FocusCode | FocusLive | ToggleMinimap | OpenFile | Save | SaveAs
             | OpenFolder | ToggleSidebar | NewFile | RecentFiles | Back | Forward | Find
             | Replace | FindNext | FindPrevious | GoToLine | SearchFolder | ToggleOutline
-            | NewFolder | ShowKeys | CloseTab | TabNext | TabPrevious | TabLeft | TabRight
-            | Tab1 | Tab2 | Tab3 | Tab4 | Tab5 | Tab6 | Tab7 | Tab8 | Tab9 => Scope::App,
+            | NewFolder | ShowKeys | CloseTab | ReopenTab | TabNext | TabPrevious | TabLeft
+            | TabRight | Tab1 | Tab2 | Tab3 | Tab4 | Tab5 | Tab6 | Tab7 | Tab8 | Tab9 => Scope::App,
             Rename | MoveToTrash => Scope::Browser,
             InsertRowAbove | InsertRowBelow | InsertColumnLeft | InsertColumnRight | DeleteRow
             | DeleteColumn | MoveRowUp | MoveRowDown | MoveColumnLeft | MoveColumnRight
@@ -1006,6 +1010,7 @@ fn default_chords(action: Action) -> Vec<Chord> {
         NewFolder => vec![chord(ctrl_shift, Key::N)],
         ShowKeys => vec![chord(Modifiers::NONE, Key::F1)],
         CloseTab => vec![chord(ctrl, Key::W)],
+        ReopenTab => vec![chord(ctrl_shift, Key::T)],
         TabNext => vec![chord(ctrl, Key::Tab)],
         TabPrevious => vec![chord(ctrl_shift, Key::Tab)],
         TabLeft => vec![chord(ctrl, Key::PageUp)],
@@ -1079,6 +1084,7 @@ mod tests {
         assert_eq!(map.shortcut_text(Action::NewFolder), "Ctrl+Shift+N");
         assert_eq!(map.shortcut_text(Action::ShowKeys), "F1");
         assert_eq!(map.shortcut_text(Action::CloseTab), "Ctrl+W");
+        assert_eq!(map.shortcut_text(Action::ReopenTab), "Ctrl+Shift+T");
         assert_eq!(map.shortcut_text(Action::TabNext), "Ctrl+Tab");
         assert_eq!(map.shortcut_text(Action::TabPrevious), "Ctrl+Shift+Tab");
         assert_eq!(map.shortcut_text(Action::TabLeft), "Ctrl+PageUp");
