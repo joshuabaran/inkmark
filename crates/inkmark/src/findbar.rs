@@ -1,10 +1,20 @@
 //! The find bar. Its fields hold the query and the replacement; the
 //! document stays in the rope.
+//!
+//! A plain query is counted on the UI thread. A regex query is counted
+//! on a worker: the first match at the caret is selected when the walk
+//! reaches it, and the count follows. The rope the worker sees is a
+//! snapshot, so a newer query or a document edit drops that walk. The
+//! edit is counted on the next poll.
 
 use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::time::Duration;
 
 use eframe::egui::{self, Key, Modifiers, RichText, TextEdit};
-use inkmark_buffer::find::{Finder, SearchOptions};
+use inkmark_buffer::find::{Finder, MatchList, Scan, SearchOptions};
 use inkmark_buffer::{Document, Selection};
 use inkmark_view::theme;
 
@@ -66,6 +76,47 @@ pub struct FindState {
     indexed: Option<Range<usize>>,
     count: usize,
     index: Option<usize>,
+    /// Set when a count is in flight and the index should be taken from
+    /// this range once the walk finishes (an undo, or F3 during the walk).
+    reindex: Option<Range<usize>>,
+    generation: u64,
+    scanning: bool,
+    scan_epoch: u64,
+    worker: Option<Worker>,
+}
+
+struct Worker {
+    jobs: Sender<Job>,
+    events: Receiver<Event>,
+    shared: Arc<ScanShared>,
+}
+
+struct ScanShared {
+    stop: AtomicBool,
+    generation: AtomicU64,
+}
+
+struct Job {
+    generation: u64,
+    epoch: u64,
+    scan: Scan,
+    select_probe: bool,
+    clears_index: bool,
+}
+
+enum Event {
+    Probe {
+        generation: u64,
+        epoch: u64,
+        range: Range<usize>,
+        index: usize,
+    },
+    Done {
+        generation: u64,
+        epoch: u64,
+        list: MatchList,
+        clears_index: bool,
+    },
 }
 
 impl FindState {
@@ -91,11 +142,18 @@ impl FindState {
 
     /// Recounts after an undo or redo that happened outside the bar.
     pub fn sync_count(&mut self, doc: &Document, selection: Selection) {
+        self.reindex = Some(selection.range());
         self.matches_ready = false;
         self.refresh(doc);
-        let range = selection.range();
-        self.index = self.index_of(doc, &range);
-        self.indexed = self.index.is_some().then_some(range);
+        if !self.scanning {
+            self.apply_reindex(doc);
+        }
+    }
+
+    /// The regex walk has not published its count yet.
+    #[cfg(test)]
+    pub(crate) fn scanning(&self) -> bool {
+        self.scanning
     }
 
     /// Drops the match list when the document is replaced. The query,
@@ -211,12 +269,15 @@ impl FindState {
                 self.regex ^= true;
             }
         });
-        // The query is known before the count is drawn.
-        let mut selection_out = None;
-        if before != (self.query.clone(), self.case_sensitive, self.regex) || self.force {
-            self.force = false;
-            selection_out = self.research(doc);
-        }
+        // The query is known before the count is drawn. A regex walk that
+        // started on an earlier frame publishes its first match here.
+        let mut selection_out =
+            if before != (self.query.clone(), self.case_sensitive, self.regex) || self.force {
+                self.force = false;
+                self.research(doc)
+            } else {
+                self.poll(doc)
+            };
         let working = selection_out.unwrap_or(selection);
         if command == Command::Next {
             selection_out = self.goto_next(doc, working);
@@ -249,6 +310,9 @@ impl FindState {
             ui.label(RichText::new(error).color(theme::current(ui.ctx()).error));
         }
         self.focus_pending(ui);
+        if self.scanning {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        }
 
         // A click still moves when this frame's re-search already selected
         // a match. The key handled above is not applied twice.
@@ -272,6 +336,7 @@ impl FindState {
 
     /// F3, including while the bar is closed.
     pub fn goto_next(&mut self, doc: &Document, selection: Selection) -> Option<Selection> {
+        self.poll(doc);
         self.ensure(doc);
         self.refresh(doc);
         self.finder.as_ref()?;
@@ -293,6 +358,7 @@ impl FindState {
 
     /// Shift+F3.
     pub fn goto_prev(&mut self, doc: &Document, selection: Selection) -> Option<Selection> {
+        self.poll(doc);
         self.ensure(doc);
         self.refresh(doc);
         self.finder.as_ref()?;
@@ -325,7 +391,18 @@ impl FindState {
             }
         };
         self.error = None;
+        self.reindex = None;
         let origin = self.origin.min(doc.len());
+        if self.regex {
+            // The walk counts every match. That stays off this thread.
+            // Navigation still uses the compiled finder, one match at a time.
+            self.finder = Some(finder.clone());
+            self.clear_matches();
+            self.start_scan(doc, origin, true, false, finder);
+            return None;
+        }
+        // Drop a regex walk that this plain query replaces.
+        self.clear_matches();
         let list = finder.collect_matches(doc.rope(), MATCH_LIST_LIMIT, origin);
         let probed = list.probed.clone();
         self.finder = Some(finder);
@@ -336,6 +413,7 @@ impl FindState {
     }
 
     fn replace_one(&mut self, doc: &mut Document, selection: Selection) -> Option<Selection> {
+        self.poll(doc);
         self.ensure(doc);
         let range = {
             let finder = self.finder.as_ref()?;
@@ -364,6 +442,7 @@ impl FindState {
     }
 
     fn replace_all(&mut self, doc: &mut Document, selection: Selection) -> Option<Selection> {
+        self.poll(doc);
         self.ensure(doc);
         let template = self.replacement.clone();
         let replaced = {
@@ -396,6 +475,18 @@ impl FindState {
     }
 
     fn clear_matches(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if let Some(worker) = &self.worker {
+            worker
+                .shared
+                .generation
+                .store(self.generation, Ordering::Release);
+        }
+        self.scanning = false;
+        self.forget_list();
+    }
+
+    fn forget_list(&mut self) {
         self.matches.clear();
         self.matches_complete = false;
         self.matches_ready = false;
@@ -414,10 +505,22 @@ impl FindState {
 
     /// Rebuilds the match list when the document has changed.
     fn refresh(&mut self, doc: &Document) {
-        let Some(finder) = self.finder.as_ref() else {
+        let Some(finder) = self.finder.clone() else {
             self.clear_matches();
             return;
         };
+        if self.regex {
+            if self.matches_ready && self.matches_epoch == doc.epoch() && !self.scanning {
+                return;
+            }
+            if self.scanning && self.scan_epoch == doc.epoch() {
+                return;
+            }
+            let clears_index = self.matches_ready;
+            self.start_scan(doc, 0, false, clears_index, finder);
+            self.forget_list();
+            return;
+        }
         if self.matches_ready && self.matches_epoch == doc.epoch() {
             return;
         }
@@ -466,6 +569,11 @@ impl FindState {
         if self.matches_complete {
             return index_in(&self.matches, range);
         }
+        // The in-flight walk publishes the index. Census would rescan the
+        // whole rope on this thread.
+        if self.scanning {
+            return None;
+        }
         self.finder.as_ref()?.census(doc.rope(), Some(range)).1
     }
 
@@ -478,6 +586,12 @@ impl FindState {
         forward: bool,
         wrapped: bool,
     ) -> Option<Selection> {
+        if self.scanning {
+            self.reindex = found.clone();
+            self.index = None;
+            self.indexed = None;
+            return found.map(selection_of);
+        }
         let known = self.indexed.as_ref() == Some(on) && self.index.is_some();
         if known && found.is_some() && !self.matches_complete {
             self.bump_index(forward, wrapped);
@@ -512,6 +626,12 @@ impl FindState {
     fn label(&self) -> String {
         if self.query.is_empty() || self.error.is_some() {
             String::new()
+        } else if self.scanning && !self.matches_ready {
+            if let Some(index) = self.index {
+                format!("{index} of …")
+            } else {
+                "Searching".into()
+            }
         } else if self.count == 0 {
             "No matches".into()
         } else if let Some(index) = self.index {
@@ -575,6 +695,218 @@ fn select_all(
     state.store(ctx, id);
 }
 
+impl FindState {
+    fn start_scan(
+        &mut self,
+        doc: &Document,
+        origin: usize,
+        select_probe: bool,
+        clears_index: bool,
+        finder: Finder,
+    ) {
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        self.ensure_worker();
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        worker
+            .shared
+            .generation
+            .store(generation, Ordering::Release);
+        self.scanning = true;
+        self.scan_epoch = doc.epoch();
+        let job = Job {
+            generation,
+            epoch: doc.epoch(),
+            scan: Scan::new(finder, doc.rope(), origin, MATCH_LIST_LIMIT),
+            select_probe,
+            clears_index,
+        };
+        let _ = worker.jobs.send(job);
+    }
+
+    fn ensure_worker(&mut self) {
+        if self.worker.is_some() {
+            return;
+        }
+        let (jobs_tx, jobs_rx) = mpsc::channel();
+        let (events_tx, events_rx) = mpsc::channel();
+        let shared = Arc::new(ScanShared {
+            stop: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+        });
+        let worker_shared = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("inkmark-find".into())
+            .spawn(move || find_worker(jobs_rx, events_tx, worker_shared))
+            .expect("spawn find thread");
+        self.worker = Some(Worker {
+            jobs: jobs_tx,
+            events: events_rx,
+            shared,
+        });
+    }
+
+    /// Applies a finished regex walk. The selection is the probed match
+    /// when this frame is the one that found it.
+    fn poll(&mut self, doc: &Document) -> Option<Selection> {
+        // Typing does not refresh find. The in-flight walk is a snapshot
+        // of the previous text, so count the document as it is now instead
+        // of waiting for that walk to finish.
+        if self.scanning && self.scan_epoch != doc.epoch() {
+            self.scanning = false;
+            self.refresh(doc);
+        }
+        let Some(worker) = &self.worker else {
+            return None;
+        };
+        let mut events = Vec::new();
+        while let Ok(event) = worker.events.try_recv() {
+            events.push(event);
+        }
+        let mut selection = None;
+        for event in events {
+            if let Some(found) = self.apply_event(doc, event) {
+                selection = Some(found);
+            }
+        }
+        selection
+    }
+
+    fn apply_event(&mut self, doc: &Document, event: Event) -> Option<Selection> {
+        let (generation, epoch) = match &event {
+            Event::Probe {
+                generation, epoch, ..
+            }
+            | Event::Done {
+                generation, epoch, ..
+            } => (*generation, *epoch),
+        };
+        // A text edit is handled above: `poll` starts a new walk before
+        // reading events, so this snapshot's generation no longer matches.
+        // Publishing it, or leaving `scanning` set after dropping it, kept
+        // the bar on Searching.
+        if generation != self.generation || epoch != doc.epoch() {
+            return None;
+        }
+        match event {
+            Event::Probe { range, index, .. } => {
+                // A step during the walk owns the caret. Don't pull it back.
+                if self.reindex.is_some() {
+                    return None;
+                }
+                self.index = Some(index);
+                self.indexed = Some(range.clone());
+                Some(selection_of(range))
+            }
+            Event::Done {
+                list, clears_index, ..
+            } => {
+                self.install(doc, list);
+                self.scanning = false;
+                if clears_index {
+                    self.index = None;
+                    self.indexed = None;
+                }
+                self.apply_reindex(doc);
+                None
+            }
+        }
+    }
+
+    fn apply_reindex(&mut self, doc: &Document) {
+        let Some(range) = self.reindex.take() else {
+            return;
+        };
+        if self.matches_complete {
+            self.index = self.index_of(doc, &range);
+            self.indexed = self.index.is_some().then_some(range);
+        }
+    }
+
+    #[cfg(test)]
+    fn settle(&mut self, doc: &Document) {
+        self.ensure(doc);
+        let start = std::time::Instant::now();
+        while self.scanning {
+            self.poll(doc);
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "regex scan did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.poll(doc);
+    }
+}
+
+fn find_worker(jobs: Receiver<Job>, events: Sender<Event>, shared: Arc<ScanShared>) {
+    while let Ok(mut job) = jobs.recv() {
+        if shared.stop.load(Ordering::Acquire) {
+            break;
+        }
+        loop {
+            match jobs.try_recv() {
+                Ok(newer) => job = newer,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+        if shared.stop.load(Ordering::Acquire) {
+            break;
+        }
+        let generation = job.generation;
+        let epoch = job.epoch;
+        let select_probe = job.select_probe;
+        let clears_index = job.clears_index;
+        let mut sent = false;
+        let finished = job.scan.run(
+            |range, index| {
+                if !select_probe || sent {
+                    return;
+                }
+                sent = true;
+                if events
+                    .send(Event::Probe {
+                        generation,
+                        epoch,
+                        range,
+                        index,
+                    })
+                    .is_err()
+                {
+                    // The bar is gone. `keep_going` ends the walk.
+                    shared.stop.store(true, Ordering::Release);
+                }
+            },
+            || {
+                !shared.stop.load(Ordering::Acquire)
+                    && shared.generation.load(Ordering::Acquire) == generation
+            },
+        );
+        let still = !shared.stop.load(Ordering::Acquire)
+            && shared.generation.load(Ordering::Acquire) == generation;
+        if !still {
+            continue;
+        }
+        let Some(list) = finished else {
+            continue;
+        };
+        if events
+            .send(Event::Done {
+                generation,
+                epoch,
+                list,
+                clears_index,
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +952,7 @@ mod tests {
             ..FindState::default()
         };
         bar.open(0, Some("$".into()), false, false);
+        bar.settle(&doc);
         let end = bar.goto_next(&doc, Selection::caret(0)).unwrap();
         assert_eq!(end.range(), 2..2);
         assert_eq!(bar.match_index(), Some(1));
@@ -627,5 +960,85 @@ mod tests {
         let again = bar.goto_next(&doc, end).unwrap();
         assert_eq!(again.range(), 2..2);
         assert_eq!(bar.match_index(), Some(1));
+    }
+
+    #[test]
+    fn a_regex_query_is_counted_off_this_thread() {
+        let doc = Document::from_text(&"quickly ".repeat(40_000));
+        let mut bar = FindState {
+            regex: true,
+            ..FindState::default()
+        };
+        bar.open(0, Some(r"\w+ly".into()), false, false);
+        assert!(bar.research(&doc).is_none());
+        assert!(bar.scanning());
+        assert_eq!(bar.match_count(), 0);
+        bar.settle(&doc);
+        assert!(!bar.scanning());
+        assert_eq!(bar.match_count(), 40_000);
+        assert_eq!(bar.match_index(), Some(1));
+    }
+
+    #[test]
+    fn a_plain_query_drops_a_regex_walk() {
+        let mut text = "quickly ".repeat(20_000);
+        text.push_str("xyzzy");
+        let doc = Document::from_text(&text);
+        let mut bar = FindState {
+            regex: true,
+            ..FindState::default()
+        };
+        bar.open(0, Some(r"\w+ly".into()), false, false);
+        bar.research(&doc);
+        assert!(bar.scanning());
+        bar.regex = false;
+        bar.query = "xyzzy".into();
+        let found = bar.research(&doc).unwrap();
+        assert!(!bar.scanning());
+        assert_eq!(found.range(), text.len() - 5..text.len());
+        assert_eq!(bar.match_count(), 1);
+        assert_eq!(bar.match_index(), Some(1));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(bar.poll(&doc).is_none());
+        assert_eq!(bar.match_count(), 1);
+        assert_eq!(bar.match_index(), Some(1));
+    }
+
+    #[test]
+    fn an_edit_during_a_regex_walk_is_counted_again() {
+        let mut doc = Document::from_text("quickly\n");
+        let mut bar = FindState {
+            regex: true,
+            ..FindState::default()
+        };
+        bar.open(0, Some(r"\w+ly".into()), false, false);
+        assert!(bar.research(&doc).is_none());
+        assert!(bar.scanning());
+        // The editor does not refresh find on a text edit, and nothing
+        // polls between the walk starting and this change.
+        doc.apply(
+            vec![inkmark_buffer::Edit::insert(0, "slowly ")],
+            Selection::caret(0),
+            Selection::caret(0),
+            inkmark_buffer::EditKind::Other,
+        )
+        .unwrap();
+        bar.settle(&doc);
+        assert!(!bar.scanning());
+        assert_eq!(bar.match_count(), 2);
+    }
+
+    #[test]
+    fn an_invalid_regex_is_reported_without_a_scan() {
+        let doc = Document::from_text("a\n");
+        let mut bar = FindState {
+            regex: true,
+            ..FindState::default()
+        };
+        bar.query = "(".into();
+        assert!(bar.research(&doc).is_none());
+        assert!(bar.error.is_some());
+        assert!(!bar.scanning());
+        assert!(bar.worker.is_none());
     }
 }

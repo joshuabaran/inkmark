@@ -292,6 +292,12 @@ any change to the live wrap width.
 
 ### 12. Find and folder search: Confirmed for regex
 
+> **Fixed in CRO-118 (2026-10-12):** a regex query compiles on the UI
+> thread and the walk runs on a worker. The first match is selected when
+> the walk reaches it, and the count follows. `micro/find/query_regex_5mb`
+> now times that handoff (compile and a rope snapshot), not the walk.
+> Plain queries are unchanged.
+
 - **Find runs on the UI thread on every query change.** Each change compiles
   the query and runs `collect_matches`:
 

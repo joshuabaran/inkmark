@@ -6184,6 +6184,19 @@ mod tests {
             self.frame(vec![]);
         }
 
+        fn wait_find(&mut self) {
+            let start = Instant::now();
+            while self.app.tab().find.scanning() {
+                self.frame(vec![]);
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "regex find did not finish"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            self.frame(vec![]);
+        }
+
         fn check_disk_now(&mut self) {
             self.app.next_disk_check = Instant::now();
             self.frame(vec![]);
@@ -6917,6 +6930,31 @@ mod tests {
         run.frame(vec![]);
         assert_eq!(run.app.tab().code.selection().range(), 12..15);
         assert_eq!(run.app.tab().find.match_index(), Some(2));
+    }
+
+    #[test]
+    fn a_regex_find_selects_the_first_match_and_then_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "one quickly\ntwo slowly\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        run.key(egui::Key::F, egui::Modifiers::COMMAND);
+        run.frame(vec![]);
+        run.frame(vec![egui::Event::Text(r"\w+ly".into())]);
+        run.frame(vec![]);
+        run.click_text("Regex");
+        run.wait_find();
+        assert_eq!(run.app.tab().code.selection().range(), 4..11);
+        assert_eq!(run.app.tab().find.match_count(), 2);
+        assert_eq!(run.app.tab().find.match_index(), Some(1));
+        assert_eq!(
+            run.app
+                .tab()
+                .doc
+                .slice(run.app.tab().code.selection().range())
+                .as_ref(),
+            "quickly"
+        );
     }
 
     #[test]

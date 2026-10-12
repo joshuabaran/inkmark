@@ -28,6 +28,7 @@ pub struct SearchOptions {
 /// is inserted unchanged. A regex replacement uses the regex crate's
 /// `$` syntax: `$1`, `${1}`, `$name`, `${name}` and `$$`. `$1a` is the
 /// group named `1a`, not group 1 followed by `a`.
+#[derive(Clone)]
 pub struct Finder {
     regex: Regex,
     literal: bool,
@@ -101,14 +102,35 @@ impl Finder {
     /// The count still covers the whole rope. `origin` picks `probed`:
     /// the first match at or after that offset.
     pub fn collect_matches(&self, rope: &Rope, limit: usize, origin: usize) -> MatchList {
+        self.collect_with(rope, limit, origin, |_, _| {}, || true)
+            .expect("walk was not cancelled")
+    }
+
+    /// [`collect_matches`](Self::collect_matches), but `on_probe` runs when
+    /// the first match at or after `origin` is known, before the rest of
+    /// the rope is counted. Returning `false` from `keep_going` stops the
+    /// walk and yields `None`, so a caller on another thread can abandon
+    /// a stale query without publishing a partial count.
+    pub fn collect_with(
+        &self,
+        rope: &Rope,
+        limit: usize,
+        origin: usize,
+        mut on_probe: impl FnMut(Range<usize>, usize),
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Option<MatchList> {
         let mut matches = Vec::new();
         let mut count = 0;
         let mut probed = None;
         let mut truncated = false;
         for range in self.iter(rope, 0) {
+            if !keep_going() {
+                return None;
+            }
             count += 1;
             if probed.is_none() && range.start >= origin {
                 probed = Some((range.clone(), count));
+                on_probe(range.clone(), count);
             }
             if truncated {
                 continue;
@@ -120,12 +142,15 @@ impl Finder {
                 matches.push(range);
             }
         }
-        MatchList {
+        if !keep_going() {
+            return None;
+        }
+        Some(MatchList {
             matches,
             count,
             complete: !truncated,
             probed,
-        }
+        })
     }
 
     /// How many matches, and the 1-based index of `current` when it is one.
@@ -245,6 +270,37 @@ impl Finder {
         let mut input = Input::new(RopeyCursor::new(rope.slice(..)));
         input.set_range(range);
         input
+    }
+}
+
+/// A regex scan the UI thread hands off without walking the rope.
+/// [`run`](Self::run) is the walk, and it belongs on another thread.
+pub struct Scan {
+    finder: Finder,
+    rope: Rope,
+    origin: usize,
+    limit: usize,
+}
+
+impl Scan {
+    /// Copies the rope's shared structure. The characters stay where they are.
+    pub fn new(finder: Finder, rope: &Rope, origin: usize, limit: usize) -> Self {
+        Self {
+            finder,
+            rope: rope.clone(),
+            origin,
+            limit,
+        }
+    }
+
+    /// Walks this snapshot. See [`Finder::collect_with`](Finder::collect_with).
+    pub fn run(
+        &self,
+        on_probe: impl FnMut(Range<usize>, usize),
+        keep_going: impl FnMut() -> bool,
+    ) -> Option<MatchList> {
+        self.finder
+            .collect_with(&self.rope, self.limit, self.origin, on_probe, keep_going)
     }
 }
 
@@ -458,6 +514,53 @@ mod tests {
 
         let empty = Rope::from_str("");
         assert_eq!(regex("$").next(&empty, 0), Some(0..0));
+    }
+
+    #[test]
+    fn a_probe_is_reported_before_the_rest_are_counted() {
+        let rope = rope("aa cat aa cat aa");
+        let finder = plain("cat");
+        let mut probes = Vec::new();
+        let list = finder
+            .collect_with(
+                &rope,
+                10,
+                0,
+                |range, index| probes.push((range, index)),
+                || true,
+            )
+            .unwrap();
+        assert_eq!(probes, vec![(3..6, 1)]);
+        let full = finder.collect_matches(&rope, 10, 0);
+        assert_eq!(list.count, full.count);
+        assert_eq!(list.matches, full.matches);
+        assert_eq!(list.complete, full.complete);
+        assert_eq!(list.probed, full.probed);
+        assert_eq!(list.count, 2);
+    }
+
+    #[test]
+    fn a_cancelled_walk_does_not_publish_a_count() {
+        let rope = rope("cat cat cat");
+        let finder = plain("cat");
+        assert!(
+            finder
+                .collect_with(&rope, 10, 0, |_, _| {}, || false)
+                .is_none()
+        );
+        let mut seen = 0;
+        let stopped = finder.collect_with(
+            &rope,
+            10,
+            0,
+            |_, _| {},
+            || {
+                seen += 1;
+                seen == 1
+            },
+        );
+        assert!(stopped.is_none());
+        assert_eq!(seen, 2);
     }
 
     #[test]
