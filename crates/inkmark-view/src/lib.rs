@@ -18,7 +18,7 @@ mod tables;
 pub mod theme;
 
 pub use browser::{BrowserOutput, FileBrowser, OpenFile};
-pub use cheatsheet::{Cheatsheet, Sample, samples};
+pub use cheatsheet::{Cheatsheet, ParsedSample, Sample, parsed_samples, samples};
 pub use images::ImageCache;
 
 /// A click that follows a link. Ctrl+click opens the preview tab.

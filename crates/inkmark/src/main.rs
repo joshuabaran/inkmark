@@ -12,7 +12,7 @@ use inkmark_files::{
     Launch, NewFileError, NewFolderError, SystemTrash, Trash, choose_root, create_new_file,
     create_new_folder, move_into, rename,
 };
-use inkmark_parse::{GfmParser, MarkdownParser, ParseState};
+use inkmark_parse::{GfmParser, ParseState};
 use inkmark_text::Fonts;
 use inkmark_view::keys::{self, Action, Scope};
 use inkmark_view::{BrowserOutput, Cheatsheet, CodeView, FileBrowser, LiveView, ScrollPos, theme};
@@ -3154,12 +3154,10 @@ impl App {
             let scroll_width = ui.available_width();
             ui.allocate_ui(egui::vec2(scroll_width, list_h), |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (index, sample) in inkmark_view::samples().iter().enumerate() {
-                        let doc = Document::from_text(&sample.source);
-                        let parse = GfmParser.parse(&sample.source);
+                    for (index, row) in inkmark_view::parsed_samples().iter().enumerate() {
                         if self
                             .syntax
-                            .show_row(ui, index, &sample.source, &doc, &parse)
+                            .show_row(ui, index, row.source, &row.doc, &row.parse)
                         {
                             clicked = Some(index);
                         }
@@ -3174,7 +3172,7 @@ impl App {
             );
         });
         if let Some(index) = clicked {
-            let source = inkmark_view::samples()[index].source.clone();
+            let source = inkmark_view::parsed_samples()[index].source.to_owned();
             self.insert_snippet(ctx, &source);
         }
         self.eat_overlay_keys(ctx);
@@ -3201,8 +3199,8 @@ impl App {
         );
     }
 
-    /// Puts `source` at the caret. With no note open, copies it instead.
-    /// The cheatsheet stays open.
+    /// Replaces the selection with `source`. A bare caret inserts it there.
+    /// With no note open, copies it instead. The cheatsheet stays open.
     fn insert_snippet(&mut self, ctx: &egui::Context, source: &str) {
         if self.tabs.is_empty() {
             ctx.copy_text(source.to_owned());
@@ -8456,6 +8454,63 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello\n");
         assert!(text(&run.app).contains("# Heading"));
         assert!(run.app.tab().code.has_focus(&run.ctx));
+    }
+
+    /// A click replaces the selection, not only an empty caret. Undo puts
+    /// the replaced text and that selection back.
+    #[test]
+    fn a_cheatsheet_row_replaces_the_selection_and_undoes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "hello\n").unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        // "ell", with the head before the anchor, so undo must restore both ends.
+        let selected = Selection { anchor: 4, head: 1 };
+        run.app.tab_mut().code.set_selection(selected);
+
+        let shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        run.key(egui::Key::Slash, shift);
+        assert!(run.app.show_syntax);
+        for _ in 0..4 {
+            let painted = run
+                .app
+                .syntax
+                .row_rects()
+                .first()
+                .is_some_and(|rect| rect.height() > 8.0);
+            let focused = run
+                .ctx
+                .memory(|m| m.has_focus(egui::Id::new("syntax_sheet")));
+            if painted && focused {
+                break;
+            }
+            run.frame(vec![]);
+        }
+        assert!(
+            run.ctx
+                .memory(|m| m.has_focus(egui::Id::new("syntax_sheet")))
+        );
+        assert_eq!(run.app.tab().code.selection(), selected);
+        assert_eq!(text(&run.app), "hello\n");
+
+        let row = run.app.syntax.row_rects()[0];
+        run.click_pos(row.center(), egui::PointerButton::Primary);
+        let snippet = inkmark_view::parsed_samples()[0].source;
+        assert_eq!(snippet, "# Heading\n");
+        assert!(run.app.show_syntax, "a click leaves the sheet open");
+        assert_eq!(text(&run.app), format!("h{snippet}o\n"));
+        assert_eq!(
+            run.app.selection(),
+            Selection::caret(1 + snippet.len()),
+            "the caret sits after the snippet that replaced the selection"
+        );
+
+        run.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!run.app.show_syntax);
+        assert!(run.app.tab().code.has_focus(&run.ctx));
+        run.key(egui::Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(text(&run.app), "hello\n");
+        assert_eq!(run.app.tab().code.selection(), selected);
     }
 
     /// The e2e window is 480×320. The cheatsheet has to fit that.

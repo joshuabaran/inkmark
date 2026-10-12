@@ -2529,7 +2529,17 @@ impl LiveView {
             let p = self.place(doc, parse, leaf, frame.width);
             // A second leaf on this line stacks under the height already there.
             self.record_block(line, p.first_line, p.last_line, p.height);
-            self.draw_leaf(painter, &mut meshes, doc, parse, &p, frame, y, &selection);
+            self.draw_leaf(
+                painter,
+                &mut meshes,
+                doc,
+                parse,
+                &p,
+                frame,
+                y,
+                &selection,
+                true,
+            );
             if (p.first_line..=p.last_line).contains(&caret_line) {
                 let r = p.caret_rect(self.selection.head, self.upstream());
                 caret = Some(r.translate(vec2(frame.left + p.indent, y)));
@@ -2760,6 +2770,7 @@ impl LiveView {
         frame: Frame,
         top: f32,
         selection: &Range<usize>,
+        record_hits: bool,
     ) {
         let right = frame.left + frame.width;
         // Container decorations: quote bars and the item's bullet or number.
@@ -2802,7 +2813,14 @@ impl LiveView {
                                     StrokeKind::Inside,
                                 );
                             }
-                            self.checkboxes.push((b.expand(3.0), at, checked));
+                            // The cheatsheet paints through this path and never
+                            // calls `paint`, which is what clears `checkboxes`.
+                            // Recording those hits would grow the list on every
+                            // repaint, and the list would stay after the panel
+                            // closed. A snippet is not a document to toggle.
+                            if record_hits {
+                                self.checkboxes.push((b.expand(3.0), at, checked));
+                            }
                         }
                         None => {
                             let marker = list_marker(doc, parse, c, &p.leaf.containers);
@@ -2945,6 +2963,7 @@ impl LiveView {
             let (rect, response) =
                 ui.allocate_exact_size(vec2(width, self.line_height), Sense::hover());
             let painter = ui.painter_at(rect);
+            self.fill_snippet(&painter, rect);
             self.text.end_frame(GlyphMeshes::default(), &painter);
             return response;
         }
@@ -2956,6 +2975,10 @@ impl LiveView {
             + 2.0;
         let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
         let painter = ui.painter_at(rect);
+        // The modal fills with `code_background` (see `Theme::visuals`). The
+        // live pane fills `background` first, which is what separates a code
+        // block and a table header from the surface they sit on.
+        self.fill_snippet(&painter, rect);
         let mut meshes = GlyphMeshes::default();
         let selection = 0..0;
         let frame = Frame {
@@ -2988,12 +3011,18 @@ impl LiveView {
                         frame,
                         rect.top() + *top,
                         &selection,
+                        false,
                     );
                 }
             }
         }
         self.text.end_frame(meshes, &painter);
         response
+    }
+
+    /// The live pane's background, so a snippet matches the note beside it.
+    fn fill_snippet(&self, painter: &egui::Painter, rect: Rect) {
+        painter.rect_filled(rect, 0.0, self.theme.background);
     }
 
     /// The live pane's block walk, without scrolling: raw lines (link
@@ -3515,5 +3544,42 @@ mod tests {
             placed.body.width()
         );
         assert_eq!(doc.slice(0..doc.len()).as_ref(), src);
+    }
+
+    /// Task rows go through `draw_leaf`, which records checkbox hits for the
+    /// live pane. A snippet is painted by a view that never calls `paint`,
+    /// so those hits must not accumulate across repaints.
+    #[test]
+    fn a_snippet_does_not_collect_checkbox_hits() {
+        use inkmark_parse::GfmParser;
+
+        let ctx = egui::Context::default();
+        let mut view = LiveView::with_fonts(inkmark_text::Fonts::shared(&ctx), Id::new("hits"));
+        let src = "- [ ] open\n- [x] done\n";
+        let doc = Document::from_text(src);
+        let parse = GfmParser.parse(src);
+        let mut time = 0.0;
+        let mut saw_mark = false;
+        for _ in 0..4 {
+            time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_max(Pos2::ZERO, pos2(800.0, 600.0))),
+                time: Some(time),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                view.show_snippet(ui, &doc, &parse);
+            });
+            out.textures_delta.clear();
+            saw_mark |= out.shapes.iter().any(|clipped| match &clipped.shape {
+                egui::Shape::Mesh(mesh) => !mesh.vertices.is_empty(),
+                egui::Shape::Vec(shapes) => shapes.iter().any(
+                    |shape| matches!(shape, egui::Shape::Mesh(mesh) if !mesh.vertices.is_empty()),
+                ),
+                _ => false,
+            });
+            assert_eq!(view.checkboxes.len(), 0);
+        }
+        assert!(saw_mark, "the task sample did not paint");
     }
 }

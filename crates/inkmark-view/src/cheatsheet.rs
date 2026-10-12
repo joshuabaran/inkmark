@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 
 use egui::{Id, Rect, Sense, pos2, vec2};
 use inkmark_buffer::Document;
-use inkmark_parse::ParseOutput;
+use inkmark_parse::{GfmParser, MarkdownParser, ParseOutput};
 use inkmark_text::{GlyphMeshes, SharedFonts, TextConfig, TextRenderer};
 
 use crate::live_view::LiveView;
@@ -49,6 +49,30 @@ enum Expect {
 pub fn samples() -> &'static [Sample] {
     static SAMPLES: OnceLock<Vec<Sample>> = OnceLock::new();
     SAMPLES.get_or_init(load_samples)
+}
+
+/// A row plus the document and parse the preview paints. Built once: the
+/// source never changes, and rebuilding it on every repaint is wasted work.
+pub struct ParsedSample {
+    pub source: &'static str,
+    pub doc: Document,
+    pub parse: ParseOutput,
+}
+
+/// Every row, with its document and parse. The panel reads this instead of
+/// parsing each sample again on every frame.
+pub fn parsed_samples() -> &'static [ParsedSample] {
+    static PARSED: OnceLock<Vec<ParsedSample>> = OnceLock::new();
+    PARSED.get_or_init(|| {
+        samples()
+            .iter()
+            .map(|sample| ParsedSample {
+                source: sample.source.as_str(),
+                doc: Document::from_text(&sample.source),
+                parse: GfmParser.parse(&sample.source),
+            })
+            .collect()
+    })
 }
 
 /// Paints the cheatsheet rows. The app owns one of these and only shows it
@@ -344,6 +368,15 @@ mod tests {
             );
             seen.push(sample.expect);
         }
+        assert_eq!(parsed_samples().len(), samples().len());
+        for (sample, parsed) in samples().iter().zip(parsed_samples()) {
+            assert_eq!(parsed.source, sample.source);
+            assert_eq!(
+                parsed.doc.slice(0..parsed.doc.len()).as_ref(),
+                sample.source
+            );
+            assert_eq!(parsed.parse, GfmParser.parse(&sample.source));
+        }
         for level in 1..=6 {
             assert!(seen.contains(&Expect::Heading(level)), "heading {level}");
         }
@@ -401,44 +434,79 @@ mod tests {
     fn each_sample_paints_through_the_live_renderer() {
         let ctx = egui::Context::default();
         let mut sheet = Cheatsheet::new(inkmark_text::Fonts::shared(&ctx));
+        let theme = theme::current(&ctx);
         let mut time = 0.0;
-        for (index, sample) in samples().iter().enumerate() {
-            let doc = Document::from_text(&sample.source);
-            let parse = GfmParser.parse(&sample.source);
+        for row in parsed_samples() {
             time += 1.0 / 60.0;
             let input = egui::RawInput {
                 screen_rect: Some(Rect::from_min_max(Pos2::ZERO, pos2(800.0, 600.0))),
                 time: Some(time),
                 ..Default::default()
             };
+            let mut height = 0.0;
             let mut out = ctx.run_ui(input, |ui| {
-                sheet.show_row(ui, index, &sample.source, &doc, &parse);
+                // The preview column alone. `show_row` also paints the source,
+                // and any glyph there used to satisfy a "something was drawn" check.
+                let response = sheet.live.show_snippet(ui, &row.doc, &row.parse);
+                height = response.rect.height();
             });
             out.textures_delta.clear();
+            assert!(height > 8.0, "preview has no height for {:?}", row.source);
             assert!(
                 out.shapes
                     .iter()
-                    .any(|clipped| shape_visible(&clipped.shape)),
-                "nothing painted for {:?}",
-                sample.source
+                    .any(|clipped| preview_mark(&clipped.shape)),
+                "preview painted nothing for {:?}",
+                row.source
             );
+            let mut fills = Vec::new();
+            for clipped in &out.shapes {
+                collect_fills(&clipped.shape, &mut fills);
+            }
+            assert!(
+                fills.contains(&theme.background),
+                "preview is missing the live-pane background for {:?}",
+                row.source
+            );
+            // A code block and a table header use `code_background`. On the
+            // modal's own `code_background` they would disappear.
+            if row.source.contains("```") || row.source.contains("| --- |") {
+                assert!(
+                    fills.contains(&theme.code_background),
+                    "code or table fill is missing for {:?}",
+                    row.source
+                );
+            }
         }
     }
 
-    fn shape_visible(shape: &egui::Shape) -> bool {
+    /// Glyphs, a rule, or another mark from the renderer. A background rect
+    /// alone is the fill under the sample, not the sample.
+    fn preview_mark(shape: &egui::Shape) -> bool {
         match shape {
-            egui::Shape::Noop => false,
-            egui::Shape::Vec(shapes) => shapes.iter().any(shape_visible),
+            egui::Shape::Noop | egui::Shape::Rect(_) => false,
+            egui::Shape::Vec(shapes) => shapes.iter().any(preview_mark),
             egui::Shape::Mesh(mesh) => !mesh.vertices.is_empty(),
             egui::Shape::Text(_)
             | egui::Shape::LineSegment { .. }
-            | egui::Shape::Rect(_)
             | egui::Shape::Path(_)
             | egui::Shape::Circle(_)
             | egui::Shape::Ellipse(_)
             | egui::Shape::QuadraticBezier(_)
             | egui::Shape::CubicBezier(_)
             | egui::Shape::Callback(_) => true,
+        }
+    }
+
+    fn collect_fills(shape: &egui::Shape, fills: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Rect(rect) => fills.push(rect.fill),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_fills(shape, fills);
+                }
+            }
+            _ => {}
         }
     }
 }
