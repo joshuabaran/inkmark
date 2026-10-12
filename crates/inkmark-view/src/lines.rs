@@ -230,7 +230,14 @@ const PANE_KEYS: egui::EventFilter = egui::EventFilter {
 /// in place by the end of each frame, after anything that requests focus:
 /// a request starts the focus over, unlocked.
 pub(crate) fn lock_focus(ui: &Ui, id: Id) {
-    ui.memory_mut(|m| m.set_focus_lock_filter(id, PANE_KEYS));
+    lock_focus_ctx(ui.ctx(), id);
+}
+
+/// Same lock as [`lock_focus`], for a request made after the pane has
+/// already drawn. A modal under the pointer makes `interact` surrender
+/// focus, so the overlay asks again once the panes have run.
+pub(crate) fn lock_focus_ctx(ctx: &egui::Context, id: Id) {
+    ctx.memory_mut(|m| m.set_focus_lock_filter(id, PANE_KEYS));
 }
 
 /// Where a minimap press or drag should put the pane's top.

@@ -172,7 +172,7 @@ inkmark               # browses the current directory and shows recent files
 | Ctrl+Shift+F | Search the open folder (`search_folder`) |
 | Ctrl+Shift+B | Show or hide the outline (`toggle_outline`) |
 | Ctrl+Shift+N | New folder in the selected folder, or the open folder (`new_folder`) |
-| F1 | Show or hide the key bindings (`show_keys`) |
+| Ctrl+/, F1 | Show or hide the key bindings (`show_keys`) |
 | Ctrl+W | Close the tab (`close_tab`) |
 | Ctrl+Tab | Switch to the next most recently used tab (`tab_next`) |
 | Ctrl+Shift+Tab | Switch to the previous most recently used tab (`tab_previous`) |
@@ -244,7 +244,7 @@ which of the code and live panes are open, each pane's minimap, the split
 between them, the outline's width, and whether the outline is showing.
 « and » at the edges of the status bar show or hide the sidebar and the
 outline. Drag the lines between the sidebar, the panes, and the outline
-to set those widths. F1 lists the keys in effect.
+to set those widths. Ctrl+/ or F1 lists the keys in effect.
 
 ### Settings
 

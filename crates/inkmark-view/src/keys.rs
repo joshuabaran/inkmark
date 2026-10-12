@@ -1,11 +1,12 @@
 //! Every configurable shortcut, and the chord it uses unless config says
 //! otherwise. The app shell, the file browser and both editor panes read
-//! this one table.
+//! this one table, and the shortcut overlay draws the same rows.
 //!
 //! Plain editing keys are not actions: arrows, Backspace, Delete, Enter,
 //! Tab, Home, End, Page Up/Down, and Shift held to extend a selection.
 //! Their Ctrl and Alt chords are actions, so they can be rebound. Mouse
-//! gestures (Ctrl+click) and IME are not actions either.
+//! gestures (Ctrl+click) and IME are not actions either. The overlay still
+//! lists those gestures, beside the group they belong to.
 //!
 //! Matching requires Shift and Alt to be exactly the ones named. egui's
 //! `consume_shortcut` uses `matches_logically`, which treats extra Shift
@@ -16,6 +17,119 @@
 //! would miss those real Ctrl events, which tests build as `command` only.
 
 use egui::{Key, Modifiers};
+
+/// Where a shortcut is listed in the overlay. The order is the overlay's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    /// Opening, saving, and the sidebar's file commands.
+    File,
+    /// Switching, closing, and reopening tabs.
+    Tabs,
+    /// Editing text, formatting, and tables.
+    Edit,
+    /// Find, replace, and folder search.
+    Find,
+    /// Panes, the sidebar, the outline, and this overlay.
+    View,
+    /// Moving through the note and through followed links.
+    Navigation,
+    /// The minimap, and pointer gestures that follow a link.
+    Minimap,
+}
+
+impl Group {
+    pub const ALL: [Group; 7] = [
+        Group::File,
+        Group::Tabs,
+        Group::Edit,
+        Group::Find,
+        Group::View,
+        Group::Navigation,
+        Group::Minimap,
+    ];
+
+    /// The heading drawn above this group's rows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Group::File => "File",
+            Group::Tabs => "Tabs",
+            Group::Edit => "Edit",
+            Group::Find => "Find",
+            Group::View => "View/Layout",
+            Group::Navigation => "Navigation",
+            Group::Minimap => "Minimap/Mouse",
+        }
+    }
+}
+
+/// A pointer gesture. It is not a chord, so config cannot rebind it and
+/// key handling does not read it. The overlay lists it with the chords.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gesture {
+    pub group: Group,
+    pub keys: &'static str,
+    pub description: &'static str,
+}
+
+impl Gesture {
+    /// Whether the overlay keeps this gesture for `query`.
+    ///
+    /// `Ctrl+click` also matches `Cmd+click`, the name macOS shows.
+    pub fn matches_query(self, query: &str) -> bool {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return true;
+        }
+        format!(
+            "{} {} {}",
+            self.keys,
+            self.platform_keys(egui::os::OperatingSystem::Mac),
+            self.description
+        )
+        .to_lowercase()
+        .contains(&query)
+    }
+
+    /// How this machine names the gesture. Linux and Windows keep Ctrl.
+    /// macOS says Cmd. A gesture with no Ctrl is unchanged.
+    pub fn platform_keys(self, os: egui::os::OperatingSystem) -> String {
+        if os.is_mac() {
+            self.keys.replace("Ctrl", "Cmd")
+        } else {
+            self.keys.to_owned()
+        }
+    }
+}
+
+/// One action in the shortcut table. `chords` is empty when it is unbound.
+/// The overlay and the key handling both come from this table: handling
+/// reads [`KeyMap::find`], and the overlay reads [`KeyMap::bindings`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Binding {
+    pub action: Action,
+    pub group: Group,
+    pub description: &'static str,
+    pub chords: String,
+}
+
+/// Pointer gestures, in overlay order within their groups.
+pub const GESTURES: &[Gesture] = &[
+    Gesture {
+        group: Group::Tabs,
+        keys: "Middle click a tab",
+        description: "Close the tab",
+    },
+    Gesture {
+        group: Group::Minimap,
+        keys: "Ctrl+click",
+        description: "Follow a link, in a preview tab",
+    },
+    Gesture {
+        group: Group::Minimap,
+        keys: "Middle click a link",
+        description: "Follow a link, in a pinned tab",
+    },
+];
 
 /// Where an action is handled. A chord belongs to one action everywhere;
 /// two actions never share one, even across these.
@@ -384,6 +498,30 @@ impl Action {
         }
     }
 
+    /// The overlay section this action is listed under.
+    pub fn group(self) -> Group {
+        use Action::*;
+        match self {
+            OpenFile | Save | SaveAs | OpenFolder | NewFile | NewFolder | RecentFiles | Rename
+            | MoveToTrash => Group::File,
+            CloseTab | ReopenTab | TabNext | TabPrevious | TabLeft | TabRight | Tab1 | Tab2
+            | Tab3 | Tab4 | Tab5 | Tab6 | Tab7 | Tab8 | Tab9 => Group::Tabs,
+            Undo | Redo | Bold | Italic | Code | Strikethrough | Link | ToggleTask | Heading0
+            | Heading1 | Heading2 | Heading3 | Heading4 | Heading5 | Heading6 | SelectAll
+            | SelectWord | SelectParagraph | DeleteWordLeft | DeleteWordRight | InsertRowAbove
+            | InsertRowBelow | InsertColumnLeft | InsertColumnRight | DeleteRow | DeleteColumn
+            | MoveRowUp | MoveRowDown | MoveColumnLeft | MoveColumnRight | FormatTable
+            | InsertTable => Group::Edit,
+            Find | Replace | FindNext | FindPrevious | SearchFolder => Group::Find,
+            CycleMode | FocusCode | FocusLive | ToggleSidebar | ToggleOutline | ShowKeys => {
+                Group::View
+            }
+            Back | Forward | WordLeft | WordRight | DocumentStart | DocumentEnd | GoToLine
+            | MatchBracket => Group::Navigation,
+            ToggleMinimap => Group::Minimap,
+        }
+    }
+
     /// Heading actions carry the level (0 is a paragraph).
     pub fn heading_level(self) -> Option<u8> {
         use Action::*;
@@ -432,23 +570,34 @@ impl Chord {
     }
 
     /// `Ctrl+Shift+S`, `Alt+Left`, `F2`. Modifier order is fixed so the
-    /// same chord always prints the same way.
+    /// same chord always prints the same way. Config and the README use
+    /// this, which always says Ctrl, so a file written on one machine
+    /// applies on another. Slash is `/`, the key a person presses.
     pub fn display(&self) -> String {
-        let mut parts = Vec::new();
-        if self.modifiers.command || self.modifiers.ctrl {
-            parts.push("Ctrl");
+        self.platform_label(egui::os::OperatingSystem::Nix)
+    }
+
+    /// How this machine names the chord. Linux and Windows say Ctrl.
+    /// macOS says Cmd for the command bit and Option for Alt. Super stays
+    /// Super off macOS; egui's own names omit that bit there.
+    pub fn platform_label(self, os: egui::os::OperatingSystem) -> String {
+        let mac = os.is_mac();
+        let mut mods = egui::ModifierNames::NAMES.format(&self.modifiers, mac);
+        if !mac && self.modifiers.mac_cmd {
+            if !mods.is_empty() {
+                mods.push('+');
+            }
+            mods.push_str("Super");
         }
-        if self.modifiers.alt {
-            parts.push("Alt");
+        let key = match self.key {
+            Key::Slash => "/",
+            other => other.name(),
+        };
+        if mods.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{mods}+{key}")
         }
-        if self.modifiers.shift {
-            parts.push("Shift");
-        }
-        if self.modifiers.mac_cmd {
-            parts.push("Super");
-        }
-        parts.push(self.key.name());
-        parts.join("+")
     }
 
     /// Why the desktop will take this chord before inkmark sees it, if it will.
@@ -653,13 +802,70 @@ impl KeyMap {
     }
 
     /// The label drawn next to a menu item. Every chord, so a rebound
-    /// action doesn't keep advertising the old key.
+    /// action doesn't keep advertising the old key. Always the Ctrl form
+    /// (`display`), so a menu and config.toml agree.
     pub fn shortcut_text(&self, action: Action) -> String {
         self.chords(action)
             .iter()
             .map(Chord::display)
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    /// The same chords, named the way `os` names modifiers.
+    pub fn platform_text(&self, os: egui::os::OperatingSystem, action: Action) -> String {
+        self.chords(action)
+            .iter()
+            .map(|chord| chord.platform_label(os))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// One row of the shortcut table the overlay and `--list-keys` share.
+    /// Empty `chords` means the action is unbound.
+    pub fn bindings(&self) -> Vec<Binding> {
+        let mut rows = Vec::with_capacity(Action::ALL.len());
+        for group in Group::ALL {
+            for action in Action::ALL {
+                if action.group() == group {
+                    rows.push(Binding {
+                        action,
+                        group,
+                        description: action.description(),
+                        chords: self.shortcut_text(action),
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    /// Whether the overlay keeps this row for `query`. An empty query keeps
+    /// every row. Matching is case-insensitive, against the description, the
+    /// config name, and the chord text (Ctrl form and this machine's names).
+    pub fn matches_query(
+        &self,
+        action: Action,
+        os: egui::os::OperatingSystem,
+        query: &str,
+    ) -> bool {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return true;
+        }
+        let mut hay = String::new();
+        hay.push_str(action.description());
+        hay.push(' ');
+        hay.push_str(action.id());
+        hay.push(' ');
+        hay.push_str(&self.shortcut_text(action));
+        hay.push(' ');
+        hay.push_str(&self.platform_text(os, action));
+        for chord in self.chords(action) {
+            hay.push(' ');
+            hay.push_str(chord.key.name());
+        }
+        hay.to_lowercase().contains(&query)
     }
 
     pub fn find(&self, key: Key, modifiers: Modifiers, scope: Scope) -> Option<Action> {
@@ -1008,7 +1214,8 @@ fn default_chords(action: Action) -> Vec<Chord> {
         SearchFolder => vec![chord(ctrl_shift, Key::F)],
         ToggleOutline => vec![chord(ctrl_shift, Key::B)],
         NewFolder => vec![chord(ctrl_shift, Key::N)],
-        ShowKeys => vec![chord(Modifiers::NONE, Key::F1)],
+        // Ctrl+/ is free. F1 already opened this list, and still does.
+        ShowKeys => vec![chord(ctrl, Key::Slash), chord(Modifiers::NONE, Key::F1)],
         CloseTab => vec![chord(ctrl, Key::W)],
         ReopenTab => vec![chord(ctrl_shift, Key::T)],
         TabNext => vec![chord(ctrl, Key::Tab)],
@@ -1082,7 +1289,7 @@ mod tests {
         );
         assert_eq!(map.shortcut_text(Action::ToggleOutline), "Ctrl+Shift+B");
         assert_eq!(map.shortcut_text(Action::NewFolder), "Ctrl+Shift+N");
-        assert_eq!(map.shortcut_text(Action::ShowKeys), "F1");
+        assert_eq!(map.shortcut_text(Action::ShowKeys), "Ctrl+/, F1");
         assert_eq!(map.shortcut_text(Action::CloseTab), "Ctrl+W");
         assert_eq!(map.shortcut_text(Action::ReopenTab), "Ctrl+Shift+T");
         assert_eq!(map.shortcut_text(Action::TabNext), "Ctrl+Tab");
@@ -1371,5 +1578,88 @@ mod tests {
                 action.id()
             );
         }
+    }
+
+    #[test]
+    fn every_bound_action_appears_in_the_binding_table() {
+        let map = KeyMap::builtin();
+        let rows = map.bindings();
+        assert_eq!(rows.len(), Action::ALL.len());
+        let mut seen = [false; COUNT];
+        for row in &rows {
+            assert!(!seen[row.action.index()], "twice: {}", row.action.id());
+            seen[row.action.index()] = true;
+            assert_eq!(row.group, row.action.group());
+            assert_eq!(row.description, row.action.description());
+            assert_eq!(row.chords, map.shortcut_text(row.action));
+            assert!(!row.chords.is_empty(), "{} is unbound", row.action.id());
+            // The overlay's row is the chord input handling will fire.
+            let chord = map.chords(row.action)[0];
+            let found = match row.action.scope() {
+                Scope::Editor | Scope::Table => map.find_editing(chord.key, chord.modifiers),
+                scope => map.find(chord.key, chord.modifiers, scope),
+            };
+            assert_eq!(found, Some(row.action), "{}", row.action.id());
+        }
+        assert!(seen.iter().all(|hit| *hit));
+        // Tab chords from CRO-132 and reopen from CRO-136 are in the table.
+        let reopen = rows
+            .iter()
+            .find(|row| row.action == Action::ReopenTab)
+            .unwrap();
+        assert_eq!(reopen.group, Group::Tabs);
+        assert!(reopen.chords.contains("Ctrl+Shift+T"));
+        assert!(rows.iter().any(|row| row.action == Action::Tab1
+            && row.group == Group::Tabs
+            && row.chords == "Alt+1"));
+        for group in Group::ALL {
+            assert!(
+                rows.iter().any(|row| row.group == group),
+                "no row in {}",
+                group.label()
+            );
+        }
+    }
+
+    #[test]
+    fn the_overlay_query_matches_the_action_name_or_the_key() {
+        let map = KeyMap::builtin();
+        let os = egui::os::OperatingSystem::Nix;
+        let hit = |query: &str, action: Action| map.matches_query(action, os, query);
+        assert!(hit("reopen", Action::ReopenTab));
+        assert!(hit("REOPEN", Action::ReopenTab));
+        assert!(hit("ctrl+shift+t", Action::ReopenTab));
+        assert!(!hit("reopen", Action::Bold));
+        assert!(hit("show_keys", Action::ShowKeys));
+        assert!(hit("ctrl+/", Action::ShowKeys));
+        assert!(hit("f1", Action::ShowKeys));
+        assert!(hit("", Action::Bold));
+        assert!(hit("   ", Action::Save));
+        assert!(
+            GESTURES
+                .iter()
+                .any(|gesture| gesture.matches_query("ctrl+click"))
+        );
+        assert!(!GESTURES.iter().any(|gesture| gesture.matches_query("bold")));
+    }
+
+    #[test]
+    fn chords_say_ctrl_on_linux_and_cmd_on_mac() {
+        let map = KeyMap::builtin();
+        let linux = egui::os::OperatingSystem::Nix;
+        let mac = egui::os::OperatingSystem::Mac;
+        assert!(!linux.is_mac());
+        assert_eq!(map.platform_text(linux, Action::Bold), "Ctrl+B");
+        assert_eq!(map.platform_text(linux, Action::ReopenTab), "Ctrl+Shift+T");
+        assert_eq!(map.platform_text(linux, Action::ShowKeys), "Ctrl+/, F1");
+        assert_eq!(map.platform_text(linux, Action::Back), "Alt+Left");
+        assert_eq!(map.shortcut_text(Action::Bold), "Ctrl+B");
+        assert_eq!(map.platform_text(mac, Action::Bold), "Cmd+B");
+        assert_eq!(map.platform_text(mac, Action::Redo), "Shift+Cmd+Z, Cmd+Y");
+        assert_eq!(map.platform_text(mac, Action::Back), "Option+Left");
+        let super_i = Chord::parse("Super+I").unwrap();
+        assert_eq!(super_i.platform_label(linux), "Super+I");
+        assert_eq!(super_i.platform_label(mac), "Cmd+I");
+        assert_eq!(Chord::parse("Ctrl+/").unwrap().display(), "Ctrl+/");
     }
 }
