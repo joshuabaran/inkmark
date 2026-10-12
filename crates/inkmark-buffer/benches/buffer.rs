@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use inkmark_bench::fixtures;
-use inkmark_buffer::find::{Finder, SearchOptions};
+use inkmark_buffer::find::{Finder, Scan, SearchOptions};
 use inkmark_buffer::{Document, Edit, EditKind, Selection};
 
 fn configure() -> Criterion {
@@ -75,8 +75,9 @@ fn find(c: &mut Criterion) {
     let mut g = c.benchmark_group("find");
     g.throughput(Throughput::Bytes(doc.len() as u64));
     g.sample_size(20);
-    // What the find bar does on every change to the query: compile, then
-    // one pass that lists (up to its limit) and counts every match.
+    // A plain query compiles and counts on the calling thread. A regex
+    // query compiles and snapshots the rope here; the count runs elsewhere
+    // (`Scan::run` / `collect_matches`).
     g.bench_function("query_common_word_5mb", |b| {
         b.iter(|| {
             let f = Finder::compile("the", plain).unwrap();
@@ -92,7 +93,7 @@ fn find(c: &mut Criterion) {
     g.bench_function("query_regex_5mb", |b| {
         b.iter(|| {
             let f = Finder::compile(r"\b\w+ly\b", regex).unwrap();
-            black_box(f.collect_matches(rope, 10_000, mid))
+            black_box(Scan::new(f, rope, mid, 10_000))
         })
     });
     let common = Finder::compile("the", plain).unwrap();
