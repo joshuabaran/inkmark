@@ -5,8 +5,9 @@ use egui::{
     Rect, pos2,
 };
 use inkmark_buffer::{Document, Edit, EditKind, Selection};
+use inkmark_minimap::Minimap;
 use inkmark_parse::{ParseState, PulldownParser};
-use inkmark_view::CodeView;
+use inkmark_view::{CodeView, ScrollPos};
 
 const SCREEN: Rect = Rect::from_min_max(Pos2::ZERO, pos2(800.0, 600.0));
 
@@ -379,7 +380,8 @@ fn minimap_click_jumps_and_drag_tracks() {
     let jumped = h.view.scroll_pos().line;
     assert!(jumped > 100, "jumped to line {jumped}");
     assert!(h.view.take_scrolled(), "minimap scrolling counts for sync");
-    // Dragging to the bottom edge scrolls to the end, like a scrollbar.
+    // The minimap is outside the text, so a drag has to arrive on its own
+    // widget. Moving down from that jump keeps scrolling.
     h.frame(vec![
         Event::PointerMoved(pos2(MINIMAP_X, 300.0)),
         Event::PointerButton {
@@ -389,12 +391,36 @@ fn minimap_click_jumps_and_drag_tracks() {
             modifiers: Modifiers::NONE,
         },
     ]);
+    let pressed_at = h.view.scroll_pos().line;
     for y in [350.0, 450.0, 600.0] {
         h.frame(vec![Event::PointerMoved(pos2(MINIMAP_X, y))]);
     }
+    let dragged = h.view.scroll_pos().line;
+    assert!(
+        dragged > pressed_at + 50,
+        "press landed on {pressed_at}, drag stayed at {dragged}"
+    );
+    // Grabbing the box and dragging it to the bottom edge reaches the end.
+    h.frame(vec![Event::PointerButton {
+        pos: pos2(MINIMAP_X, 600.0),
+        button: PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    }]);
+    h.view.set_scroll_pos(ScrollPos { line: 0, frac: 0.0 });
+    h.frame(vec![
+        Event::PointerMoved(pos2(MINIMAP_X, 24.0)),
+        Event::PointerButton {
+            pos: pos2(MINIMAP_X, 24.0),
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    h.frame(vec![Event::PointerMoved(pos2(MINIMAP_X, 600.0))]);
     assert!(
         h.view.scroll_pos().line > 19_900,
-        "dragged to {}",
+        "dragged the box to {}",
         h.view.scroll_pos().line
     );
 }
@@ -413,6 +439,61 @@ fn hiding_the_minimap_widens_the_text() {
         h.head() > with_minimap,
         "first row holds more text without the minimap"
     );
+}
+
+#[test]
+fn dragging_the_minimap_box_keeps_it_under_the_pointer() {
+    let text: String = (0..8_000).map(|i| format!("line {i}\n")).collect();
+    let mut h = Harness::new(&text);
+    let minimap = Rect::from_min_max(
+        pos2(800.0 - 10.0 - inkmark_minimap::WIDTH, 0.0),
+        pos2(800.0 - 10.0, 600.0),
+    );
+    // Below the box at the top. The jump's document y calibrates the line height.
+    let jump_y = 240.0;
+    h.click(pos2(MINIMAP_X, jump_y));
+    let jumped = h.view.scroll_pos();
+    let jumped_lines = jumped.line as f64 + f64::from(jumped.frac);
+    assert!(jumped_lines > 1.0, "jump landed on {jumped:?}");
+    let expected_y = f64::from(jump_y) / f64::from(inkmark_minimap::SCALE) - 300.0;
+    let line_h = expected_y / jumped_lines;
+    let total = h.doc.line_count() as f64 * line_h;
+
+    let press_y = 24.0;
+    let press = |y, pressed| Event::PointerButton {
+        pos: pos2(MINIMAP_X, y),
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    h.view.set_scroll_pos(ScrollPos { line: 0, frac: 0.0 });
+    h.frame(vec![
+        Event::PointerMoved(pos2(MINIMAP_X, press_y)),
+        press(press_y, true),
+    ]);
+    let held = h.view.scroll_pos();
+    assert_eq!(held.line, 0, "a press on the box jumps");
+    assert!(held.frac < 0.05, "a press on the box scrolls, {held:?}");
+
+    let dy = 90.0;
+    h.frame(vec![Event::PointerMoved(pos2(MINIMAP_X, press_y + dy))]);
+    let dragged = h.view.scroll_pos();
+    let actual = (dragged.line as f64 + f64::from(dragged.frac)) * line_h;
+    let start = Minimap::new(minimap, total, 600.0, 0.0);
+    let expected = start.drag_to(press_y + dy, start.grab(press_y));
+    assert!(
+        (actual - expected).abs() < line_h,
+        "scroll {actual} (line {dragged:?}), box-tracking target {expected}, line height {line_h}"
+    );
+
+    h.frame(vec![press(press_y + dy, false)]);
+    let before = h.head();
+    h.press(Key::ArrowRight);
+    assert!(h.view.has_focus(&h.ctx), "the pane lost focus");
+    assert_ne!(h.head(), before, "the arrow did not move the caret");
+    let len = h.doc.len();
+    h.type_text("z");
+    assert_eq!(h.doc.len(), len + 1, "typing after the drag was lost");
 }
 
 #[test]

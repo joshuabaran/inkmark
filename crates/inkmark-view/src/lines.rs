@@ -2,7 +2,7 @@
 //! document. Both panes index by source line, which makes scroll sync a
 //! matter of sharing a line number.
 
-use egui::{Id, Painter, Rect, Sense, Ui, pos2, vec2};
+use egui::{Id, Painter, Rect, Response, Sense, Ui, pos2, vec2};
 use inkmark_buffer::{Change, Document};
 use inkmark_minimap::Minimap;
 use inkmark_text::{HeightCache, ScrollAnchor};
@@ -164,19 +164,14 @@ impl LineIndex {
         )
     }
 
-    /// Click (jump, centred) and drag (scrollbar-like) on a minimap at
-    /// `rect`. Returns (scrolled, hovered).
+    /// Click outside the preview box jumps, centred on the click. A press on
+    /// the box grabs it, and a drag keeps the box under the pointer.
+    /// Returns (scrolled, hovered).
     pub fn minimap_input(&mut self, ui: &Ui, id: Id, rect: Rect, viewport: f32) -> (bool, bool) {
         let response = ui.interact(rect, id.with("minimap"), Sense::click_and_drag());
         keep_focus(ui, id, &response);
         let m = self.minimap(rect, viewport);
-        let pressed =
-            response.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed());
-        let target = match response.interact_pointer_pos() {
-            Some(p) if pressed => Some(m.jump_target(p.y)),
-            Some(p) if response.dragged() => Some(m.drag_target(p.y)),
-            _ => None,
-        };
+        let target = minimap_target(ui, response.id, &m, &response);
         if let Some(top) = target {
             self.anchor = self.heights.line_at(top);
         }
@@ -236,6 +231,44 @@ const PANE_KEYS: egui::EventFilter = egui::EventFilter {
 /// a request starts the focus over, unlocked.
 pub(crate) fn lock_focus(ui: &Ui, id: Id) {
     ui.memory_mut(|m| m.set_focus_lock_filter(id, PANE_KEYS));
+}
+
+/// Where a minimap press or drag should put the pane's top.
+///
+/// A press on the preview box records how far the pointer sits below the
+/// box and does not scroll. A press elsewhere jumps, centred on the click,
+/// and the drag that follows keeps the pointer on the box that jump made.
+/// The offset lives on the minimap widget until the button comes up.
+pub(crate) fn minimap_target(ui: &Ui, id: Id, map: &Minimap, response: &Response) -> Option<f64> {
+    let pressed = response.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed());
+    let target = match response.interact_pointer_pos() {
+        Some(p) if pressed => {
+            let preview = map.viewport_rect();
+            let on_box = p.y >= preview.top() && p.y <= preview.bottom();
+            let (top, offset) = if on_box {
+                (None, map.grab(p.y))
+            } else {
+                let top = map.jump_target(p.y);
+                (Some(top), map.grab_after_jump(p.y))
+            };
+            ui.data_mut(|data| data.insert_temp(id, offset));
+            top
+        }
+        Some(p) if response.dragged() => {
+            let offset = ui
+                .data(|data| data.get_temp::<f32>(id))
+                .unwrap_or_else(|| map.grab(p.y));
+            Some(map.drag_to(p.y, offset))
+        }
+        _ => None,
+    };
+    // A release can come without a pointer position. Drop the grab either way.
+    if response.drag_stopped() {
+        ui.data_mut(|data| {
+            data.remove_temp::<f32>(id);
+        });
+    }
+    target
 }
 
 /// Clicking a pane's scrollbar or minimap keeps (or gives) keyboard focus to

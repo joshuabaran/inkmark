@@ -5,6 +5,11 @@
 //! proportion to the pane (like VS Code's), so only a window of the document
 //! is ever sampled: cost per frame depends on the minimap's height, not the
 //! document's.
+//!
+//! Dragging the preview box keeps that box under the pointer. A short
+//! document scrolls `dy / SCALE` points for a pointer move of `dy`. A taller
+//! one keeps the same box tracking, and the window follows the scroll in
+//! proportion, so both ends of the document stay reachable.
 
 use egui::{Color32, Painter, Rect, Stroke, StrokeKind, pos2};
 
@@ -43,12 +48,22 @@ impl Minimap {
 
     /// Document y at the top of the minimap.
     pub fn window_top(&self) -> f64 {
+        self.window_top_at(self.view_top)
+    }
+
+    /// The same window, if the pane were scrolled to `view_top`.
+    fn window_top_at(&self, view_top: f64) -> f64 {
         let window = self.window_height();
-        if self.total <= window || self.total <= self.viewport {
+        let max_top = (self.total - self.viewport).max(0.0);
+        if self.total <= window || self.total <= self.viewport || max_top <= 0.0 {
             return 0.0;
         }
-        let progress = (self.view_top / (self.total - self.viewport)).clamp(0.0, 1.0);
-        progress * (self.total - window)
+        let y = view_top.clamp(0.0, max_top);
+        (y / max_top) * (self.total - window)
+    }
+
+    fn with_view_top(self, view_top: f64) -> Self {
+        Self { view_top, ..self }
     }
 
     /// The document range the minimap shows: sample these lines/blocks.
@@ -77,10 +92,53 @@ impl Minimap {
         self.clamp_top(self.to_doc(screen_y) - self.viewport / 2.0)
     }
 
-    /// New pane top while dragging: the minimap acts like a scrollbar track.
-    pub fn drag_target(&self, screen_y: f32) -> f64 {
-        let frac = f64::from((screen_y - self.rect.top()) / self.rect.height()).clamp(0.0, 1.0);
-        self.clamp_top(frac * (self.total - self.viewport))
+    /// How far `screen_y` sits below the preview box's top, in screen points.
+    /// A press on the box records this and does not scroll.
+    pub fn grab(&self, screen_y: f32) -> f32 {
+        screen_y - self.viewport_rect().top()
+    }
+
+    /// Grab offset after [`jump_target`](Self::jump_target) has centred on
+    /// `screen_y`, so a drag from that click keeps the pointer on the box
+    /// the jump produced.
+    pub fn grab_after_jump(&self, screen_y: f32) -> f32 {
+        self.with_view_top(self.jump_target(screen_y))
+            .grab(screen_y)
+    }
+
+    /// Pane top that puts the preview box `offset` screen points below
+    /// `screen_y`. `offset` comes from [`grab`](Self::grab).
+    ///
+    /// The box top moves with the pointer until the document ends. A short
+    /// document (the minimap window stays put) scrolls `dy / SCALE` document
+    /// points. A taller one uses the same screen tracking: the window moves
+    /// in proportion to the scroll, which is what keeps the box under the
+    /// pointer while the whole document stays reachable.
+    pub fn drag_to(&self, screen_y: f32, offset: f32) -> f64 {
+        let desired = screen_y - offset;
+        let max_top = (self.total - self.viewport).max(0.0);
+        if max_top <= 0.0 {
+            return 0.0;
+        }
+        // Already there: don't nudge the pane for a pointer that hasn't moved.
+        if (desired - self.viewport_rect().top()).abs() <= f32::EPSILON {
+            return self.clamp_top(self.view_top);
+        }
+        let scale = f64::from(SCALE);
+        let from_top = f64::from(desired - self.rect.top());
+        let window = self.window_height();
+        let y = if self.total <= window || self.total <= self.viewport {
+            from_top / scale
+        } else {
+            // Screen travel of the box top: the minimap, minus the box.
+            let travel = f64::from(self.rect.height()) - self.viewport * scale;
+            if travel < 1.0 {
+                let frac = (from_top / f64::from(self.rect.height())).clamp(0.0, 1.0);
+                return self.clamp_top(frac * max_top);
+            }
+            (from_top / travel) * max_top
+        };
+        self.clamp_top(y)
     }
 
     fn clamp_top(&self, top: f64) -> f64 {
@@ -159,13 +217,48 @@ mod tests {
     }
 
     #[test]
-    fn clicks_centre_and_drags_track_like_a_scrollbar() {
+    fn clicks_outside_the_box_centre_on_the_pointer() {
         let m = map(100_000.0, 0.0);
         // Click 50 pt into the minimap = 400 pt into the document; centred.
         assert_eq!(m.jump_target(150.0), 0.0);
         assert_eq!(m.jump_target(300.0), 1600.0 - 400.0);
-        assert_eq!(m.drag_target(100.0), 0.0);
-        assert_eq!(m.drag_target(500.0), 100_000.0 - 800.0);
-        assert_eq!(m.drag_target(9999.0), 100_000.0 - 800.0);
+    }
+
+    /// Box top after scrolling this minimap to `top`.
+    fn box_at(m: Minimap, top: f64) -> f32 {
+        m.with_view_top(top).viewport_rect().top()
+    }
+
+    #[test]
+    fn a_press_on_the_box_does_not_move_it_and_a_drag_tracks_the_pointer() {
+        // Short: the window stays at the top. 40 screen points is 320 document points.
+        let short = map(2000.0, 600.0);
+        let on_box = 200.0;
+        let offset = short.grab(on_box);
+        assert!((short.drag_to(on_box, offset) - 600.0).abs() < 1e-6);
+        let dragged = short.drag_to(on_box + 40.0, offset);
+        assert!((dragged - 920.0).abs() < 1e-6);
+        assert!((box_at(short, dragged) - (box_at(short, 600.0) + 40.0)).abs() < 1e-2);
+
+        // Long: the window scrolls with the pane, and the box still moves by dy.
+        let long = map(100_000.0, 20_000.0);
+        let preview = long.viewport_rect().top();
+        let held = long.grab(preview + 10.0);
+        assert!((long.drag_to(preview + 10.0, held) - 20_000.0).abs() < 1e-3);
+        let moved = long.drag_to(preview + 10.0 + 50.0, held);
+        assert!(
+            (box_at(long, moved) - (preview + 50.0)).abs() < 1e-2,
+            "box {} after a 50 pt drag, from {preview}",
+            box_at(long, moved)
+        );
+        assert!(moved > 20_000.0);
+
+        // Both ends clamp, for a short document and a long one.
+        for m in [short, long] {
+            let offset = m.grab(m.viewport_rect().top() + 8.0);
+            assert_eq!(m.drag_to(-10_000.0, offset), 0.0);
+            assert_eq!(m.drag_to(10_000.0, offset), m.total - m.viewport);
+            assert!((box_at(m, 0.0) - m.rect.top()).abs() < 1e-2);
+        }
     }
 }
