@@ -187,6 +187,7 @@ inkmark               # browses the current directory and shows recent files
 | Alt+7 | Switch to tab 7 (`tab_7`) |
 | Alt+8 | Switch to tab 8 (`tab_8`) |
 | Alt+9 | Switch to tab 9 (`tab_9`) |
+| Ctrl+Shift+T | Reopen the closed tab (`reopen_tab`) |
 
 Arrows, Home, End, Page Up, Page Down, Backspace, Enter and Tab edit as
 usual, and holding Shift extends a selection. Those keys are not in the
@@ -291,7 +292,11 @@ Opening another file keeps the unsaved tab and shows the new file beside
 it. Closing one dirty tab asks Save, Discard, or Cancel for that tab.
 Closing the window with several unsaved tabs asks once, names each file,
 and offers Save all, Discard all, or Cancel. Closing the last tab leaves
-the window open, with recent files in the empty pane. A clean file another
+the window open, with recent files in the empty pane. Starting with no
+file reopens those tabs, which one was active, and each caret and scroll
+position. Text that was not saved is not restored. A file named on the
+command line opens beside them. Ctrl+Shift+T reopens the tab closed most
+recently. A clean file another
 program changes in a background tab is reloaded, and that tab keeps its
 caret and scroll line. A dirty one is marked ↻, and the banner appears
 when that tab is selected. A missing file keeps its text
