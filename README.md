@@ -5,7 +5,7 @@
 A fast, local Markdown editor for Linux and Wayland. Plain `.md` files on
 disk are the only source of truth: no accounts, sync or plugins.
 
-![inkmark in split view: the notes folder in the sidebar, Markdown on the left, the rendered document on the right, and the heading outline, in the Tokyo Night theme](docs/screenshots/split-tokyo-night.png)
+![inkmark in split view: the notes folder in the sidebar, Markdown on the left, the rendered document on the right, and the heading outline, in the Aetheria theme](docs/screenshots/split-aetheria.png)
 
 - **Three views of one document**: split (raw Markdown left, rendered
   right), code only, or live only. Both panes are editable; one undo history.
@@ -33,26 +33,35 @@ disk are the only source of truth: no accounts, sync or plugins.
 
 <table>
 <tr>
-<td><img src="docs/screenshots/live-flexoki-light.png" alt="Live view only, Flexoki Light theme"></td>
-<td><img src="docs/screenshots/code-catppuccin-latte.png" alt="Code view only, Catppuccin Latte theme"></td>
+<td><img src="docs/screenshots/live-forest-green.png" alt="Live view only, Forest Green theme"></td>
+<td><img src="docs/screenshots/code-blackgold.png" alt="Code view only, Blackgold theme"></td>
 </tr>
 <tr>
-<td align="center">Live view · Flexoki Light</td>
-<td align="center">Code view · Catppuccin Latte</td>
+<td align="center">Live view · Forest Green</td>
+<td align="center">Code view · Blackgold</td>
 </tr>
 <tr>
-<td><img src="docs/screenshots/long-document-rose-pine.png" alt="A 5 MB book in split view with the heading outline and both minimaps, Rosé Pine theme"></td>
+<td><img src="docs/screenshots/long-document-space-monkey.png" alt="A long book in split view with the heading outline and both minimaps, Space Monkey theme"></td>
+<td><img src="docs/screenshots/tabs-blackturq.png" alt="Three notes open in tabs, split view, Blackturq theme"></td>
+</tr>
+<tr>
+<td align="center">A long book with the outline and minimaps · Space Monkey</td>
+<td align="center">Tabs · Blackturq</td>
+</tr>
+<tr>
+<td><img src="docs/screenshots/cheatsheet-solarized-osaka.png" alt="The Markdown syntax cheatsheet over a split view, Solarizedosaka theme"></td>
 <td><img src="docs/screenshots/split-built-in-dark.png" alt="Split view in inkmark's built-in dark theme"></td>
 </tr>
 <tr>
-<td align="center">A 5 MB book with the outline and minimaps · Rosé Pine</td>
+<td align="center">Syntax cheatsheet · Solarizedosaka</td>
 <td align="center">Built-in dark theme</td>
 </tr>
 </table>
 
-Tokyo Night, Flexoki Light, Catppuccin Latte, and Rosé Pine are Omarchy
-themes; inkmark follows whichever one is active. With no Omarchy palette
-it uses its own dark or light theme, shown last.
+Aetheria, Forest Green, Blackgold, Space Monkey, Blackturq, and
+Solarizedosaka are Omarchy themes. inkmark follows whichever one is
+active. With no Omarchy palette it uses its own dark or light theme,
+shown last.
 
 See [PLAN.md](PLAN.md) for the design, measurements and roadmap.
 
