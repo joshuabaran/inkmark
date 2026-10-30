@@ -1,8 +1,8 @@
 //! Drives `CodeView` through egui with synthetic input, no window needed.
 
 use egui::{
-    Event, FullOutput, Id, ImeEvent, Key, Modifiers, OutputCommand, PointerButton, Pos2, RawInput,
-    Rect, pos2,
+    Event, FullOutput, Id, ImeEvent, Key, Modifiers, MouseWheelUnit, OutputCommand, PointerButton,
+    Pos2, RawInput, Rect, TouchPhase, pos2, vec2,
 };
 use inkmark_buffer::{Document, Edit, EditKind, Selection};
 use inkmark_minimap::Minimap;
@@ -359,6 +359,26 @@ fn bench_typing_mid_document_5mb() {
 
 /// The minimap sits just left of the 10 pt scrollbar on an 800 pt screen.
 const MINIMAP_X: f32 = 800.0 - 10.0 - inkmark_minimap::WIDTH / 2.0;
+
+#[test]
+fn a_wheel_scrolls_the_code_pane() {
+    let text: String = (0..400).map(|i| format!("line {i}\n")).collect();
+    let mut h = Harness::new(&text);
+    h.frame(vec![
+        Event::PointerMoved(pos2(80.0, 80.0)),
+        Event::MouseWheel {
+            unit: MouseWheelUnit::Point,
+            delta: vec2(0.0, -240.0),
+            phase: TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    assert!(
+        h.view.scroll_pos().line > 0,
+        "wheel stayed at {:?}",
+        h.view.scroll_pos()
+    );
+}
 
 #[test]
 fn minimap_click_jumps_and_drag_tracks() {

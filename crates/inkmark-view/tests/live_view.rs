@@ -302,6 +302,26 @@ fn live_minimap_click_jumps() {
 }
 
 #[test]
+fn a_short_document_ignores_the_empty_minimap_column() {
+    let mut h = Harness::new("# Title\n\nA short note.\n");
+    let x = 800.0 - 10.0 - inkmark_minimap::WIDTH / 2.0;
+    let parse = h.parse.output().clone();
+    let before = h.view.scroll_pos(&h.doc, &parse);
+    let press = |pressed| Event::PointerButton {
+        pos: pos2(x, 520.0),
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    h.frame(vec![Event::PointerMoved(pos2(x, 520.0)), press(true)]);
+    h.frame(vec![Event::PointerMoved(pos2(x, 560.0))]);
+    h.frame(vec![press(false)]);
+    let after = h.view.scroll_pos(&h.doc, &parse);
+    assert_eq!(after.line, before.line);
+    assert!((after.frac - before.frac).abs() < 0.01);
+}
+
+#[test]
 fn live_minimap_drag_tracks() {
     // One list item per source line, so a scroll position is that many
     // equal line heights into the document.

@@ -249,6 +249,7 @@ pub(crate) fn lock_focus_ctx(ctx: &egui::Context, id: Id) {
 pub(crate) fn minimap_target(ui: &Ui, id: Id, map: &Minimap, response: &Response) -> Option<f64> {
     let pressed = response.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed());
     let target = match response.interact_pointer_pos() {
+        Some(p) if map.in_unpainted_column(p.y) => None,
         Some(p) if pressed => {
             let preview = map.viewport_rect();
             let on_box = p.y >= preview.top() && p.y <= preview.bottom();
