@@ -253,6 +253,13 @@ mod tests {
         );
         assert!(moved > 20_000.0);
 
+        // The column below a short document is unpainted. A pointer there
+        // is not the end of the document, so it does not scroll.
+        let gap = short.rect.top() + (short.total as f32) * SCALE + 40.0;
+        assert!(gap < short.rect.bottom());
+        assert_eq!(short.jump_target(gap), 600.0);
+        assert_eq!(short.drag_to(gap, offset), 600.0);
+
         // Both ends clamp, for a short document and a long one.
         for m in [short, long] {
             let offset = m.grab(m.viewport_rect().top() + 8.0);
