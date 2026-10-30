@@ -80,6 +80,19 @@ impl Minimap {
         self.window_top() + f64::from(screen_y - self.rect.top()) / f64::from(SCALE)
     }
 
+    /// Bottom of the painted document. A short document leaves the rest of
+    /// the column empty.
+    fn painted_bottom(&self) -> f32 {
+        let shown = self.total.min(self.window_top() + self.window_height());
+        self.to_screen(shown)
+    }
+
+    /// The column below a short document. That area is background, not a
+    /// scroll target. A pointer below the column still clamps to the end.
+    pub fn in_unpainted_column(&self, screen_y: f32) -> bool {
+        screen_y > self.painted_bottom() && screen_y <= self.rect.bottom()
+    }
+
     /// The pane's visible area, drawn on the minimap.
     pub fn viewport_rect(&self) -> Rect {
         let top = self.to_screen(self.view_top);
@@ -89,6 +102,9 @@ impl Minimap {
 
     /// New pane top for a click at `screen_y`: centre the view there.
     pub fn jump_target(&self, screen_y: f32) -> f64 {
+        if self.in_unpainted_column(screen_y) {
+            return self.clamp_top(self.view_top);
+        }
         self.clamp_top(self.to_doc(screen_y) - self.viewport / 2.0)
     }
 
@@ -122,6 +138,9 @@ impl Minimap {
         }
         // Already there: don't nudge the pane for a pointer that hasn't moved.
         if (desired - self.viewport_rect().top()).abs() <= f32::EPSILON {
+            return self.clamp_top(self.view_top);
+        }
+        if self.in_unpainted_column(screen_y) {
             return self.clamp_top(self.view_top);
         }
         let scale = f64::from(SCALE);
