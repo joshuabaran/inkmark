@@ -364,20 +364,23 @@ const MINIMAP_X: f32 = 800.0 - 10.0 - inkmark_minimap::WIDTH / 2.0;
 fn a_wheel_scrolls_the_code_pane() {
     let text: String = (0..400).map(|i| format!("line {i}\n")).collect();
     let mut h = Harness::new(&text);
+    h.ctx.options_mut(|options| {
+        options.input_options.line_scroll_speed = 21.0 * 5.0;
+    });
     h.frame(vec![
         Event::PointerMoved(pos2(80.0, 80.0)),
         Event::MouseWheel {
-            unit: MouseWheelUnit::Point,
-            delta: vec2(0.0, -240.0),
+            unit: MouseWheelUnit::Line,
+            delta: vec2(0.0, -1.0),
             phase: TouchPhase::Move,
             modifiers: Modifiers::NONE,
         },
     ]);
-    assert!(
-        h.view.scroll_pos().line > 0,
-        "wheel stayed at {:?}",
-        h.view.scroll_pos()
-    );
+    for _ in 0..120 {
+        h.frame(vec![]);
+    }
+    let notch = h.view.scroll_pos().line;
+    assert!(notch >= 4, "one wheel notch landed on line {notch}");
 }
 
 #[test]

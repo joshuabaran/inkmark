@@ -568,6 +568,12 @@ impl App {
 
     fn with_recent(ctx: &egui::Context, path: Option<PathBuf>, recent: recent::Recent) -> Self {
         install_ui_font(ctx);
+        // A discrete Wayland notch arrives as one line unit. egui turns that
+        // into 40 points, about one code row, so the wheel appears to step
+        // a single line. Five rows is one notch.
+        ctx.options_mut(|options| {
+            options.input_options.line_scroll_speed = (CODE_SIZE * CODE_LINE).round() * 5.0;
+        });
         // One font database and glyph atlas for both panes.
         let fonts = Fonts::shared(ctx);
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -6570,6 +6576,89 @@ mod tests {
                 find(&clip.shape, text).is_some_and(|rect| clip.clip_rect.intersects(rect))
             })
         }
+    }
+
+    #[test]
+    fn wheel_notch_and_minimap_drag_move_many_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        let text: String = (0..400)
+            .map(|i| format!("line {i} of the notes\n"))
+            .collect();
+        fs::write(&path, &text).unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        run.app.sidebar.visible = false;
+        run.app.layout.outline_visible = false;
+        run.frame(vec![]);
+        let before = run.app.tab().code.scroll_pos().line;
+        run.frame(vec![
+            egui::Event::PointerMoved(egui::pos2(120.0, 200.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, -1.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        for _ in 0..120 {
+            run.frame(vec![]);
+        }
+        let notch = run.app.tab().code.scroll_pos().line;
+        let live = run
+            .app
+            .tab()
+            .live
+            .scroll_pos(&run.app.tab().doc, run.app.tab().parse.output())
+            .line;
+        let x = 1000.0 - 10.0 - inkmark_minimap::WIDTH / 2.0;
+        // Right pane's minimap, at the screen edge. Left pane's is near the split.
+        let mini_x = x;
+        let press = |x, y, pressed| egui::Event::PointerButton {
+            pos: egui::pos2(x, y),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        run.app
+            .tab_mut()
+            .code
+            .set_scroll_pos(inkmark_view::ScrollPos { line: 0, frac: 0.0 });
+        run.frame(vec![
+            egui::Event::PointerMoved(egui::pos2(mini_x, 30.0)),
+            press(mini_x, 30.0, true),
+        ]);
+        let mut steps = Vec::new();
+        for y in [50.0, 70.0, 90.0, 140.0] {
+            run.frame(vec![egui::Event::PointerMoved(egui::pos2(mini_x, y))]);
+            steps.push(run.app.tab().code.scroll_pos().line);
+        }
+        let dragged = *steps.last().unwrap_or(&0);
+        run.frame(vec![press(mini_x, 140.0, false)]);
+        run.app
+            .tab_mut()
+            .code
+            .set_scroll_pos(inkmark_view::ScrollPos { line: 0, frac: 0.0 });
+        let bar_x = 1000.0 - 5.0;
+        run.frame(vec![
+            egui::Event::PointerMoved(egui::pos2(bar_x, 40.0)),
+            press(bar_x, 40.0, true),
+        ]);
+        run.frame(vec![egui::Event::PointerMoved(egui::pos2(bar_x, 280.0))]);
+        let bar = run
+            .app
+            .tab()
+            .live
+            .scroll_pos(&run.app.tab().doc, run.app.tab().parse.output())
+            .line;
+        assert!(
+            notch >= before + 4,
+            "notch {notch} (live {live}), minimap steps {steps:?}, bar {bar}, probe x {x}"
+        );
+        assert!(
+            dragged > 20,
+            "minimap drag landed on {dragged} after notch {notch}"
+        );
+        assert!(bar > 20, "scrollbar drag landed on {bar}");
     }
 
     #[test]
