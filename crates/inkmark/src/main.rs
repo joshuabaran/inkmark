@@ -6740,7 +6740,6 @@ mod tests {
             code > 40 && live > 40,
             "lines {lines} height {height:.0} after {height_after:.0} code {code} live {live} top {top:?}"
         );
-        // Wheel the live pane the way a Wayland notch arrives: a line unit, then End.
         run.app
             .tab_mut()
             .code
@@ -6757,12 +6756,31 @@ mod tests {
         for _ in 0..3 {
             run.frame(vec![]);
         }
-        let before = run.app.tab().live.view_top();
-        let h0 = run.app.tab().live.content_height();
-        let mut trace = Vec::new();
+        // The code pane stays focused while the pointer is over the preview.
+        // fcitx then echoes an empty preedit on every frame. Re-arming reveal
+        // from that echo pulls the code pane back to line 0, and split sync
+        // copies that onto the preview.
+        run.app.tab_mut().code.request_focus(&run.ctx);
+        run.frame(vec![]);
+        assert!(
+            run.app.tab().code.has_focus(&run.ctx),
+            "the code pane is not focused, so the preedit echo would not run"
+        );
+        let echo = || {
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: String::new(),
+                active_range_chars: None,
+            })
+        };
+        // x=700 is the live pane on the 1000-wide split. A Wayland notch is a
+        // line unit, then a later zero point move. Neither is TouchPhase::End.
+        // The first source line is taller than one notch, so the code pane
+        // can still report line 0 while sitting partway down that line.
+        let at = egui::pos2(700.0, 200.0);
         for _ in 0..4 {
             run.frame(vec![
-                egui::Event::PointerMoved(egui::pos2(700.0, 200.0)),
+                egui::Event::PointerMoved(at),
+                echo(),
                 egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Line,
                     delta: egui::vec2(0.0, -1.0),
@@ -6770,9 +6788,10 @@ mod tests {
                     modifiers: egui::Modifiers::NONE,
                 },
             ]);
-            trace.push(format!("line {:?}", run.app.tab().live.view_top()));
+            let moved = run.app.tab().code.scroll_pos();
             run.frame(vec![
-                egui::Event::PointerMoved(egui::pos2(700.0, 200.0)),
+                egui::Event::PointerMoved(at),
+                echo(),
                 egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, 0.0),
@@ -6780,19 +6799,23 @@ mod tests {
                     modifiers: egui::Modifiers::NONE,
                 },
             ]);
-            trace.push(format!("point {:?}", run.app.tab().live.view_top()));
+            let held = run.app.tab().code.scroll_pos();
+            assert!(
+                held.line > moved.line
+                    || (held.line == moved.line && held.frac + 1e-3 >= moved.frac),
+                "point event snapped the code pane back to line 0 ({held:?} from {moved:?})"
+            );
         }
-        let after = run.app.tab().live.view_top();
-        let h1 = run.app.tab().live.content_height();
         let live_line = run
             .app
             .tab()
             .live
             .scroll_pos(&run.app.tab().doc, run.app.tab().parse.output())
             .line;
+        let code_line = run.app.tab().code.scroll_pos().line;
         assert!(
-            live_line >= 4,
-            "notch ended early {before:?}->{after:?} line {live_line} h {h0:.0}->{h1:.0} trace {trace:?}"
+            code_line >= 4 && live_line >= 4,
+            "notch ended early code {code_line} live {live_line}"
         );
     }
 
