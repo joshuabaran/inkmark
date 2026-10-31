@@ -35,6 +35,9 @@ pub(crate) struct LineIndex {
     /// Heights must be re-estimated (layout changed), but edits since
     /// `synced_epoch` still need mapping first.
     heights_stale: bool,
+    /// Points of a discrete notch already applied. Later frames still emit
+    /// egui's smoothed slices of that same notch; those are skipped.
+    wheel_credit: f32,
 }
 
 impl LineIndex {
@@ -44,6 +47,7 @@ impl LineIndex {
             anchor: ScrollAnchor::default(),
             synced_epoch: None,
             heights_stale: true,
+            wheel_credit: 0.0,
         }
     }
 
@@ -146,12 +150,82 @@ impl LineIndex {
             self.anchor = self.heights.scroll_by(self.anchor, 0.0, viewport);
             scrolled = true;
         }
-        let wheel = ui.input(|i| i.smooth_scroll_delta.y);
-        if (hovered || bar_response.hovered()) && wheel != 0.0 {
+        let wheel = if hovered || bar_response.hovered() {
+            self.wheel_y(ui)
+        } else {
+            0.0
+        };
+        if wheel != 0.0 {
             self.anchor = self.heights.scroll_by(self.anchor, -wheel, viewport);
             scrolled = true;
         }
         scrolled
+    }
+
+    /// Vertical wheel delta for this frame, in the same sign as
+    /// `smooth_scroll_delta` (positive moves content down).
+    ///
+    /// A mouse notch arrives as one line unit and, on Wayland, a following
+    /// end phase. egui smooths the line unit over later frames, then the
+    /// end phase drops whatever is left, so a notch only moved one slice.
+    /// The whole notch is applied on the event frame. Slices of that same
+    /// notch are ignored. Trackpad points, which are already smooth, pass
+    /// through.
+    pub fn wheel_y(&mut self, ui: &Ui) -> f32 {
+        let (notches, smooth) = ui.input(|input| {
+            let notches = input
+                .events
+                .iter()
+                .map(|event| match event {
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta,
+                        phase: egui::TouchPhase::Move,
+                        ..
+                    } => delta.y,
+                    _ => 0.0,
+                })
+                .sum::<f32>();
+            (notches, input.smooth_scroll_delta.y)
+        });
+        // A wheel stop arrives as a zero point delta. It carries no movement,
+        // and applying the smoothed tail of the notch here scrolls backward.
+        let zero_stop = notches == 0.0
+            && ui.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta,
+                            phase: egui::TouchPhase::Move,
+                            ..
+                        } if delta.length_sq() < 1e-6
+                    )
+                })
+            });
+        if zero_stop {
+            return 0.0;
+        }
+        if notches == 0.0 && smooth == 0.0 {
+            self.wheel_credit = 0.0;
+            return 0.0;
+        }
+        let mut delta = 0.0;
+        if notches != 0.0 {
+            let speed = ui
+                .ctx()
+                .options(|options| options.input_options.line_scroll_speed);
+            let full = notches * speed;
+            delta += full;
+            self.wheel_credit = (self.wheel_credit + full.abs() - smooth.abs()).max(0.0);
+        }
+        if self.wheel_credit > 0.0 {
+            self.wheel_credit = (self.wheel_credit - smooth.abs()).max(0.0);
+        } else {
+            delta += smooth;
+        }
+        delta
     }
 
     /// The minimap for this pane at `rect`, as of this frame's scroll position.

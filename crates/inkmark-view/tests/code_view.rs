@@ -364,19 +364,93 @@ const MINIMAP_X: f32 = 800.0 - 10.0 - inkmark_minimap::WIDTH / 2.0;
 fn a_wheel_scrolls_the_code_pane() {
     let text: String = (0..400).map(|i| format!("line {i}\n")).collect();
     let mut h = Harness::new(&text);
+    h.ctx.options_mut(|options| {
+        options.input_options.line_scroll_speed = 21.0 * 5.0;
+    });
     h.frame(vec![
         Event::PointerMoved(pos2(80.0, 80.0)),
         Event::MouseWheel {
-            unit: MouseWheelUnit::Point,
-            delta: vec2(0.0, -240.0),
+            unit: MouseWheelUnit::Line,
+            delta: vec2(0.0, -1.0),
             phase: TouchPhase::Move,
             modifiers: Modifiers::NONE,
         },
     ]);
+    // Wayland follows the notch with End, which drops egui's unprocessed remainder.
+    h.frame(vec![Event::MouseWheel {
+        unit: MouseWheelUnit::Line,
+        delta: vec2(0.0, 0.0),
+        phase: TouchPhase::End,
+        modifiers: Modifiers::NONE,
+    }]);
+    for _ in 0..8 {
+        h.frame(vec![]);
+    }
+    let notch = h.view.scroll_pos().line;
+    assert!(notch >= 4, "one wheel notch landed on line {notch}");
+}
+
+/// fcitx sends `Preedit ""` on every frame after the cursor rect is set.
+/// Re-arming the caret reveal from that echo snaps a notch back to line 0.
+#[test]
+fn an_empty_preedit_echo_does_not_snap_the_wheel_back_to_line_0() {
+    let text: String = (0..400).map(|i| format!("line {i}\n")).collect();
+    let mut h = Harness::new(&text);
+    h.ctx.options_mut(|options| {
+        options.input_options.line_scroll_speed = 21.0 * 5.0;
+    });
+    let echo = || {
+        Event::Ime(ImeEvent::Preedit {
+            text: String::new(),
+            active_range_chars: None,
+        })
+    };
+    let at = pos2(80.0, 80.0);
+    let mut trace = Vec::new();
+    for _ in 0..8 {
+        h.frame(vec![
+            Event::PointerMoved(at),
+            echo(),
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Line,
+                delta: vec2(0.0, -1.0),
+                phase: TouchPhase::Move,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        let line = h.view.scroll_pos().line;
+        let reveal = h.view.reveal_caret();
+        trace.push((line, reveal));
+        // A re-armed reveal is decremented in the same frame, so it ends at 2
+        // rather than 3, and the anchor is back on line 0.
+        assert_eq!(
+            (line > 0, reveal),
+            (true, 0),
+            "notch snapped or reveal stayed armed, trace {trace:?}"
+        );
+        h.frame(vec![
+            Event::PointerMoved(at),
+            echo(),
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Point,
+                delta: vec2(0.0, 0.0),
+                phase: TouchPhase::Move,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        let line = h.view.scroll_pos().line;
+        let reveal = h.view.reveal_caret();
+        trace.push((line, reveal));
+        assert_eq!(
+            (line > 0, reveal),
+            (true, 0),
+            "point event snapped or reveal stayed armed, trace {trace:?}"
+        );
+    }
+    let end = trace.last().map(|(line, _)| *line).unwrap_or(0);
     assert!(
-        h.view.scroll_pos().line > 0,
-        "wheel stayed at {:?}",
-        h.view.scroll_pos()
+        end >= 20,
+        "eight notches ended on line {end}, trace {trace:?}"
     );
 }
 

@@ -4,13 +4,18 @@ use std::ops::Range;
 ///
 /// Heights start as estimates and are replaced as lines are laid out. Prefix
 /// sums live in a Fenwick tree so offset and hit lookups stay O(log n) on
-/// 100k+ lines.
+/// 100k+ lines. The original estimate is kept beside the laid-out height:
+/// the minimap is drawn from the estimates, so measuring a block does not
+/// move every bar below it.
 pub struct HeightCache {
     heights: Vec<f32>,
     measured: Vec<bool>,
     measured_count: usize,
     /// 1-based Fenwick tree over `heights`, summed in f64 to avoid drift.
     tree: Vec<f64>,
+    /// Estimate given to each line. Unchanged by [`Self::set_measured`].
+    estimates: Vec<f32>,
+    estimate_tree: Vec<f64>,
 }
 
 /// Scroll position as "this line is at the top, scrolled `offset` points into it".
@@ -30,6 +35,8 @@ impl HeightCache {
             measured: Vec::new(),
             measured_count: 0,
             tree: Vec::new(),
+            estimates: Vec::new(),
+            estimate_tree: Vec::new(),
         };
         cache.reset_estimates(estimates);
         cache
@@ -39,23 +46,12 @@ impl HeightCache {
     pub fn reset_estimates(&mut self, estimates: impl IntoIterator<Item = f32>) {
         self.heights.clear();
         self.heights.extend(estimates);
+        self.estimates.clone_from(&self.heights);
         self.measured.clear();
         self.measured.resize(self.heights.len(), false);
         self.measured_count = 0;
-        self.rebuild_tree();
-    }
-
-    fn rebuild_tree(&mut self) {
-        let n = self.heights.len();
-        self.tree.clear();
-        self.tree.resize(n + 1, 0.0);
-        for i in 1..=n {
-            self.tree[i] += f64::from(self.heights[i - 1]);
-            let parent = i + i.isolate_lowest_one();
-            if parent <= n {
-                self.tree[parent] += self.tree[i];
-            }
-        }
+        self.tree = fenwick(&self.heights);
+        self.estimate_tree = fenwick(&self.estimates);
     }
 
     pub fn len(&self) -> usize {
@@ -95,10 +91,15 @@ impl HeightCache {
         let delta = f64::from(height) - f64::from(self.heights[line]);
         self.heights[line] = height;
         if delta != 0.0 {
-            let mut i = line + 1;
-            while i < self.tree.len() {
-                self.tree[i] += delta;
-                i += i.isolate_lowest_one();
+            fenwick_add(&mut self.tree, line, delta);
+        }
+        // A fresh estimate replaces the remembered one. A measurement does
+        // not: the minimap keeps the estimate so later bars stay put.
+        if !measured {
+            let delta = f64::from(height) - f64::from(self.estimates[line]);
+            self.estimates[line] = height;
+            if delta != 0.0 {
+                fenwick_add(&mut self.estimate_tree, line, delta);
             }
         }
     }
@@ -107,6 +108,7 @@ impl HeightCache {
     /// heights. O(log n) per line when the line count is unchanged (typing
     /// within a line), O(n) otherwise.
     pub fn splice(&mut self, range: Range<usize>, estimates: impl ExactSizeIterator<Item = f32>) {
+        let estimates: Vec<f32> = estimates.collect();
         if estimates.len() == range.len() {
             for (line, h) in range.zip(estimates) {
                 self.set(line, h, false);
@@ -115,11 +117,14 @@ impl HeightCache {
         }
         let removed_measured = self.measured[range.clone()].iter().filter(|&&m| m).count();
         let added = estimates.len();
-        self.heights.splice(range.clone(), estimates);
+        self.heights
+            .splice(range.clone(), estimates.iter().copied());
+        self.estimates.splice(range.clone(), estimates);
         self.measured
             .splice(range, std::iter::repeat_n(false, added));
         self.measured_count -= removed_measured;
-        self.rebuild_tree();
+        self.tree = fenwick(&self.heights);
+        self.estimate_tree = fenwick(&self.estimates);
     }
 
     pub fn total(&self) -> f64 {
@@ -128,43 +133,34 @@ impl HeightCache {
 
     /// Sum of the heights of lines `0..line`.
     pub fn offset_of(&self, line: usize) -> f64 {
-        let mut sum = 0.0;
-        let mut i = line.min(self.len());
-        while i > 0 {
-            sum += self.tree[i];
-            i &= i - 1;
-        }
-        sum
+        fenwick_sum(&self.tree, line.min(self.len()))
+    }
+
+    /// The estimate originally stored for `line`, in points.
+    pub fn estimate(&self, line: usize) -> f32 {
+        self.estimates[line]
+    }
+
+    /// Sum of the estimates of lines `0..line`. Measuring a line does not
+    /// change this.
+    pub fn estimate_offset_of(&self, line: usize) -> f64 {
+        fenwick_sum(&self.estimate_tree, line.min(self.len()))
+    }
+
+    /// Sum of every line's estimate.
+    pub fn estimate_total(&self) -> f64 {
+        self.estimate_offset_of(self.len())
+    }
+
+    /// The line containing estimate-space `y`, clamped to the document.
+    /// `offset` is in estimate points, not the laid-out height.
+    pub fn estimate_line_at(&self, y: f64) -> ScrollAnchor {
+        line_at_in(&self.estimates, &self.estimate_tree, y)
     }
 
     /// The line containing document y-coordinate `y`, clamped to the document.
     pub fn line_at(&self, y: f64) -> ScrollAnchor {
-        if self.is_empty() {
-            return ScrollAnchor::default();
-        }
-        // Fenwick descent: the largest `line` with offset_of(line) <= y.
-        let mut line = 0;
-        let mut remaining = y.max(0.0);
-        let mut step = self.len().next_power_of_two();
-        while step > 0 {
-            let next = line + step;
-            if next <= self.len() && self.tree[next] <= remaining {
-                line = next;
-                remaining -= self.tree[next];
-            }
-            step >>= 1;
-        }
-        if line >= self.len() {
-            let last = self.len() - 1;
-            return ScrollAnchor {
-                line: last,
-                offset: self.heights[last],
-            };
-        }
-        ScrollAnchor {
-            line,
-            offset: (remaining as f32).min(self.heights[line]),
-        }
+        line_at_in(&self.heights, &self.tree, y)
     }
 
     pub fn anchor_y(&self, anchor: ScrollAnchor) -> f64 {
@@ -176,6 +172,67 @@ impl HeightCache {
         let max = (self.total() - f64::from(viewport)).max(0.0);
         let y = (self.anchor_y(anchor) + f64::from(delta)).clamp(0.0, max);
         self.line_at(y)
+    }
+}
+
+fn fenwick(heights: &[f32]) -> Vec<f64> {
+    let n = heights.len();
+    let mut tree = vec![0.0; n + 1];
+    for i in 1..=n {
+        tree[i] += f64::from(heights[i - 1]);
+        let parent = i + i.isolate_lowest_one();
+        if parent <= n {
+            tree[parent] += tree[i];
+        }
+    }
+    tree
+}
+
+fn fenwick_add(tree: &mut [f64], line: usize, delta: f64) {
+    let mut i = line + 1;
+    while i < tree.len() {
+        tree[i] += delta;
+        i += i.isolate_lowest_one();
+    }
+}
+
+fn fenwick_sum(tree: &[f64], line: usize) -> f64 {
+    let mut sum = 0.0;
+    let mut i = line;
+    while i > 0 {
+        sum += tree[i];
+        i &= i - 1;
+    }
+    sum
+}
+
+fn line_at_in(heights: &[f32], tree: &[f64], y: f64) -> ScrollAnchor {
+    let len = heights.len();
+    if len == 0 {
+        return ScrollAnchor::default();
+    }
+    // Fenwick descent: the largest `line` with offset_of(line) <= y.
+    let mut line = 0;
+    let mut remaining = y.max(0.0);
+    let mut step = len.next_power_of_two();
+    while step > 0 {
+        let next = line + step;
+        if next <= len && tree[next] <= remaining {
+            line = next;
+            remaining -= tree[next];
+        }
+        step >>= 1;
+    }
+    if line >= len {
+        let last = len - 1;
+        return ScrollAnchor {
+            line: last,
+            offset: heights[last],
+        };
+    }
+    ScrollAnchor {
+        line,
+        offset: (remaining as f32).min(heights[line]),
     }
 }
 
@@ -290,6 +347,41 @@ mod tests {
         for line in [0, 10, 13, 14, 99, 100, 101, heights.len()] {
             assert!((cache.offset_of(line) - naive_offset(&heights, line)).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn measuring_a_line_keeps_its_estimate() {
+        let mut cache = HeightCache::new([10.0, 20.0, 30.0]);
+        cache.set_measured(1, 5.0);
+        assert!((cache.offset_of(3) - 45.0).abs() < 1e-6);
+        assert!((cache.estimate_offset_of(3) - 60.0).abs() < 1e-6);
+        assert_eq!(cache.estimate(1), 20.0);
+        assert_eq!(
+            cache.estimate_line_at(10.0),
+            ScrollAnchor {
+                line: 1,
+                offset: 0.0
+            }
+        );
+        assert_eq!(
+            cache.estimate_line_at(29.0),
+            ScrollAnchor {
+                line: 1,
+                offset: 19.0
+            }
+        );
+        // A y on the boundary is the start of the next line, same as line_at.
+        assert_eq!(
+            cache.estimate_line_at(30.0),
+            ScrollAnchor {
+                line: 2,
+                offset: 0.0
+            }
+        );
+        // A new estimate, from an edit, replaces the remembered one.
+        cache.splice(1..2, [7.0].into_iter());
+        assert_eq!(cache.estimate(1), 7.0);
+        assert!((cache.estimate_total() - 47.0).abs() < 1e-6);
     }
 
     #[test]

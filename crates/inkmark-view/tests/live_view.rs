@@ -535,6 +535,43 @@ fn line_of(src: &str, needle: &str) -> usize {
     src[..src.find(needle).unwrap()].matches('\n').count()
 }
 
+/// Laying a block out changes its scroll height. The minimap is drawn from
+/// the estimates, so that replacement must not move a block's bar.
+#[test]
+fn scrolling_does_not_reflow_the_minimap() {
+    let src = parts(80);
+    let mut h = Harness::new(&src);
+    let line = line_of(&src, "## Part 40");
+    let before = h.view.overview_offset(line);
+    let height_before = h.view.content_height();
+    let mut events = vec![Event::PointerMoved(pos2(80.0, 80.0))];
+    for _ in 0..24 {
+        events.push(Event::MouseWheel {
+            unit: MouseWheelUnit::Point,
+            delta: vec2(0.0, -40.0),
+            phase: TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        });
+    }
+    h.frame(events);
+    h.frame(vec![]);
+    let parse = h.parse.output().clone();
+    assert!(
+        h.view.scroll_pos(&h.doc, &parse).line > 0,
+        "the wheel did not scroll"
+    );
+    assert_eq!(
+        h.view.overview_offset(line),
+        before,
+        "minimap moved the block at line {line}"
+    );
+    let height_after = h.view.content_height();
+    assert!(
+        (height_after - height_before).abs() > 1.0,
+        "scroll never replaced an estimate ({height_before} -> {height_after}), so a reflow would not show up"
+    );
+}
+
 #[test]
 fn a_cold_jump_to_the_end_lays_out_only_the_screen() {
     let src = parts(400);
