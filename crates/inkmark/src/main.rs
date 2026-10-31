@@ -6600,7 +6600,13 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             },
         ]);
-        for _ in 0..120 {
+        run.frame(vec![egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 0.0),
+            phase: egui::TouchPhase::End,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        for _ in 0..8 {
             run.frame(vec![]);
         }
         let notch = run.app.tab().code.scroll_pos().line;
@@ -6682,6 +6688,112 @@ mod tests {
         run.key(egui::Key::Z, egui::Modifiers::COMMAND);
         assert_eq!(text(&run.app), "one cat\ntwo cat\n");
         assert!(!run.app.tab().doc.can_undo());
+    }
+
+    #[test]
+    fn content_md_scrolls_past_the_first_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        let text: String = (0..80)
+            .map(|i| format!("section {i}. {}\n\n", "word ".repeat(40)))
+            .collect();
+        fs::write(&path, &text).unwrap();
+        let mut run = Run::new(dir.path(), Some(path));
+        run.app.sidebar.visible = false;
+        run.app.layout.outline_visible = false;
+        for _ in 0..5 {
+            run.frame(vec![]);
+        }
+        let lines = run.app.tab().doc.line_count();
+        let height = run.app.tab().live.content_height();
+        run.app
+            .tab_mut()
+            .code
+            .set_scroll_pos(inkmark_view::ScrollPos {
+                line: 80,
+                frac: 0.0,
+            });
+        {
+            let tab = run.app.tab_mut();
+            let pos = inkmark_view::ScrollPos {
+                line: 80,
+                frac: 0.0,
+            };
+            let doc_lines = tab.doc.line_count();
+            let parse = tab.parse.output().clone();
+            tab.live.set_scroll_pos(&tab.doc, &parse, pos);
+            let _ = doc_lines;
+        }
+        for _ in 0..5 {
+            run.frame(vec![]);
+        }
+        let code = run.app.tab().code.scroll_pos().line;
+        let live = run
+            .app
+            .tab()
+            .live
+            .scroll_pos(&run.app.tab().doc, run.app.tab().parse.output())
+            .line;
+        let top = run.app.tab().live.view_top();
+        let height_after = run.app.tab().live.content_height();
+        assert!(
+            code > 40 && live > 40,
+            "lines {lines} height {height:.0} after {height_after:.0} code {code} live {live} top {top:?}"
+        );
+        // Wheel the live pane the way a Wayland notch arrives: a line unit, then End.
+        run.app
+            .tab_mut()
+            .code
+            .set_scroll_pos(inkmark_view::ScrollPos { line: 0, frac: 0.0 });
+        {
+            let tab = run.app.tab_mut();
+            let parse = tab.parse.output().clone();
+            tab.live.set_scroll_pos(
+                &tab.doc,
+                &parse,
+                inkmark_view::ScrollPos { line: 0, frac: 0.0 },
+            );
+        }
+        for _ in 0..3 {
+            run.frame(vec![]);
+        }
+        let before = run.app.tab().live.view_top();
+        let h0 = run.app.tab().live.content_height();
+        let mut trace = Vec::new();
+        for _ in 0..4 {
+            run.frame(vec![
+                egui::Event::PointerMoved(egui::pos2(700.0, 200.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -1.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            trace.push(format!("line {:?}", run.app.tab().live.view_top()));
+            run.frame(vec![
+                egui::Event::PointerMoved(egui::pos2(700.0, 200.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, 0.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            trace.push(format!("point {:?}", run.app.tab().live.view_top()));
+        }
+        let after = run.app.tab().live.view_top();
+        let h1 = run.app.tab().live.content_height();
+        let live_line = run
+            .app
+            .tab()
+            .live
+            .scroll_pos(&run.app.tab().doc, run.app.tab().parse.output())
+            .line;
+        assert!(
+            live_line >= 4,
+            "notch ended early {before:?}->{after:?} line {live_line} h {h0:.0}->{h1:.0} trace {trace:?}"
+        );
     }
 
     #[test]

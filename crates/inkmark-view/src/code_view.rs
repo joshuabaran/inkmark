@@ -289,6 +289,12 @@ impl CodeView {
         ctx.memory(|m| m.has_focus(self.id))
     }
 
+    /// Frames left before a caret reveal stops pulling the view. Zero once
+    /// the caret is on screen, or when nothing has asked to reveal it.
+    pub fn reveal_caret(&self) -> u8 {
+        self.reveal_caret
+    }
+
     /// Where the view is scrolled to, as a source line and fraction.
     pub fn scroll_pos(&self) -> ScrollPos {
         if let Some(pos) = self.pending_scroll {
@@ -1034,6 +1040,13 @@ impl CodeView {
                     }
                 }
                 Event::Ime(ImeEvent::Preedit { text, .. }) => {
+                    // fcitx echoes the current preedit, including an empty
+                    // one, on every frame once the cursor rectangle is set.
+                    // Arming reveal for an unchanged echo scrolls the caret
+                    // back on screen and undoes a wheel.
+                    if text == self.preedit {
+                        continue;
+                    }
                     if self.preedit.is_empty() && !text.is_empty() {
                         let range = self.selection.range();
                         self.delete(doc, range, EditKind::Other);

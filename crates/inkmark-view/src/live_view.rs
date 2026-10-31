@@ -451,6 +451,13 @@ impl LiveView {
         self.lines.heights.total()
     }
 
+    /// Where `line` sits in the minimap. Layout replaces a line's height
+    /// in the scroll cache, and this offset does not follow that, so the
+    /// overview stays put while the pane scrolls.
+    pub fn overview_offset(&self, line: usize) -> f64 {
+        self.lines.heights.estimate_offset_of(line)
+    }
+
     pub fn take_scrolled(&mut self) -> bool {
         std::mem::take(&mut self.scrolled)
     }
@@ -461,16 +468,20 @@ impl LiveView {
         if let Some(pos) = self.pending_scroll {
             return pos;
         }
+        self.source_at(doc, parse, self.lines.anchor)
+    }
+
+    /// `anchor` as a source line and a fraction through that line. Inside a
+    /// block the height sits on the first line once laid out, and on every
+    /// line's estimate before that; the fraction walks the block's lines
+    /// either way.
+    fn source_at(&self, doc: &Document, parse: &ParseOutput, anchor: ScrollAnchor) -> ScrollPos {
         let heights = &self.lines.heights;
-        let anchor = self.lines.anchor;
         if anchor.line >= heights.len() {
             return ScrollPos::default();
         }
         match leaf_lines(doc, parse, anchor.line) {
             Some((first, last)) => {
-                // The block's height is everything from its first line to
-                // the line after it: measured, it all sits on the first
-                // line; not yet drawn, it's spread over every line's estimate.
                 let top = heights.offset_of(first);
                 let height = (heights.offset_of(last + 1) - top).max(1.0);
                 let progress = ((heights.anchor_y(anchor) - top) / height).clamp(0.0, 1.0) as f32;
@@ -485,6 +496,41 @@ impl LiveView {
                 frac: anchor.offset / heights.height(anchor.line).max(1.0),
             },
         }
+    }
+
+    /// `pos` in the estimate space the minimap is drawn in.
+    fn estimate_y(&self, pos: ScrollPos) -> f64 {
+        let heights = &self.lines.heights;
+        if pos.line >= heights.len() {
+            return heights.estimate_total();
+        }
+        let h = f64::from(heights.estimate(pos.line));
+        heights.estimate_offset_of(pos.line) + f64::from(pos.frac.clamp(0.0, 1.0)) * h
+    }
+
+    /// The minimap for this frame. Bars and the viewport box are both in
+    /// estimate space, so a block laid out while scrolling does not slide
+    /// the overview under the box.
+    fn overview(
+        &self,
+        doc: &Document,
+        parse: &ParseOutput,
+        rect: Rect,
+        viewport: f32,
+    ) -> inkmark_minimap::Minimap {
+        let heights = &self.lines.heights;
+        let total = heights.estimate_total();
+        if heights.is_empty() {
+            return inkmark_minimap::Minimap::new(rect, 0.0, viewport, 0.0);
+        }
+        let top = self.source_at(doc, parse, self.lines.anchor);
+        let bottom_y = heights.anchor_y(self.lines.anchor) + f64::from(viewport);
+        let bottom = self.source_at(doc, parse, heights.line_at(bottom_y));
+        let y0 = self.estimate_y(top);
+        let y1 = self.estimate_y(bottom).max(y0);
+        let min_box = f64::from(heights.estimate(top.line).max(1.0));
+        let span = (y1 - y0).max(min_box.min(total.max(1.0)));
+        inkmark_minimap::Minimap::new(rect, total, span as f32, y0)
     }
 
     /// Scrolls to `pos`, the inverse of [`scroll_pos`](Self::scroll_pos).
@@ -808,8 +854,9 @@ impl LiveView {
     }
 
     /// If the anchor sits in a block that is still estimated, remember how
-    /// far through that estimate it was, measure the block, and park on the
-    /// first line at the same fraction of the real height.
+    /// many points into that estimate it was, measure the block, and keep
+    /// that distance. A fraction of the estimate snaps the view back to the
+    /// top, because the estimate is taller than the laid-out block.
     fn collapse_anchor_block(&mut self, doc: &Document, parse: &ParseOutput, width: f32) {
         let line = self.lines.anchor.line;
         if line >= self.lines.heights.len() {
@@ -820,19 +867,26 @@ impl LiveView {
                 return;
             }
             let top = self.lines.heights.offset_of(first);
-            let bottom = self
-                .lines
-                .heights
-                .offset_of((last + 1).min(self.lines.heights.len()));
-            let span = (bottom - top).max(1e-3);
             let y = self.lines.heights.anchor_y(self.lines.anchor);
-            let progress = ((y - top) / span).clamp(0.0, 1.0);
+            // Pixels into the block, not a fraction of the estimate. The
+            // estimate is often far taller than the laid-out block, and the
+            // fraction then snaps a real scroll back to the top of it.
+            let into = (y - top).max(0.0);
             self.store_block(doc, parse, first, width);
-            let real = self.lines.heights.height(first);
-            self.lines.anchor = ScrollAnchor {
-                line: first,
-                offset: (progress as f32) * real,
-            };
+            let real = f64::from(self.lines.heights.height(first));
+            let past = (into - real).max(0.0);
+            if past == 0.0 {
+                self.lines.anchor = ScrollAnchor {
+                    line: first,
+                    offset: into as f32,
+                };
+            } else {
+                let after = self
+                    .lines
+                    .heights
+                    .offset_of((last + 1).min(self.lines.heights.len()));
+                self.lines.anchor = self.lines.heights.line_at(after + past);
+            }
             return;
         }
         if self.lines.heights.is_measured(line) {
@@ -1106,11 +1160,24 @@ impl LiveView {
             let hit = ui.interact(rect, self.id.with("minimap"), Sense::click_and_drag());
             lines::keep_focus(ui, self.id, &hit);
             minimap_hovered = hit.hovered();
-            let map = self.lines.minimap(rect, viewport);
+            let map = self.overview(doc, parse, rect, viewport);
             // The minimap sits outside the text area, so the drag is `hit`'s.
+            // `top` is in estimate space, the same space the bars are drawn in.
             let target = lines::minimap_target(ui, hit.id, &map, &hit);
-            if let Some(top) = target {
-                self.lines.anchor = self.lines.heights.line_at(top);
+            if let Some(top) = target
+                && !self.lines.heights.is_empty()
+            {
+                let hit_line = self.lines.heights.estimate_line_at(top);
+                let h = self.lines.heights.estimate(hit_line.line).max(0.001);
+                self.apply_scroll_pos(
+                    doc,
+                    parse,
+                    ScrollPos {
+                        line: hit_line.line,
+                        frac: (hit_line.offset / h).clamp(0.0, 1.0),
+                    },
+                    width,
+                );
                 self.lines.anchor = self
                     .lines
                     .heights
@@ -1132,7 +1199,11 @@ impl LiveView {
                 .scroll_by(self.lines.anchor, 0.0, viewport);
             scrolled = true;
         }
-        let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+        let wheel = if hovered || bar_response.hovered() || minimap_hovered {
+            self.lines.wheel_y(ui)
+        } else {
+            0.0
+        };
         if (hovered || bar_response.hovered() || minimap_hovered) && wheel != 0.0 {
             let delta = -wheel;
             self.settle(doc, parse, width, viewport, f64::from(delta));
@@ -1818,11 +1889,18 @@ impl LiveView {
                     self.replace_selection(doc, &text, EditKind::Typing)
                 }
                 Event::Ime(ImeEvent::Preedit { text, .. }) => {
-                    let starting = self.preedit.is_empty() && !text.is_empty();
-                    self.preedit = text;
-                    self.reveal_caret = REVEAL_FRAMES;
-                    let range = self.selection.range();
-                    starting && self.delete(doc, range, EditKind::Other)
+                    // An unchanged echo, including the empty preedit fcitx
+                    // sends every frame, must not arm reveal. That countdown
+                    // would pull the caret back on screen and undo a scroll.
+                    if text == self.preedit {
+                        false
+                    } else {
+                        let starting = self.preedit.is_empty() && !text.is_empty();
+                        self.preedit = text;
+                        self.reveal_caret = REVEAL_FRAMES;
+                        let range = self.selection.range();
+                        starting && self.delete(doc, range, EditKind::Other)
+                    }
                 }
                 Event::Ime(ImeEvent::Commit(text)) => {
                     self.preedit.clear();
@@ -2586,20 +2664,20 @@ impl LiveView {
         if heights.is_empty() {
             return;
         }
-        let m = self.lines.minimap(rect, viewport);
+        let m = self.overview(doc, parse, rect, viewport);
         m.paint_background(painter, self.theme.mini_background);
         let (top, bottom) = m.window();
         let row = f64::from(self.text.row_height());
-        let start = heights.line_at(top).line;
+        let start = heights.estimate_line_at(top).line;
         for leaf in parse.blocks.leaves_from(doc.line_to_byte(start)) {
             let r = &leaf.block.range;
             let first = doc.byte_to_line(r.start);
             let last = doc.byte_to_line(r.end.saturating_sub(1).max(r.start));
-            let y = heights.offset_of(first);
+            let y = self.overview_offset(first);
             if y > bottom {
                 break;
             }
-            let h = heights.offset_of(last + 1) - y;
+            let h = self.overview_offset(last + 1) - y;
             let indent = (leaf
                 .containers
                 .iter()
