@@ -601,8 +601,8 @@ impl App {
             tabs: vec![Tab {
                 id: 1,
                 doc: Document::default(),
-                code: CodeView::with_fonts(fonts.clone(), egui::Id::new(("code_view", 1u64))),
-                live: LiveView::with_fonts(fonts.clone(), egui::Id::new(("live_view", 1u64))),
+                code: CodeView::with_fonts(fonts.clone(), egui::Id::unique(("code_view", 1u64))),
+                live: LiveView::with_fonts(fonts.clone(), egui::Id::unique(("live_view", 1u64))),
                 // GitHub Flavored Markdown; PulldownParser is plain CommonMark.
                 parse: ParseState::new(Arc::new(GfmParser), &Document::default(), move || {
                     parse_ctx.request_repaint()
@@ -1362,12 +1362,12 @@ impl App {
         } else {
             Pane::Code
         };
-        let mut code = CodeView::with_fonts(fonts.clone(), egui::Id::new(("code_view", id)));
+        let mut code = CodeView::with_fonts(fonts.clone(), egui::Id::unique(("code_view", id)));
         code.font_size = code_size;
         code.line_height = code_height;
         code.show_minimap = code_minimap;
         code.set_keys(keys.clone());
-        let mut live = LiveView::with_fonts(fonts, egui::Id::new(("live_view", id)));
+        let mut live = LiveView::with_fonts(fonts, egui::Id::unique(("live_view", id)));
         live.font_size = text_size;
         live.line_height = text_height;
         live.show_minimap = live_minimap;
@@ -2598,7 +2598,7 @@ impl App {
             || self.trash_confirm.is_some();
         if self.tabs.is_empty() {
             if open {
-                ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("file_browser")));
+                ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique("file_browser")));
             }
             self.modal_was_open = open;
             return;
@@ -2607,14 +2607,14 @@ impl App {
         // is open. Releasing the browser keeps the sidebar from taking keys.
         // The editor is focused again when the overlay closes (CRO-128).
         if self.overlay_open() {
-            ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("file_browser")));
+            ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique("file_browser")));
             self.modal_was_open = true;
             return;
         }
         if open {
             self.tab_mut().code.release_focus(ctx);
             self.tab_mut().live.release_focus(ctx);
-            ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("file_browser")));
+            ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique("file_browser")));
         } else if self.modal_was_open {
             self.restore_editor_focus(ctx);
         }
@@ -2651,7 +2651,7 @@ impl App {
             selected = (selected + 1).min(entries.len() - 1);
         }
         let mut chosen = enter.then(|| entries[selected].clone());
-        egui::Modal::new(egui::Id::new("recent")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("recent")).show(ctx, |ui| {
             ui.set_min_width(480.0);
             ui.heading("Recent files");
             ui.add_space(6.0);
@@ -2806,7 +2806,7 @@ impl App {
             }
         };
         let mut choice = None;
-        egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
             if all {
                 ui.label("These files have unsaved changes:");
                 for label in &labels {
@@ -2985,7 +2985,7 @@ impl App {
             self.close_keys();
             return;
         }
-        let field = egui::Id::new("keys_filter");
+        let field = egui::Id::unique("keys_filter");
         let os = ctx.os();
         // Stay inside a small window. 640×420 is the preferred size; the
         // e2e viewport is 480×320, and a fixed minimum overflows it.
@@ -2997,7 +2997,7 @@ impl App {
         // e2e viewport is 480×320.
         let width = max_w.min(640.0);
         let list_h = (max_h - 140.0).clamp(80.0, 420.0);
-        egui::Modal::new(egui::Id::new("keys")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("keys")).show(ctx, |ui| {
             ui.set_width(width);
             ui.heading("Key bindings");
             ui.add_space(4.0);
@@ -3135,9 +3135,9 @@ impl App {
         let width = max_w.min(760.0);
         let list_h = (max_h - 160.0).clamp(80.0, 480.0);
         let close = self.keys.platform_text(ctx.os(), Action::ShowSyntax);
-        let sheet = egui::Id::new("syntax_sheet");
+        let sheet = egui::Id::unique("syntax_sheet");
         let mut clicked = None;
-        egui::Modal::new(egui::Id::new("syntax")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("syntax")).show(ctx, |ui| {
             ui.set_width(width);
             // A focus target on this layer, so the pane underneath gives up
             // the keyboard. Registered before the rows, so a row click stays
@@ -3471,7 +3471,7 @@ impl App {
             .tabs
             .iter()
             .any(|tab| tab.doc.path().is_some_and(|open| open.starts_with(&path)));
-        egui::Modal::new(egui::Id::new("trash")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("trash")).show(ctx, |ui| {
             ui.set_min_width(420.0);
             ui.heading(format!("Move “{}” to the trash?", display_name(&path)));
             ui.label("You can restore it from your file manager's trash.");
@@ -3627,8 +3627,11 @@ impl App {
             let handle =
                 Rect::from_min_max(pos2(cursor, rect.top()), pos2(cursor + gap, rect.bottom()));
             cursor = handle.right();
-            let handle_resp =
-                ui.interact(handle, egui::Id::new("sidebar_split"), egui::Sense::drag());
+            let handle_resp = ui.interact(
+                handle,
+                egui::Id::unique("sidebar_split"),
+                egui::Sense::drag(),
+            );
             if handle_resp.hovered() || handle_resp.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
@@ -3693,8 +3696,11 @@ impl App {
                 pos2(panes_right + gap, rect.bottom()),
             );
             let outline_rect = Rect::from_min_max(pos2(divider.right(), rect.top()), rect.max);
-            let handle_resp =
-                ui.interact(divider, egui::Id::new("outline_split"), egui::Sense::drag());
+            let handle_resp = ui.interact(
+                divider,
+                egui::Id::unique("outline_split"),
+                egui::Sense::drag(),
+            );
             if handle_resp.hovered() || handle_resp.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
@@ -4291,7 +4297,7 @@ impl App {
                     pos2(mid - hit_half, rect.top()),
                     pos2(mid + hit_half, rect.bottom()),
                 );
-                let handle = ui.interact(hit, egui::Id::new("pane_split"), egui::Sense::drag());
+                let handle = ui.interact(hit, egui::Id::unique("pane_split"), egui::Sense::drag());
                 if handle.hovered() || handle.dragged() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
@@ -4614,8 +4620,8 @@ fn name_modal(
             i.consume_key(Modifiers::NONE, Key::Escape),
         )
     });
-    let field = egui::Id::new((id, "name"));
-    egui::Modal::new(egui::Id::new(id)).show(ctx, |ui| {
+    let field = egui::Id::unique((id, "name"));
+    egui::Modal::new(egui::Id::unique(id)).show(ctx, |ui| {
         ui.set_min_width(420.0);
         ui.heading(heading);
         ui.label(detail);
@@ -6597,6 +6603,7 @@ mod tests {
                 unit: egui::MouseWheelUnit::Line,
                 delta: egui::vec2(0.0, -1.0),
                 phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
                 modifiers: egui::Modifiers::NONE,
             },
         ]);
@@ -6604,6 +6611,7 @@ mod tests {
             unit: egui::MouseWheelUnit::Line,
             delta: egui::vec2(0.0, 0.0),
             phase: egui::TouchPhase::End,
+            source: egui::MouseWheelSource::Wheel,
             modifiers: egui::Modifiers::NONE,
         }]);
         for _ in 0..8 {
@@ -6785,6 +6793,7 @@ mod tests {
                     unit: egui::MouseWheelUnit::Line,
                     delta: egui::vec2(0.0, -1.0),
                     phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
                     modifiers: egui::Modifiers::NONE,
                 },
             ]);
@@ -6796,6 +6805,7 @@ mod tests {
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, 0.0),
                     phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
                     modifiers: egui::Modifiers::NONE,
                 },
             ]);
@@ -8318,7 +8328,7 @@ mod tests {
         assert!(run.text_rect("Filter by name or key").is_some());
         assert!(
             run.ctx
-                .memory(|m| m.has_focus(egui::Id::new("keys_filter"))),
+                .memory(|m| m.has_focus(egui::Id::unique("keys_filter"))),
             "the filter takes focus when the list opens"
         );
         // A later frame must not ask for focus again, and must not hand
@@ -8326,7 +8336,7 @@ mod tests {
         run.frame(vec![]);
         assert!(
             run.ctx
-                .memory(|m| m.has_focus(egui::Id::new("keys_filter"))),
+                .memory(|m| m.has_focus(egui::Id::unique("keys_filter"))),
             "the filter keeps focus"
         );
         assert!(!run.app.tab().code.has_focus(&run.ctx));
@@ -8342,7 +8352,7 @@ mod tests {
         assert_eq!(run.app.keys_query, "reopen");
         assert!(
             run.ctx
-                .memory(|m| m.has_focus(egui::Id::new("keys_filter")))
+                .memory(|m| m.has_focus(egui::Id::unique("keys_filter")))
         );
         assert_eq!(text(&run.app), "hello\n");
         assert!(run.text_rect("Tabs").is_some());
@@ -8386,7 +8396,7 @@ mod tests {
         );
         assert!(
             run.ctx
-                .memory(|m| m.has_focus(egui::Id::new("keys_filter")))
+                .memory(|m| m.has_focus(egui::Id::unique("keys_filter")))
         );
 
         run.app.keys_query = "zzzzz".into();
@@ -8420,7 +8430,7 @@ mod tests {
         }
         assert!(
             run.ctx
-                .memory(|m| m.has_focus(egui::Id::new("keys_filter")))
+                .memory(|m| m.has_focus(egui::Id::unique("keys_filter")))
         );
         run.frame(vec![egui::Event::Text("alt+1".into())]);
         assert!(run.text_rect("Switch to tab 1").is_some());
@@ -8439,7 +8449,7 @@ mod tests {
         run.frame(vec![]);
         assert!(
             run.ctx
-                .memory(|m| m.has_focus(egui::Id::new("keys_filter")))
+                .memory(|m| m.has_focus(egui::Id::unique("keys_filter")))
         );
         assert!(!run.app.tab().live.has_focus(&run.ctx));
         run.key(egui::Key::F1, egui::Modifiers::NONE);
@@ -8478,7 +8488,7 @@ mod tests {
         }
         assert!(
             run.ctx
-                .memory(|m| m.has_focus(egui::Id::new("keys_filter")))
+                .memory(|m| m.has_focus(egui::Id::unique("keys_filter")))
         );
         run.key(egui::Key::Escape, egui::Modifiers::NONE);
         assert!(!run.app.show_keys);
@@ -8517,7 +8527,7 @@ mod tests {
         }
         assert!(
             run.ctx
-                .memory(|m| m.has_focus(egui::Id::new("keys_filter")))
+                .memory(|m| m.has_focus(egui::Id::unique("keys_filter")))
         );
     }
 
@@ -8546,7 +8556,7 @@ mod tests {
                     .is_some_and(|rect| rect.height() > 8.0);
             let focused = run
                 .ctx
-                .memory(|m| m.has_focus(egui::Id::new("syntax_sheet")));
+                .memory(|m| m.has_focus(egui::Id::unique("syntax_sheet")));
             if painted && focused {
                 break;
             }
@@ -8561,7 +8571,7 @@ mod tests {
         );
         assert!(
             run.ctx
-                .memory(|m| m.has_focus(egui::Id::new("syntax_sheet"))),
+                .memory(|m| m.has_focus(egui::Id::unique("syntax_sheet"))),
             "the cheatsheet takes focus"
         );
         assert!(!run.app.tab().code.has_focus(&run.ctx));
@@ -8619,7 +8629,7 @@ mod tests {
         for _ in 0..4 {
             if run
                 .ctx
-                .memory(|m| m.has_focus(egui::Id::new("syntax_sheet")))
+                .memory(|m| m.has_focus(egui::Id::unique("syntax_sheet")))
             {
                 break;
             }
@@ -8704,7 +8714,7 @@ mod tests {
                 .is_some_and(|rect| rect.height() > 8.0);
             let focused = run
                 .ctx
-                .memory(|m| m.has_focus(egui::Id::new("syntax_sheet")));
+                .memory(|m| m.has_focus(egui::Id::unique("syntax_sheet")));
             if painted && focused {
                 break;
             }
@@ -8712,7 +8722,7 @@ mod tests {
         }
         assert!(
             run.ctx
-                .memory(|m| m.has_focus(egui::Id::new("syntax_sheet")))
+                .memory(|m| m.has_focus(egui::Id::unique("syntax_sheet")))
         );
         assert_eq!(run.app.tab().code.selection(), selected);
         assert_eq!(text(&run.app), "hello\n");
@@ -10160,7 +10170,7 @@ mod tests {
         }
         assert!(run.app.tabs.is_empty());
         run.ctx
-            .memory_mut(|m| m.surrender_focus(egui::Id::new("file_browser")));
+            .memory_mut(|m| m.surrender_focus(egui::Id::unique("file_browser")));
         let size = egui::vec2(1000.0, 200.0);
         run.frame_sized(vec![], size);
         assert_eq!(run.app.empty_recent, 0);

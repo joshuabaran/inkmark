@@ -1,8 +1,8 @@
 //! Drives `CodeView` through egui with synthetic input, no window needed.
 
 use egui::{
-    Event, FullOutput, Id, ImeEvent, Key, Modifiers, MouseWheelUnit, OutputCommand, PointerButton,
-    Pos2, RawInput, Rect, TouchPhase, pos2, vec2,
+    Event, FullOutput, Id, ImeEvent, Key, Modifiers, MouseWheelSource, MouseWheelUnit,
+    OutputCommand, PointerButton, Pos2, RawInput, Rect, TouchPhase, pos2, vec2,
 };
 use inkmark_buffer::{Document, Edit, EditKind, Selection};
 use inkmark_minimap::Minimap;
@@ -22,7 +22,7 @@ struct Harness {
 impl Harness {
     fn new(text: &str) -> Self {
         let ctx = egui::Context::default();
-        let view = CodeView::new(&ctx, Id::new("code"));
+        let view = CodeView::new(&ctx, Id::unique("code"));
         let mut h = Self {
             ctx,
             view,
@@ -297,7 +297,7 @@ fn edits_from_elsewhere_shift_the_caret() {
 #[test]
 fn unfocused_view_ignores_keys() {
     let mut h = Harness::new("abc");
-    h.ctx.memory_mut(|m| m.surrender_focus(Id::new("code")));
+    h.ctx.memory_mut(|m| m.surrender_focus(Id::unique("code")));
     h.frame(vec![]);
     h.type_text("zzz");
     assert_eq!(h.text(), "abc");
@@ -373,6 +373,7 @@ fn a_wheel_scrolls_the_code_pane() {
             unit: MouseWheelUnit::Line,
             delta: vec2(0.0, -1.0),
             phase: TouchPhase::Move,
+            source: MouseWheelSource::Wheel,
             modifiers: Modifiers::NONE,
         },
     ]);
@@ -381,6 +382,7 @@ fn a_wheel_scrolls_the_code_pane() {
         unit: MouseWheelUnit::Line,
         delta: vec2(0.0, 0.0),
         phase: TouchPhase::End,
+        source: MouseWheelSource::Wheel,
         modifiers: Modifiers::NONE,
     }]);
     for _ in 0..8 {
@@ -415,6 +417,7 @@ fn an_empty_preedit_echo_does_not_snap_the_wheel_back_to_line_0() {
                 unit: MouseWheelUnit::Line,
                 delta: vec2(0.0, -1.0),
                 phase: TouchPhase::Move,
+                source: MouseWheelSource::Wheel,
                 modifiers: Modifiers::NONE,
             },
         ]);
@@ -435,6 +438,7 @@ fn an_empty_preedit_echo_does_not_snap_the_wheel_back_to_line_0() {
                 unit: MouseWheelUnit::Point,
                 delta: vec2(0.0, 0.0),
                 phase: TouchPhase::Move,
+                source: MouseWheelSource::Wheel,
                 modifiers: Modifiers::NONE,
             },
         ]);

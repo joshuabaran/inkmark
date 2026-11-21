@@ -38,7 +38,7 @@ impl GoToLine {
     /// Draws the bar. Enter and Go jump when the field holds a line number.
     /// Escape closes the bar. An empty or non-numeric field stays as it is.
     pub fn show(&mut self, ui: &mut egui::Ui, line_count: usize, modal: bool) -> GoToStep {
-        let id = egui::Id::new(FIELD);
+        let id = egui::Id::unique(FIELD);
         let focused = ui.memory(|m| m.has_focus(id));
         let (enter, escape) = ui.input_mut(|input| {
             let escape = if modal {

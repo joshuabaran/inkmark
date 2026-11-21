@@ -37,8 +37,8 @@ impl Split {
         // As in the app: GFM.
         let parse = ParseState::new(Arc::new(GfmParser), &doc, || {});
         let mut s = Self {
-            code: CodeView::with_fonts(fonts.clone(), Id::new("code")),
-            live: LiveView::with_fonts(fonts, Id::new("live")),
+            code: CodeView::with_fonts(fonts.clone(), Id::unique("code")),
+            live: LiveView::with_fonts(fonts, Id::unique("live")),
             ctx,
             doc,
             parse,

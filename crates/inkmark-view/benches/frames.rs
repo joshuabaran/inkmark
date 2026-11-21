@@ -72,8 +72,8 @@ impl Panes {
             wake.fetch_add(1, Ordering::Relaxed);
         });
         let mut p = Self {
-            code: CodeView::with_fonts(fonts.clone(), Id::new("code")),
-            live: LiveView::with_fonts(fonts.clone(), Id::new("live")),
+            code: CodeView::with_fonts(fonts.clone(), Id::unique("code")),
+            live: LiveView::with_fonts(fonts.clone(), Id::unique("live")),
             fonts,
             ctx,
             doc,

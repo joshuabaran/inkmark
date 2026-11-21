@@ -137,7 +137,9 @@ impl FindState {
 
     /// The query or the replacement has the caret.
     pub fn field_focused(&self, ctx: &egui::Context) -> bool {
-        ctx.memory(|m| m.has_focus(egui::Id::new(QUERY)) || m.has_focus(egui::Id::new(REPLACE)))
+        ctx.memory(|m| {
+            m.has_focus(egui::Id::unique(QUERY)) || m.has_focus(egui::Id::unique(REPLACE))
+        })
     }
 
     /// Recounts after an undo or redo that happened outside the bar.
@@ -205,8 +207,8 @@ impl FindState {
         selection: Selection,
         modal: bool,
     ) -> FindStep {
-        let query_id = egui::Id::new(QUERY);
-        let replace_id = egui::Id::new(REPLACE);
+        let query_id = egui::Id::unique(QUERY);
+        let replace_id = egui::Id::unique(REPLACE);
         let query_focused = ui.memory(|m| m.has_focus(query_id));
         let replace_focused = ui.memory(|m| m.has_focus(replace_id));
         if !query_focused && !replace_focused {
@@ -251,10 +253,12 @@ impl FindState {
         let before = (self.query.clone(), self.case_sensitive, self.regex);
         ui.horizontal(|ui| {
             ui.label("Find");
-            let edit = TextEdit::singleline(&mut self.query)
-                .id(query_id)
-                .desired_width(280.0)
-                .show(ui);
+            let edit = show_field(
+                ui,
+                TextEdit::singleline(&mut self.query)
+                    .id(query_id)
+                    .desired_width(280.0),
+            );
             if self.select_query {
                 self.select_query = false;
                 select_all(&edit, ui.ctx(), query_id, self.query.chars().count());
@@ -295,10 +299,12 @@ impl FindState {
                 button = Command::Next;
             }
             ui.label("Replace");
-            TextEdit::singleline(&mut self.replacement)
-                .id(replace_id)
-                .desired_width(280.0)
-                .show(ui);
+            show_field(
+                ui,
+                TextEdit::singleline(&mut self.replacement)
+                    .id(replace_id)
+                    .desired_width(280.0),
+            );
             if ui.button("Replace one").clicked() {
                 button = Command::ReplaceOne;
             }
@@ -645,7 +651,7 @@ impl FindState {
         let Some(field) = self.pending.take() else {
             return;
         };
-        let id = egui::Id::new(match field {
+        let id = egui::Id::unique(match field {
             Field::Query => QUERY,
             Field::Replace => REPLACE,
         });
@@ -678,6 +684,27 @@ fn step_past(doc: &Document, range: &Range<usize>) -> usize {
 fn index_in(matches: &[Range<usize>], range: &Range<usize>) -> Option<usize> {
     let i = matches.partition_point(|m| m.start < range.start);
     matches.get(i).filter(|m| *m == range).map(|_| i + 1)
+}
+
+/// A click outside a focused field surrenders focus before the field
+/// reads this frame's text. Hold focus through the edit, then surrender,
+/// so a query and a click in the same frame see the new text.
+fn show_field(ui: &mut egui::Ui, edit: TextEdit<'_>) -> egui::text_edit::TextEditOutput {
+    let prev = ui
+        .ctx()
+        .options(|options| options.input_options.surrender_focus_on);
+    ui.ctx().options_mut(|options| {
+        options.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never;
+    });
+    let output = edit.show(ui);
+    ui.ctx().options_mut(|options| {
+        options.input_options.surrender_focus_on = prev;
+    });
+    let clicked_outside = ui.input(|input| input.pointer.any_click()) && !output.response.hovered();
+    if clicked_outside && ui.memory(|memory| memory.has_focus(output.response.id)) {
+        ui.memory_mut(|memory| memory.surrender_focus(output.response.id));
+    }
+    output
 }
 
 fn select_all(
