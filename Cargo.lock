@@ -1947,7 +1947,7 @@ dependencies = [
 
 [[package]]
 name = "inkmark"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "eframe",
  "inkmark-bench",
@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "inkmark-bench"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "image",
  "serde_json",
@@ -1977,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "inkmark-buffer"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "criterion",
  "inkmark-bench",
@@ -1989,7 +1989,7 @@ dependencies = [
 
 [[package]]
 name = "inkmark-files"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "notify",
  "rustix 1.1.6",
@@ -1999,14 +1999,14 @@ dependencies = [
 
 [[package]]
 name = "inkmark-minimap"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "egui",
 ]
 
 [[package]]
 name = "inkmark-parse"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "criterion",
  "inkmark-bench",
@@ -2018,7 +2018,7 @@ dependencies = [
 
 [[package]]
 name = "inkmark-text"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "cosmic-text",
  "criterion",
@@ -2030,7 +2030,7 @@ dependencies = [
 
 [[package]]
 name = "inkmark-view"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "egui",
  "flate2",
