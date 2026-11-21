@@ -88,7 +88,7 @@ pub struct Cheatsheet {
 impl Cheatsheet {
     pub fn new(fonts: SharedFonts) -> Self {
         Self {
-            live: LiveView::with_fonts(fonts.clone(), Id::new("syntax_cheatsheet")),
+            live: LiveView::with_fonts(fonts.clone(), Id::unique("syntax_cheatsheet")),
             code: TextRenderer::with_fonts(fonts),
             // The code pane's defaults, until the app copies the open tab.
             code_size: 14.0,
@@ -144,7 +144,7 @@ impl Cheatsheet {
         });
         let rect = response.response.rect;
         self.row_rects.push(rect);
-        let hit = ui.interact(rect, Id::new(("syntax_row", index)), Sense::click());
+        let hit = ui.interact(rect, Id::unique(("syntax_row", index)), Sense::click());
         if hit.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
@@ -494,6 +494,7 @@ mod tests {
             | egui::Shape::Ellipse(_)
             | egui::Shape::QuadraticBezier(_)
             | egui::Shape::CubicBezier(_)
+            | egui::Shape::Band(_)
             | egui::Shape::Callback(_) => true,
         }
     }

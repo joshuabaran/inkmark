@@ -230,7 +230,7 @@ impl FolderSearch {
             }
         }
 
-        let query_id = egui::Id::new(QUERY);
+        let query_id = egui::Id::unique(QUERY);
         let query_focused = ui.memory(|m| m.has_focus(query_id));
         let showing = self.showing_results();
         let (escape, enter, pin_enter, up, down) = ui.input_mut(|input| {
@@ -274,17 +274,19 @@ impl FolderSearch {
         // runs and the close path sees an unfocused field.
         let edit = ui
             .horizontal(|ui| {
-                TextEdit::singleline(&mut self.query)
-                    .id(query_id)
-                    .desired_width(ui.available_width())
-                    .hint_text("Search this folder")
-                    .event_filter(egui::EventFilter {
-                        horizontal_arrows: true,
-                        vertical_arrows: true,
-                        escape: true,
-                        ..Default::default()
-                    })
-                    .show(ui)
+                show_field(
+                    ui,
+                    TextEdit::singleline(&mut self.query)
+                        .id(query_id)
+                        .desired_width(ui.available_width())
+                        .hint_text("Search this folder")
+                        .event_filter(egui::EventFilter {
+                            horizontal_arrows: true,
+                            vertical_arrows: true,
+                            escape: true,
+                            ..Default::default()
+                        }),
+                )
             })
             .inner;
         if self.select_query {
@@ -369,7 +371,7 @@ impl FolderSearch {
                         let scroll_id = ui.make_persistent_id(egui::IdSalt::new(LIST_ID));
                         let current =
                             egui::containers::scroll_area::State::load(ui.ctx(), scroll_id)
-                                .map(|state| state.offset.y)
+                                .map(|state| state.unclamped_offset().y)
                                 .unwrap_or(0.0);
                         if let Some(offset) =
                             offset_to_reveal(index as f32 * ROW_H, current, viewport)
@@ -902,6 +904,27 @@ fn fit_label(
     job.wrap.break_anywhere = true;
     job.wrap.overflow_character = Some('…');
     ui.painter().layout_job(job)
+}
+
+/// A click outside a focused field surrenders focus before the field
+/// reads this frame's text. Hold focus through the edit, then surrender,
+/// so a query and a click in the same frame see the new text.
+fn show_field(ui: &mut egui::Ui, edit: TextEdit<'_>) -> egui::text_edit::TextEditOutput {
+    let prev = ui
+        .ctx()
+        .options(|options| options.input_options.surrender_focus_on);
+    ui.ctx().options_mut(|options| {
+        options.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never;
+    });
+    let output = edit.show(ui);
+    ui.ctx().options_mut(|options| {
+        options.input_options.surrender_focus_on = prev;
+    });
+    let clicked_outside = ui.input(|input| input.pointer.any_click()) && !output.response.hovered();
+    if clicked_outside && ui.memory(|memory| memory.has_focus(output.response.id)) {
+        ui.memory_mut(|memory| memory.surrender_focus(output.response.id));
+    }
+    output
 }
 
 fn select_all(

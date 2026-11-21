@@ -1,6 +1,15 @@
 version: 2
 updates:
-  # Keep the CI actions current; Rust dependencies are updated by hand.
+  # Security fixes open as they are published. This schedule is everything else,
+  # folded into one pull request so the queue stays short.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      rust:
+        patterns:
+          - "*"
   - package-ecosystem: github-actions
     directory: /
     schedule:

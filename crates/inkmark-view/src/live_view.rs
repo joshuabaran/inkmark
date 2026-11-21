@@ -3440,7 +3440,7 @@ mod tests {
         use inkmark_parse::GfmParser;
 
         let ctx = egui::Context::default();
-        let mut view = LiveView::with_fonts(inkmark_text::Fonts::shared(&ctx), Id::new("t"));
+        let mut view = LiveView::with_fonts(inkmark_text::Fonts::shared(&ctx), Id::unique("t"));
         let width = 360.0;
         view.text.begin_frame(
             TextConfig {
@@ -3479,7 +3479,7 @@ mod tests {
         use inkmark_parse::GfmParser;
 
         let ctx = egui::Context::default();
-        let mut view = LiveView::with_fonts(inkmark_text::Fonts::shared(&ctx), Id::new("math"));
+        let mut view = LiveView::with_fonts(inkmark_text::Fonts::shared(&ctx), Id::unique("math"));
         let width = 600.0;
         view.text.begin_frame(
             TextConfig {
@@ -3594,7 +3594,7 @@ mod tests {
         use inkmark_parse::GfmParser;
 
         let ctx = egui::Context::default();
-        let mut view = LiveView::with_fonts(inkmark_text::Fonts::shared(&ctx), Id::new("wide"));
+        let mut view = LiveView::with_fonts(inkmark_text::Fonts::shared(&ctx), Id::unique("wide"));
         let width = 220.0;
         view.text.begin_frame(
             TextConfig {
@@ -3632,7 +3632,7 @@ mod tests {
         use inkmark_parse::GfmParser;
 
         let ctx = egui::Context::default();
-        let mut view = LiveView::with_fonts(inkmark_text::Fonts::shared(&ctx), Id::new("hits"));
+        let mut view = LiveView::with_fonts(inkmark_text::Fonts::shared(&ctx), Id::unique("hits"));
         let src = "- [ ] open\n- [x] done\n";
         let doc = Document::from_text(src);
         let parse = GfmParser.parse(src);

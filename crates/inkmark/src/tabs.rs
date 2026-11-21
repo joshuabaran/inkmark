@@ -93,7 +93,7 @@ fn chip(ui: &mut egui::Ui, index: usize, tab: &Item) -> Option<Event> {
     let galley = ui.painter().layout_job(job);
     let width = galley.size().x + 20.0;
     let (_, rect) = ui.allocate_space(vec2(width, HEIGHT));
-    let response = ui.interact(rect, egui::Id::new(("tab_chip", tab.id)), Sense::click());
+    let response = ui.interact(rect, egui::Id::unique(("tab_chip", tab.id)), Sense::click());
     let fill = if tab.active {
         Some(colors.selection)
     } else if response.hovered() {

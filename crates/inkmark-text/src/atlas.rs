@@ -240,16 +240,13 @@ mod tests {
     fn overflow_clears_at_next_frame_boundary() {
         let ctx = Context::default();
         let mut font_system = FontSystem::new();
-        let font_id = font_system
-            .db()
-            .faces()
-            .map(|f| f.id)
-            .next()
-            .expect("tests need at least one system font");
+        // Huge glyphs fill pages fast. fontconfig's first face can be a
+        // small symbol font, and a couple thousand of its glyph ids never
+        // fill four pages. DejaVu Sans and Noto Sans do.
+        let font_id = face_that_can_overflow(font_system.db());
         let mut atlas = GlyphAtlas::new(&ctx);
         atlas.begin_frame();
 
-        // Huge glyphs fill pages fast; keep going until the atlas goes over budget.
         let mut glyph_id = 1;
         while atlas.stats().pages <= MAX_PAGES && glyph_id < 2000 {
             let (key, _, _) = CacheKey::new(
@@ -275,5 +272,37 @@ mod tests {
         assert_eq!(after.glyphs, 0);
         assert_eq!(after.pages, MAX_PAGES);
         assert_eq!(after.resets, 1);
+    }
+
+    /// A regular text face. The first face in the database is whichever
+    /// directory fontconfig lists first, and that file may only hold a
+    /// few dozen glyphs.
+    fn face_that_can_overflow(db: &fontdb::Database) -> fontdb::ID {
+        const NAMES: &[&str] = &["DejaVu Sans", "Liberation Sans", "Noto Sans"];
+        if let Some(face) = db.faces().find(|face| {
+            face.style == fontdb::Style::Normal
+                && face.weight == fontdb::Weight::NORMAL
+                && face
+                    .families
+                    .iter()
+                    .any(|(name, _)| NAMES.contains(&name.as_str()))
+        }) {
+            return face.id;
+        }
+        let mut best: Option<(u16, fontdb::ID)> = None;
+        for face in db.faces() {
+            let Some(font) = cosmic_text::Font::new(db, face.id, fontdb::Weight::NORMAL) else {
+                continue;
+            };
+            let count = font.as_swash().metrics(&[]).glyph_count;
+            if count >= 2000 {
+                return face.id;
+            }
+            if best.is_none_or(|(n, _)| count > n) {
+                best = Some((count, face.id));
+            }
+        }
+        best.map(|(_, id)| id)
+            .expect("tests need at least one system font")
     }
 }

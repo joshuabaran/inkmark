@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{
-    Event, FullOutput, Id, Key, Modifiers, MouseWheelUnit, OutputCommand, PointerButton, Pos2,
-    RawInput, Rect, TouchPhase, pos2, vec2,
+    Event, FullOutput, Id, Key, Modifiers, MouseWheelSource, MouseWheelUnit, OutputCommand,
+    PointerButton, Pos2, RawInput, Rect, TouchPhase, pos2, vec2,
 };
 use inkmark_buffer::{Document, Edit, EditKind, Selection};
 use inkmark_minimap::Minimap;
@@ -33,7 +33,7 @@ impl Harness {
         let doc = Document::from_text(text);
         let parse = ParseState::new(Arc::new(PulldownParser), &doc, || {});
         let mut h = Self {
-            view: LiveView::new(&ctx, Id::new("live")),
+            view: LiveView::new(&ctx, Id::unique("live")),
             ctx,
             doc,
             parse,
@@ -250,7 +250,7 @@ fn image_paragraphs_show_the_loaded_image() {
     let doc = Document::open(&path).unwrap();
     let parse = ParseState::new(Arc::new(PulldownParser), &doc, || {});
     let mut h = Harness {
-        view: LiveView::new(&ctx, Id::new("live")),
+        view: LiveView::new(&ctx, Id::unique("live")),
         ctx,
         doc,
         parse,
@@ -495,6 +495,7 @@ fn a_wheel_holds_its_place_on_the_next_frame() {
             unit: MouseWheelUnit::Point,
             delta: vec2(0.0, -7.0),
             phase: TouchPhase::Move,
+            source: MouseWheelSource::Wheel,
             modifiers: Modifiers::NONE,
         });
     }
@@ -550,6 +551,7 @@ fn scrolling_does_not_reflow_the_minimap() {
             unit: MouseWheelUnit::Point,
             delta: vec2(0.0, -40.0),
             phase: TouchPhase::Move,
+            source: MouseWheelSource::Wheel,
             modifiers: Modifiers::NONE,
         });
     }
@@ -605,6 +607,7 @@ fn a_wheel_up_after_a_cold_jump_moves_exactly_its_distance() {
             unit: MouseWheelUnit::Point,
             delta: vec2(0.0, 300.0),
             phase: TouchPhase::Move,
+            source: MouseWheelSource::Wheel,
             modifiers: Modifiers::NONE,
         },
     ]);

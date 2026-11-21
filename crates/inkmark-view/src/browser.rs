@@ -144,7 +144,7 @@ impl FileBrowser {
             missing: HashSet::new(),
             focus_next: false,
             revealed: false,
-            id: Id::new("file_browser"),
+            id: Id::unique("file_browser"),
             painted: 0,
             scroll_to: None,
             row_rects: HashMap::new(),
@@ -827,7 +827,7 @@ impl FileBrowser {
                     // ScrollArea salts the id again, so load the same `IdSalt`.
                     let scroll_id = ui.make_persistent_id(egui::IdSalt::new(self.id));
                     let current = egui::containers::scroll_area::State::load(ui.ctx(), scroll_id)
-                        .map(|state| state.offset.y)
+                        .map(|state| state.unclamped_offset().y)
                         .unwrap_or(0.0);
                     if let Some(offset) = offset_to_reveal(row_y, current, viewport) {
                         area = area.vertical_scroll_offset(offset);

@@ -1748,7 +1748,7 @@ mod tests {
     /// `# One\nbody one\n# Two\nbody two\n`, with each body folded.
     fn two_folds() -> (CodeView, Document) {
         let ctx = egui::Context::default();
-        let mut view = CodeView::new(&ctx, Id::new("fold-ends"));
+        let mut view = CodeView::new(&ctx, Id::unique("fold-ends"));
         let doc = Document::from_text("# One\nbody one\n# Two\nbody two\n");
         assert_eq!(doc.slice(6..15).as_ref(), "body one\n");
         assert_eq!(doc.slice(21..30).as_ref(), "body two\n");
